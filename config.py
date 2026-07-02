@@ -1,5 +1,4 @@
-"""
-Ivy Local Admin API Gateway — Configuration & Constants
+"""Ivy Local Admin API Gateway — Configuration & Constants
 
 Centralized configuration for timeouts, feature flags, API schemas, and tool definitions.
 All hardcoded values are defined here for easy tuning without modifying business logic.
