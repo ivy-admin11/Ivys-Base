@@ -16,7 +16,11 @@ import hashlib
 import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
-import google.generativeai as genai
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 logger = logging.getLogger("ivy.cache")
 
@@ -41,6 +45,7 @@ class PromptCacheManager:
         # In-memory cache of system prompt + tools (minimal memory footprint)
         self._cached_system_block = None
         self._cached_system_hash = None
+        logger.info(f"💾 PromptCacheManager initialized (caching={'ON' if enable_caching else 'OFF'}, TTL={ttl_seconds}s)")
 
     def build_cached_system_prompt(
         self,
@@ -109,13 +114,17 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
         user_message: str,
         system_instruction: str,
         tool_declarations: List[Dict[str, Any]]
-    ) -> List[genai.types.ContentDict]:
+    ) -> List:
         """
         Create Gemini content list optimized for caching.
         
         Returns: [cached_system_block, user_message]
         where cached_system_block has cache_control set to ephemeral.
         """
+        if genai is None:
+            logger.warning("google.generativeai not installed, caching disabled")
+            return None
+            
         if not self.enable_caching:
             # Fallback: send everything in a single message (no caching)
             return [genai.types.ContentDict(
