@@ -79,6 +79,19 @@ HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "+12147334061")
 """Primary authorized contact for approval workflows"""
 
 # ============================================================================
+# PROMPT CACHING (Token Cost Optimization)
+# ============================================================================
+
+ENABLE_PROMPT_CACHING: bool = os.environ.get("ENABLE_PROMPT_CACHING", "true").lower() == "true"
+"""Enable prompt caching to reduce Gemini API token costs by 80-90%"""
+
+CACHE_CONTROL_TTL_SECONDS: int = int(os.environ.get("CACHE_CONTROL_TTL_SECONDS", "3600"))
+"""Cache Time-To-Live in seconds (default: 3600 = 1 hour, max: 86400 = 24 hours)"""
+
+ENABLE_CACHE_METRICS_LOGGING: bool = os.environ.get("ENABLE_CACHE_METRICS_LOGGING", "true").lower() == "true"
+"""Log detailed cache hit/miss statistics for cost analysis"""
+
+# ============================================================================
 # GEMINI (GOOGLE) TOOL SCHEMA
 # ============================================================================
 
