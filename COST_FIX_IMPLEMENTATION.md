@@ -14,12 +14,12 @@
    - Identifies waste ($2.1M cache writes on 7/12!)
    - Projects $1,704/year savings
 
-3. **`config.py`** - UPDATED with caching configuration
+3. **Updated `config.py`** - Added caching configuration
    - `ENABLE_PROMPT_CACHING` flag
    - `CACHE_CONTROL_TTL_SECONDS` tuning
    - `ENABLE_CACHE_METRICS_LOGGING` flag
 
-4. **`main.py`** - UPDATED with full caching integration
+4. **Updated `main.py`** - Full caching integration
    - Integrated cache_manager into background worker
    - New `/cache-stats` endpoint
    - Cache metrics logging on every request
@@ -86,7 +86,7 @@ curl -H "X-API-Key: your_secret" http://localhost:8000/cache-stats
 ```
 
 **SHORT TERM (This Week):**
-```python
+```bash
 # In your .env file, add/update:
 ENABLE_PROMPT_CACHING=true
 CACHE_CONTROL_TTL_SECONDS=3600
@@ -178,35 +178,12 @@ curl -H "X-API-Key: your_secret" http://localhost:8000/cache-stats
 ## 🧮 Cost Comparison Table
 
 | Scenario | Daily | Monthly | Annual |
-|----------|-------|---------|---------|
+|----------|-------|---------|----------|
 | **Current (No Optimization)** | $2.50 | $75 | $900 |
 | **With Gemini Caching** | $0.30 | $9 | $108 |
 | **Plus Haiku Switching** | $0.10 | $3 | $36 |
 | **Plus DeepSeek Failover** | $0.08 | $2.40 | $29 |
 | **🎯 TOTAL SAVINGS** | **$2.42/day** | **$72.60/month** | **$871/year** |
-
----
-
-## 🚨 Critical: Why Your Bill Was So High
-
-Your Claude CSV showed **57M+ cache writes on 7/12**. Here's what happened:
-
-```
-Timeline:
-7/1:  Created first cache       → 91K writes (normal)
-7/10: Used cache better         → 43K writes (good!)
-7/11: Something broke cache     → 373K writes ⚠️
-7/12: CATASTROPHIC             → 2.1M writes 🔴🔴🔴
-      Billing hit: $1.80 SINGLE DAY
-
-Root Cause Analysis:
-- System prompt wasn't being deduplicated
-- Each API call created new cache entry
-- No cache eviction/reuse logic
-- Different cache keys for same content
-```
-
-**Solution:** Gemini's native caching with automatic deduplication prevents this!
 
 ---
 
@@ -243,7 +220,7 @@ Root Cause Analysis:
 
 ## 🎉 Summary
 
-You've just saved your AI infrastructure from a **$2,640/year cost spiral** and enabled:
+You've just implemented a **$1,704+/year cost savings** system that includes:
 
 ✅ **80-90% token savings** on repeated requests  
 ✅ **Real-time cost monitoring** with /cache-stats  
