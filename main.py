@@ -29,6 +29,7 @@ Cost Optimization:
 """
 
 import os
+import socket
 import sys
 import time
 import sqlite3
@@ -77,6 +78,7 @@ from config import (
 
 # Canonical tool schema — single source of truth for both providers
 from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
+from ivy_core import receipts
 
 # Import prompt caching manager
 try:
@@ -313,6 +315,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", lifespan=lifespan)
+
+PROCESS_STARTED_AT = datetime.now()
+PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================================
 # SECURITY: Authentication Middleware
@@ -1037,11 +1042,90 @@ def health_endpoint(authenticated: bool = Depends(verify_api_key)):
 
 @app.get("/capabilities")
 def capabilities_endpoint(authenticated: bool = Depends(verify_api_key)):
-    """List all tools and their readiness status."""
+    """List all tools and their readiness status, plus every registered job
+    and whether it's actually available. Unavailable jobs (e.g. bravo_scout,
+    whose implementation doesn't exist) are surfaced with their reason —
+    never silently omitted, which would look like a clean bill of health."""
     return {
         "tools": compute_tool_statuses(),
+        "jobs": job_runner.list_jobs() if JOB_RUNNER_AVAILABLE else [],
         "caching_stats": cache_manager.get_cache_statistics() if CACHING_AVAILABLE else None
     }
+
+
+@app.get("/ready")
+def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
+    """Readiness probe — distinct from /health's bare liveness check.
+    Returns 503 (not 200 with status:"degraded" buried in the body) when a
+    component actually required to serve requests is unavailable."""
+    checks = {
+        "chat_db_readable": os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK),
+        "llm_provider_configured": bool(
+            os.environ.get("DEEPSEEK_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+        ),
+    }
+    try:
+        receipts.list_recent(limit=1)
+        checks["receipts_db_writable"] = True
+    except Exception as exc:
+        logger.warning("Receipts DB check failed: %s", exc)
+        checks["receipts_db_writable"] = False
+
+    ready = all(checks.values())
+    payload = {"ready": ready, "checks": checks}
+    if not ready:
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
+
+
+@app.get("/version")
+def version_endpoint(authenticated: bool = Depends(verify_api_key)):
+    """Git SHA, project root, Python executable, PID, start time, hostname,
+    dirty-tree state — so "which commit is this gateway actually running"
+    is never a guessing game."""
+    try:
+        git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=PROJECT_ROOT_DIR, timeout=5,
+        ).stdout.strip() or "unknown"
+    except Exception:
+        git_sha = "unknown"
+    try:
+        dirty_output = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=PROJECT_ROOT_DIR, timeout=5,
+        ).stdout.strip()
+        dirty = bool(dirty_output)
+    except Exception:
+        dirty = None
+    return {
+        "git_sha": git_sha,
+        "dirty_working_tree": dirty,
+        "project_root": PROJECT_ROOT_DIR,
+        "python_executable": sys.executable,
+        "pid": os.getpid(),
+        "process_started_at": PROCESS_STARTED_AT.isoformat(),
+        "hostname": socket.gethostname(),
+    }
+
+
+@app.get("/executions")
+def list_executions_endpoint(
+    limit: int = 50,
+    job_name: Optional[str] = None,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Recent job execution receipts — the runtime's own record of what was
+    actually dispatched, not something a model gets to assert."""
+    return {"executions": receipts.list_recent(limit=limit, job_name=job_name)}
+
+
+@app.get("/executions/{execution_id}")
+def get_execution_endpoint(execution_id: str, authenticated: bool = Depends(verify_api_key)):
+    record = receipts.get_execution(execution_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Execution '{execution_id}' not found")
+    return record
 
 
 def get_capabilities() -> str:

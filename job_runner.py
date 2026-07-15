@@ -174,27 +174,27 @@ class JobRunner:
         success — a missing plist, a nonexistent entrypoint module, or a
         nonzero launchctl exit code all come back as an explicit failure.
         """
+        execution_id = receipts.record_start(job_name, requester=requester)
+
         job = self.find_job(job_name)
         if not job:
             available_names = ", ".join(j.display_name for j in self.registry.values() if j.available)
-            return JobStatus.NOT_FOUND, f"Job '{job_name}' not found. Available jobs: {available_names}"
-
-        if not job.available:
-            return JobStatus.UNAVAILABLE, f"{job.display_name} is unavailable: {job.unavailable_reason}"
-
-        execution_id = receipts.record_start(job.name, requester=requester)
-        try:
-            if job.executor == "entrypoint":
-                status, message = self._run_entrypoint_job(job, force=force, send=send, requester=requester)
-            elif job.executor == "launchctl":
-                status, message = self._run_launchctl_job(job)
-            elif job.executor == "shell":
-                status, message = self._run_shell_job(job)
-            else:
-                status, message = JobStatus.ERROR, f"Unknown executor type: {job.executor}"
-        except Exception as e:
-            logger.error(f"Error running job {job.name}: {e}")
-            status, message = JobStatus.ERROR, f"Error running {job.display_name}: {str(e)}"
+            status, message = JobStatus.NOT_FOUND, f"Job '{job_name}' not found. Available jobs: {available_names}"
+        elif not job.available:
+            status, message = JobStatus.UNAVAILABLE, f"{job.display_name} is unavailable: {job.unavailable_reason}"
+        else:
+            try:
+                if job.executor == "entrypoint":
+                    status, message = self._run_entrypoint_job(job, force=force, send=send, requester=requester)
+                elif job.executor == "launchctl":
+                    status, message = self._run_launchctl_job(job)
+                elif job.executor == "shell":
+                    status, message = self._run_shell_job(job)
+                else:
+                    status, message = JobStatus.ERROR, f"Unknown executor type: {job.executor}"
+            except Exception as e:
+                logger.error(f"Error running job {job.name}: {e}")
+                status, message = JobStatus.ERROR, f"Error running {job.display_name}: {str(e)}"
 
         # Records the dispatch outcome, not necessarily the detached
         # subprocess's eventual completion (entrypoint jobs run
