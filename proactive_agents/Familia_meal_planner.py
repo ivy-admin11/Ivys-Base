@@ -1,0 +1,403 @@
+"""
+Familia Meal Planner — Venezuelan-American-Asian Fusion Recipe Generator
+
+Proactively generates family-optimized meal plans for a household of three,
+featuring toddler-friendly, macro-balanced fusion cuisine. Integrates with
+iMessage notification bus for weekly recipe delivery.
+
+Architecture:
+- Environment routing via require_env (dual-brain failover: Gemini → DeepSeek)
+- Stateful 48-hour cron gatekeeping (JSON state tracking at ~/openclaw-admin/data/meal_plan_state.json)
+- Specialized menu rotation: arepas, cachapas, fusion burgers, macro bowls, sushi, Ooni pizza
+- Ultra-condensed SMS text compression for iMessage delivery
+"""
+
+import os
+import sys
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+
+# Add parent directory to path for .ivy module access
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# Import from the .ivy module at the project root
+import importlib.util
+ivy_core_path = os.path.join(parent_dir, ".ivy", "ivy_core.py")
+spec = importlib.util.spec_from_file_location("ivy_core", ivy_core_path)
+ivy_core = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ivy_core)
+
+require_env = ivy_core.require_env
+send_imessage = ivy_core.send_imessage
+query_gemini = ivy_core.query_gemini
+
+logger = logging.getLogger("ivy.familia_meal_planner")
+
+# ============================================================================
+# CONFIGURATION & STATE MANAGEMENT
+# ============================================================================
+
+STATE_FILE_PATH = Path.home() / "openclaw-admin" / "data" / "meal_plan_state.json"
+STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Meal plan target parameters
+MEAL_PLAN_CONFIG = {
+    "household_size": 3,
+    "region": "Dallas/Frisco, TX",
+    "cuisine_fusion": ["Venezuelan", "American", "Asian"],
+    "core_themes": [
+        "stuffed arepas",
+        "sweet corn cachapas",
+        "street-style fusion burgers",
+        "balanced macro bowls",
+        "sushi & rolls",
+        "Ooni pizza oven specials",
+    ],
+    "dietary_constraints": [
+        "toddler-friendly textures",
+        "finger-food adaptable",
+        "low sodium scaling",
+        "minimal spice (adjustable)",
+        "macro-balanced proteins/carbs/fats",
+    ],
+}
+
+# Alert recipients
+ALERT_RECIPIENTS = {
+    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
+    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
+}
+
+# Initialize state threshold: July 15, 2026 8am CST
+INIT_THRESHOLD = datetime(2026, 7, 15, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+
+
+def initialize_state_file() -> None:
+    """Initialize state file if it doesn't exist."""
+    if not STATE_FILE_PATH.exists():
+        initial_state = {
+            "last_run_date": INIT_THRESHOLD.isoformat(),
+            "recipe_count": 0,
+            "execution_history": []
+        }
+        with open(STATE_FILE_PATH, 'w') as f:
+            json.dump(initial_state, f, indent=2)
+        logger.info(f"📋 Initialized state file: {STATE_FILE_PATH}")
+
+
+def load_state() -> Dict[str, Any]:
+    """Load state from JSON file."""
+    initialize_state_file()
+    try:
+        with open(STATE_FILE_PATH, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load state: {e}")
+        return {
+            "last_run_date": INIT_THRESHOLD.isoformat(),
+            "recipe_count": 0,
+            "execution_history": []
+        }
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    """Save state to JSON file."""
+    try:
+        with open(STATE_FILE_PATH, 'w') as f:
+            json.dump(state, f, indent=2)
+        logger.info(f"💾 State saved: {STATE_FILE_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+
+def check_48h_gate() -> bool:
+    """
+    Check if 48 hours have elapsed since last execution.
+
+    Returns True if execution should proceed, False if within 48-hour window.
+    """
+    state = load_state()
+    last_run_str = state.get("last_run_date", INIT_THRESHOLD.isoformat())
+
+    try:
+        last_run = datetime.fromisoformat(last_run_str)
+    except ValueError:
+        logger.warning(f"Invalid last_run_date format: {last_run_str}, forcing execution")
+        return True
+
+    now = datetime.now(timezone.utc).astimezone()
+    elapsed = now - (last_run if last_run.tzinfo else last_run.replace(tzinfo=timezone.utc).astimezone())
+
+    if elapsed >= timedelta(hours=48):
+        logger.info(f"✅ 48h gate passed ({elapsed.total_seconds()/3600:.1f}h elapsed)")
+        return True
+    else:
+        remaining = timedelta(hours=48) - elapsed
+        logger.info(f"⏭️  Within 48h window ({remaining.total_seconds()/3600:.1f}h remaining)")
+        return False
+
+
+# ============================================================================
+# MEAL PLAN GENERATION
+# ============================================================================
+
+
+def generate_family_meal_plan() -> Dict[str, Any]:
+    """
+    Generate a Venezuelan-American-Asian fusion meal plan optimized for
+    family of three with toddler-friendly adaptations.
+
+    Returns:
+        dict: Structured meal plan with recipes and prep instructions.
+    """
+    logger.info(f"🍳 Generating fusion meal plan for {MEAL_PLAN_CONFIG['household_size']} people")
+
+    meal_plan_prompt = f"""
+    Create a weekly family meal plan for {MEAL_PLAN_CONFIG['household_size']} people in {MEAL_PLAN_CONFIG['region']}.
+
+    Cuisine Fusion: {', '.join(MEAL_PLAN_CONFIG['cuisine_fusion'])}
+
+    Meal themes to include:
+    {json.dumps(MEAL_PLAN_CONFIG['core_themes'], indent=2)}
+
+    Dietary constraints:
+    {json.dumps(MEAL_PLAN_CONFIG['dietary_constraints'], indent=2)}
+
+    Special equipment: Ooni gas-fired pizza oven (optimize 1-2 pizza recipes for this)
+
+    Generate recipes in JSON format with:
+    - recipe_name (string)
+    - cuisine_origin (Venezuelan/American/Asian)
+    - prep_time_minutes (integer, under 30 min)
+    - cooking_time_minutes (integer)
+    - ingredients (list of simple, available ingredients with quantities)
+    - toddler_adaptations (list of modifications for young child)
+    - macros (protein_g, carbs_g, fats_g)
+    - difficulty_level (easy/medium)
+
+    Include 5-7 recipes total. Return ONLY valid JSON array, no markdown formatting.
+    """
+
+    try:
+        response = query_gemini(
+            meal_plan_prompt,
+            temperature=0.7,
+        )
+
+        if not response or response.strip().lower() == "none":
+            logger.warning("LLM returned no recipes")
+            return {"status": "error", "recipes": []}
+
+        # Parse JSON response
+        try:
+            recipes = json.loads(response)
+            if not isinstance(recipes, list):
+                recipes = [recipes]
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse recipe JSON: {response[:200]}")
+            return {"status": "error", "recipes": []}
+
+        logger.info(f"✅ Generated {len(recipes)} fusion recipes")
+
+        return {
+            "status": "success",
+            "recipe_count": len(recipes),
+            "recipes": recipes,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"Recipe generation failed: {e}")
+        return {"status": "error", "recipes": []}
+
+
+# ============================================================================
+# TEXT COMPRESSION FOR SMS
+# ============================================================================
+
+
+def compress_meal_plan(meal_data: Dict[str, Any]) -> str:
+    """
+    Compress meal plan into ultra-condensed SMS format.
+    Strict <160 char per line to prevent multi-bubble splitting.
+
+    Args:
+        meal_data: Generated meal plan with recipes
+
+    Returns:
+        str: Ultra-condensed notification text
+    """
+    recipes = meal_data.get("recipes", [])
+
+    if not recipes:
+        return ""
+
+    # Build compressed recipe list (ultra-terse format)
+    recipe_lines = []
+    for recipe in recipes[:5]:  # Top 5 recipes
+        name = recipe.get("recipe_name", "Unknown")
+        time = recipe.get("prep_time_minutes", 0) + recipe.get("cooking_time_minutes", 0)
+        origin = recipe.get("cuisine_origin", "")
+
+        # Abbreviate origin
+        origin_short = origin[0] if origin else "?"
+
+        # Format: "🍽️ RecipeName (V) 25m"
+        line = f"• {name[:20]} ({origin_short}) {time}m"
+        recipe_lines.append(line)
+
+    # Header + recipe list
+    header = "📅 Week Menu:\n"
+    recipe_text = "\n".join(recipe_lines)
+
+    # Add quick prep tip (one line max)
+    tip = f"\n⏱️ Total prep: {sum(r.get('prep_time_minutes', 0) for r in recipes)}min"
+
+    full_text = header + recipe_text + tip
+
+    # Ensure no single line exceeds 160 chars (SMS safe)
+    lines = full_text.split("\n")
+    safe_lines = []
+    for line in lines:
+        if len(line) > 155:
+            # Truncate with ellipsis
+            line = line[:152] + "…"
+        safe_lines.append(line)
+
+    final_text = "\n".join(safe_lines)
+
+    logger.debug(f"Compressed meal plan ({len(final_text)} chars):\n{final_text}")
+    return final_text
+
+
+# ============================================================================
+# EXECUTION PIPELINE
+# ============================================================================
+
+
+def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
+    """
+    Main execution function: state check → generation → compression → notification dispatch.
+
+    Orchestrates the full meal planner workflow:
+    1. Check 48-hour gate (skip if within window)
+    2. Generate family meal plan via LLM
+    3. Compress to SMS format
+    4. Route via iMessage to recipients
+
+    Args:
+        send_alert: If True, dispatch notification; if False, dry-run only
+
+    Returns:
+        dict: Execution summary
+    """
+    logger.info("=" * 60)
+    logger.info("🍽️  Familia Meal Planner Cycle Starting...")
+    logger.info("=" * 60)
+
+    result = {
+        "status": "pending",
+        "gate_passed": False,
+        "recipe_count": 0,
+        "alert_sent": False,
+        "alert_text": "",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    # Step 1: Check 48-hour gate
+    logger.info("Step 1/4: Checking 48-hour execution gate...")
+    if not check_48h_gate():
+        result["status"] = "skipped"
+        result["gate_passed"] = False
+        logger.info("⏭️  Skipping execution (within 48-hour window)")
+        return result
+
+    result["gate_passed"] = True
+    logger.info("✅ Gate check passed")
+
+    # Step 2: Generate meal plan
+    logger.info("Step 2/4: Generating fusion meal plan...")
+    meal_data = generate_family_meal_plan()
+
+    if meal_data.get("status") != "success":
+        result["status"] = "error"
+        result["alert_text"] = "Meal plan generation failed"
+        logger.error("❌ Generation failed")
+        return result
+
+    result["recipe_count"] = meal_data.get("recipe_count", 0)
+    logger.info(f"✅ Generated {result['recipe_count']} recipes")
+
+    # Step 3: Compress to SMS
+    logger.info("Step 3/4: Compressing meal plan...")
+    alert_text = compress_meal_plan(meal_data)
+    result["alert_text"] = alert_text
+    logger.info(f"✅ Compression complete ({len(alert_text)} chars)")
+
+    # Step 4: Dispatch via iMessage
+    logger.info("Step 4/4: Routing notification...")
+    if not alert_text:
+        logger.info("⏭️  No meal plan content; skipping notification")
+        result["alert_sent"] = False
+    elif send_alert:
+        send_results = {}
+        for recipient_name, phone in ALERT_RECIPIENTS.items():
+            try:
+                success = send_imessage(phone, alert_text)
+                send_results[recipient_name] = success
+                logger.info(
+                    f"✅ Sent to {recipient_name}: {'SUCCESS' if success else 'FAILED'}"
+                )
+            except Exception as e:
+                send_results[recipient_name] = False
+                logger.error(f"❌ Failed to send to {recipient_name}: {e}")
+
+        result["alert_sent"] = any(send_results.values())
+        result["recipients_status"] = send_results
+    else:
+        logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
+        result["alert_sent"] = False
+
+    # Step 5: Update state file
+    logger.info("Step 5/4: Updating state...")
+    state = load_state()
+    state["last_run_date"] = datetime.now(timezone.utc).astimezone().isoformat()
+    state["recipe_count"] = result["recipe_count"]
+    state["execution_history"].append({
+        "timestamp": result["timestamp"],
+        "recipe_count": result["recipe_count"],
+        "alert_sent": result["alert_sent"]
+    })
+    # Keep only last 10 executions
+    state["execution_history"] = state["execution_history"][-10:]
+    save_state(state)
+    logger.info("✅ State updated")
+
+    result["status"] = "success"
+    logger.info("=" * 60)
+    logger.info("🍽️  Meal Planner Cycle Complete")
+    logger.info("=" * 60)
+
+    return result
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
+    # Execute a single meal plan cycle
+    result = execute_meal_plan_cycle(send_alert=False)  # Dry-run by default
+    print(json.dumps(result, indent=2))
