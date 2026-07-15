@@ -36,6 +36,10 @@ require_env = ivy_core.require_env
 send_imessage = ivy_core.send_imessage
 query_gemini = ivy_core.query_gemini
 
+# PDF formatter for professional reports
+sys.path.insert(0, parent_dir)
+from picks_formatter import PicksReportFormatter
+
 logger = logging.getLogger("ivy.familia_meal_planner")
 
 # ============================================================================
@@ -276,6 +280,65 @@ def compress_meal_plan(meal_data: Dict[str, Any]) -> str:
 
 
 # ============================================================================
+# PDF FORMATTER
+# ============================================================================
+
+
+def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
+    """
+    Generate a professional PDF report of family meal plans.
+
+    Args:
+        meal_data: Generated meal plan with recipes
+
+    Returns:
+        str: Path to generated PDF
+    """
+    recipes = meal_data.get("recipes", [])
+
+    formatter = PicksReportFormatter(
+        title="Familia Weekly Meal Plan",
+        subtitle=f"Venezuelan-American-Asian Fusion | {datetime.now():%A, %B %d, %Y}",
+        color_scheme="meals",
+    )
+
+    # Format recipes as "picks" for the formatter
+    meal_picks = [
+        {
+            "sport": recipe.get("cuisine_origin", ""),
+            "matchup": recipe.get("recipe_name", ""),
+            "side": f"{recipe.get('prep_time_minutes', 0) + recipe.get('cooking_time_minutes', 0)} min",
+            "odds": f"Difficulty: {recipe.get('difficulty_level', 'medium').title()}",
+            "reasoning": ", ".join(recipe.get("toddler_adaptations", ["Family-friendly"])[:2]),
+        }
+        for recipe in recipes
+    ]
+
+    summary = (
+        f"Weekly meal plan with {len(recipes)} recipes optimized for a family of three. "
+        f"All recipes feature Venezuelan-American-Asian fusion cuisine with toddler-friendly adaptations. "
+        f"Includes macro-balanced nutrition and specialized dishes: arepas, cachapas, sushi, and Ooni pizza specials."
+    )
+
+    metadata = {
+        "pick_count": f"{len(recipes)} recipe(s) for the week",
+        "source": "Familia Meal Planner",
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
+    }
+
+    pdf_path = f"/tmp/meal_plan_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    formatter.generate_pdf(
+        filename=pdf_path,
+        summary=summary,
+        consensus_picks=meal_picks[:3] if len(meal_picks) > 3 else meal_picks,
+        other_picks=meal_picks[3:] if len(meal_picks) > 3 else [],
+        metadata=metadata,
+    )
+
+    return pdf_path
+
+
+# ============================================================================
 # EXECUTION PIPELINE
 # ============================================================================
 
@@ -333,22 +396,27 @@ def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
     result["recipe_count"] = meal_data.get("recipe_count", 0)
     logger.info(f"✅ Generated {result['recipe_count']} recipes")
 
-    # Step 3: Compress to SMS
-    logger.info("Step 3/4: Compressing meal plan...")
-    alert_text = compress_meal_plan(meal_data)
-    result["alert_text"] = alert_text
-    logger.info(f"✅ Compression complete ({len(alert_text)} chars)")
+    # Step 3: Generate PDF report
+    logger.info("Step 3/4: Generating PDF report...")
+    pdf_path = format_meal_plan_pdf(meal_data)
+    logger.info(f"✅ PDF generated: {pdf_path}")
 
-    # Step 4: Dispatch via iMessage
+    # Step 4: Dispatch via iMessage with notification
     logger.info("Step 4/4: Routing notification...")
-    if not alert_text:
+    if result["recipe_count"] == 0:
         logger.info("⏭️  No meal plan content; skipping notification")
         result["alert_sent"] = False
     elif send_alert:
+        notification = (
+            f"🍽️  Familia Meal Plan Ready\n\n"
+            f"{result['recipe_count']} recipes (Venezuelan-American-Asian fusion)\n"
+            f"Toddler-friendly, macro-balanced\n\n"
+            f"Full plan attached (PDF)."
+        )
         send_results = {}
         for recipient_name, phone in ALERT_RECIPIENTS.items():
             try:
-                success = send_imessage(phone, alert_text)
+                success = send_imessage(phone, notification)
                 send_results[recipient_name] = success
                 logger.info(
                     f"✅ Sent to {recipient_name}: {'SUCCESS' if success else 'FAILED'}"

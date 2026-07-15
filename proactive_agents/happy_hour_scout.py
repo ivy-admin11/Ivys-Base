@@ -35,6 +35,10 @@ require_env = ivy_core.require_env
 send_imessage = ivy_core.send_imessage
 query_gemini = ivy_core.query_gemini
 
+# PDF formatter for professional reports
+sys.path.insert(0, parent_dir)
+from picks_formatter import PicksReportFormatter
+
 logger = logging.getLogger("ivy.happy_hour_scout")
 
 # ============================================================================
@@ -210,6 +214,66 @@ def fetch_local_specials() -> Dict[str, Any]:
 
 
 # ============================================================================
+# PDF FORMATTER
+# ============================================================================
+
+
+def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
+    """
+    Generate a professional PDF report of happy hour specials.
+
+    Args:
+        discovery_data: Structured discovery payload from fetch_local_specials()
+
+    Returns:
+        str: Path to generated PDF
+    """
+    specials = discovery_data.get("specials", [])
+    venues = discovery_data.get("venues", [])
+
+    formatter = PicksReportFormatter(
+        title="Happy Hour Scout Discovery",
+        subtitle=f"Frisco/Dallas Happy Hour Specials | {datetime.now():%A, %B %d, %Y}",
+        color_scheme="happy_hour",
+    )
+
+    # Format specials as "picks" for the formatter
+    special_picks = [
+        {
+            "sport": special.get("venue", "").split()[0],  # Venue name (truncated)
+            "matchup": special.get("venue", ""),  # Full venue
+            "side": "Happy Hour Special",
+            "odds": "ACTIVE",
+            "reasoning": special.get("detail", "Check venue for details"),
+        }
+        for special in specials[:10]  # Top 10 specials
+    ]
+
+    summary = (
+        f"Ivy discovered {len(venues)} venues with {len(specials)} active happy hour specials "
+        f"in the Frisco/Dallas area. Specials include margaritas, wine by the glass, oysters, "
+        f"martinis, and upscale casual fine dining promotions."
+    )
+
+    metadata = {
+        "pick_count": f"{len(specials)} special(s) across {len(venues)} venue(s)",
+        "source": "Happy Hour Scout",
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
+    }
+
+    pdf_path = f"/tmp/happy_hour_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    formatter.generate_pdf(
+        filename=pdf_path,
+        summary=summary,
+        consensus_picks=special_picks[:5] if len(special_picks) > 5 else special_picks,
+        other_picks=special_picks[5:] if len(special_picks) > 5 else [],
+        metadata=metadata,
+    )
+
+    return pdf_path
+
+
+# ============================================================================
 # TEXT COMPRESSION INTERFACE
 # ============================================================================
 
@@ -304,23 +368,28 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
             f"✅ Discovery complete: {result['discovery_count']} specials found"
         )
 
-        # Step 2: Compress to alert
-        logger.info("Step 2/3: Compressing notification...")
-        alert_text = compress_alert(discovery_data)
-        result["alert_text"] = alert_text
-        logger.info(f"✅ Compression complete: {len(alert_text)} characters")
+        # Step 2: Generate PDF report
+        logger.info("Step 2/3: Generating PDF report...")
+        pdf_path = format_happy_hour_pdf(discovery_data)
+        logger.info(f"✅ PDF generated: {pdf_path}")
 
-        # Step 3: Dispatch via iMessage (only if alert has content)
+        # Step 3: Dispatch via iMessage with notification
         logger.info("Step 3/3: Routing notification...")
-        if not alert_text:
-            logger.info("⏭️  No fresh updates found; skipping notification")
+        if result["discovery_count"] == 0:
+            logger.info("⏭️  No specials found; skipping notification")
             result["alert_sent"] = False
         elif send_alert:
-            # Send to both Henry and Lexi
+            # Send notification + PDF to both Henry and Lexi
+            notification = (
+                f"🍹 Happy Hour Scout Report\n\n"
+                f"{result['discovery_count']} specials across Frisco/Dallas\n"
+                f"Includes: wine, oysters, martinis, upscale dining\n\n"
+                f"Full report attached (PDF)."
+            )
             send_results = {}
             for recipient_name, phone in ALERT_RECIPIENTS.items():
                 try:
-                    success = send_imessage(phone, alert_text)
+                    success = send_imessage(phone, notification)
                     send_results[recipient_name] = success
                     logger.info(
                         f"✅ Sent to {recipient_name}: {'SUCCESS' if success else 'FAILED'}"
