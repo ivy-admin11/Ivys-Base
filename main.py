@@ -19,7 +19,7 @@ Security:
 Voice Assistant Features:
 - Session-based conversation management with automatic cleanup
 - Cache-optimized queries for 80-90% token savings on repeated interactions
-- Fallover from Gemini to DeepSeek for reliability
+- DeepSeek primary, with Gemini backup/failover for reliability
 - Real-time cache statistics and session monitoring
 
 Cost Optimization:
@@ -40,7 +40,7 @@ import subprocess
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -62,8 +62,6 @@ from config import (
     PLAYWRIGHT_HEADLESS,
     ADMIN_SECRET,
     HENRY_PHONE,
-    GEMINI_TOOL_DECLARATIONS,
-    DEEPSEEK_TOOL_SCHEMA,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
@@ -76,6 +74,9 @@ from config import (
     ENABLE_PROMPT_CACHING,
     ENABLE_CACHE_METRICS_LOGGING,
 )
+
+# Canonical tool schema — single source of truth for both providers
+from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 
 # Import prompt caching manager
 try:
@@ -551,6 +552,32 @@ def run_job(job_name: str) -> str:
 
 
 # ============================================================================
+# TOOL DISPATCH (single registry — replaces per-provider globals()/if-elif dispatch)
+# ============================================================================
+
+TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
+    "check_apple_calendar": check_apple_calendar,
+    "fetch_readwise_highlights": fetch_readwise_highlights,
+    "fetch_apple_reminders": fetch_apple_reminders,
+    "add_apple_reminder": add_apple_reminder,
+    "run_job": run_job,
+}
+
+
+def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
+    """Execute a registered tool by name. Both the Gemini and DeepSeek paths
+    call through here, so neither can dispatch to anything but a real,
+    registered tool, and DeepSeek gets the same run_job access Gemini has."""
+    handler = TOOL_HANDLERS.get(tool_name)
+    if handler is None:
+        return f"Error: Function {tool_name} is undefined."
+    try:
+        return handler(**tool_args)
+    except Exception as exec_err:
+        return f"Error: {exec_err}"
+
+
+# ============================================================================
 # IMESSAGE ROUTING
 # ============================================================================
 
@@ -610,35 +637,165 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
 
-        # Check if DeepSeek triggered tool execution
+        # Check if DeepSeek triggered tool execution — dispatched through the
+        # same TOOL_HANDLERS registry Gemini uses, so DeepSeek can execute
+        # every registered tool (including run_job, which it previously
+        # could request via its schema but never actually got dispatched).
         if "tool_calls" in message_node and message_node["tool_calls"]:
-            for call in message_node["tool_calls"]:
-                func_name = call["function"]["name"]
-                args = (
-                    json.loads(call["function"].get("arguments", "{}"))
-                    if call["function"].get("arguments")
-                    else {}
-                )
+            call = message_node["tool_calls"][0]
+            func_name = call["function"]["name"]
+            args = (
+                json.loads(call["function"].get("arguments", "{}"))
+                if call["function"].get("arguments")
+                else {}
+            )
 
-                logger.info(
-                    "DeepSeek Core triggered native tool: %s with arguments: %s",
-                    func_name,
-                    args,
-                )
+            logger.info(
+                "DeepSeek Core triggered native tool: %s with arguments: %s",
+                func_name,
+                args,
+            )
 
-                if func_name == "check_apple_calendar":
-                    return check_apple_calendar(timeframe=args.get("timeframe", "today"))
-                elif func_name == "fetch_readwise_highlights":
-                    return fetch_readwise_highlights()
-                elif func_name == "add_apple_reminder":
-                    return add_apple_reminder(
-                        title=args.get("title"),
-                        list_name=args.get("list_name", "Household"),
-                    )
+            return _execute_tool_call(func_name, args)
 
         return message_node.get("content", "").strip()
     except Exception as e:
         return f"❌ DeepSeek Execution Layer Exception: {str(e)}"
+
+
+# ============================================================================
+# GEMINI BACKUP ENGINE (only reached when DeepSeek is unavailable/empty)
+# ============================================================================
+
+
+def _gemini_backup_reply(text: str) -> Optional[str]:
+    """Gemini backup: prompt-cached generate_content call with real tool
+    execution and a real follow-up round-trip. Raises on provider failure
+    (caller treats that as "no backup available" and gives up); returns None
+    if Gemini responded but had nothing usable to say.
+    """
+    if not os.environ.get("GEMINI_API_KEY", "").strip():
+        raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    # ✅ USE CACHED PROMPTS IF ENABLED
+    use_caching = ENABLE_PROMPT_CACHING and CACHING_AVAILABLE
+    if use_caching:
+        messages = cache_manager.create_cached_gemini_request(
+            user_message=text,
+            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+            tool_declarations=GEMINI_TOOL_DECLARATIONS,
+        )
+        if messages is None:
+            logger.warning("Caching failed, falling back to non-cached request")
+            messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+            use_caching = False
+    else:
+        messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+
+    # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
+    # The cache_manager already includes it in the message stream
+    if use_caching:
+        response = gemini_model.generate_content(
+            messages,
+            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        )
+    else:
+        response = gemini_model.generate_content(
+            messages,
+            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+        )
+
+    # 💾 LOG CACHE METRICS
+    if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
+        cache_manager.log_cache_efficiency(
+            response, endpoint="background_imessage_worker", model="gemini-2.5-flash"
+        )
+
+    if not (response.candidates and response.candidates[0].content):
+        return None
+
+    parts = response.candidates[0].content.parts
+    text_reply = ""
+    tool_calls = []
+    for part in parts:
+        if hasattr(part, "text") and part.text:
+            text_reply += part.text
+        # part.function_call is always a present attribute (protobuf oneof
+        # field) even on text-only parts — checking truthiness, not hasattr,
+        # is what actually detects a real tool call.
+        if getattr(part, "function_call", None):
+            tool_calls.append(part.function_call)
+
+    if not tool_calls:
+        return text_reply.strip() or None
+
+    logger.info("🛠️ Gemini returned %d tool operations", len(tool_calls))
+    tool_results = []
+    for call in tool_calls:
+        tool_name = call.name
+        tool_args = call.args
+        # Enforce Household list for reminders
+        if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
+            tool_args["list_name"] = "Household"
+        logger.info("🛠️ Executing Tool: %s with arguments %s", tool_name, tool_args)
+        tool_result = _execute_tool_call(tool_name, tool_args)
+        logger.info("📤 Tool Output: %s", tool_result)
+        tool_results.append((tool_name, tool_result))
+
+    # Follow-up call with the *real* tool results (previously always sent
+    # back an empty {} regardless of what the tool actually returned).
+    follow_up_kwargs = {"tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
+    if not use_caching:
+        follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
+
+    follow_up_response = gemini_model.generate_content(
+        [
+            *messages,
+            {"role": "model", "parts": parts},
+            {
+                "role": "function",
+                "parts": [
+                    {"function_response": {"name": name, "response": {"result": result}}}
+                    for name, result in tool_results
+                ],
+            },
+        ],
+        **follow_up_kwargs,
+    )
+    if follow_up_response.candidates:
+        follow_up_parts = follow_up_response.candidates[0].content.parts
+        return "".join(p.text for p in follow_up_parts if hasattr(p, "text")).strip() or None
+    return None
+
+
+def query_llm_with_tools(prompt_text: str) -> str:
+    """One-shot DeepSeek-primary/Gemini-backup query with real tool execution.
+
+    Used by the `ivy` CLI's query mode. Unlike the iMessage poller and
+    /voice/query, this has no session state — just a single question, a
+    single dual-brain answer.
+    """
+    reply = None
+    try:
+        reply = execute_deepseek_call(
+            prompt_text,
+            DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+                current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+            ),
+        )
+    except Exception as exc:
+        logger.error("CLI query: DeepSeek primary layer fault: %s", exc)
+        reply = None
+
+    if not reply:
+        try:
+            reply = _gemini_backup_reply(prompt_text)
+        except Exception as exc:
+            logger.error("CLI query: Gemini backup layer fault: %s", exc)
+            reply = None
+
+    return reply or "No response."
 
 
 # ============================================================================
@@ -728,7 +885,7 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 
 
 # ============================================================================
-# BACKGROUND IMESSAGE WORKER: Gemini + DeepSeek Failover with CACHING
+# BACKGROUND IMESSAGE WORKER: DeepSeek Primary + Gemini Backup with CACHING
 # ============================================================================
 
 
@@ -737,7 +894,7 @@ def background_imessage_worker() -> None:
     
     🆕 Now with prompt caching enabled for 80-90% token savings!
     """
-    logger.info("🤖 Ivy Polling Thread Engaged (Gemini + DeepSeek Failover Core)")
+    logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
     logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
     
     last_id = get_last_message_id()
@@ -806,152 +963,37 @@ def background_imessage_worker() -> None:
             logger.info("📩 Inbound Trigger Isolated: %s", text)
             reply = None
 
-            # ========== PHASE 1: GEMINI PRIMARY (WITH CACHING) ==========
+            # ========== PHASE 1: DEEPSEEK PRIMARY ==========
             try:
-                logger.info("🧠 Querying Primary Engine (Gemini SDK)...")
-
-                # Check if Gemini API key is configured
-                if not os.environ.get("GEMINI_API_KEY", "").strip():
-                    raise ValueError("GEMINI_API_KEY not configured in environment")
-
-                # ✅ USE CACHED PROMPTS IF ENABLED
-                use_caching = ENABLE_PROMPT_CACHING and CACHING_AVAILABLE
-                if use_caching:
-                    # Create messages with prompt caching enabled
-                    messages = cache_manager.create_cached_gemini_request(
-                        user_message=text,
-                        system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-                        tool_declarations=GEMINI_TOOL_DECLARATIONS
-                    )
-
-                    if messages is None:
-                        logger.warning("Caching failed, falling back to non-cached request")
-                        messages = [genai.types.ContentDict(
-                            role="user",
-                            parts=[genai.types.PartDict(text=text)]
-                        )]
-                        use_caching = False
-                else:
-                    # No caching: use traditional method
-                    messages = [genai.types.ContentDict(
-                        role="user",
-                        parts=[genai.types.PartDict(text=text)]
-                    )]
-
-                # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
-                # The cache_manager already includes it in the message stream
-                if use_caching:
-                    response = gemini_model.generate_content(
-                        messages,
-                        tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
-                    )
-                else:
-                    response = gemini_model.generate_content(
-                        messages,
-                        tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
-                        system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-                    )
-
-                # 💾 LOG CACHE METRICS
-                if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
-                    cache_manager.log_cache_efficiency(
-                        response,
-                        endpoint="background_imessage_worker",
-                        model="gemini-2.5-flash"
-                    )
-
-                # Extract text and tool calls from response
-                if response.candidates and response.candidates[0].content:
-                    parts = response.candidates[0].content.parts
-                    text_reply = ""
-                    tool_calls = []
-
-                    for part in parts:
-                        if hasattr(part, "text") and part.text:
-                            text_reply += part.text
-                        if hasattr(part, "function_call"):
-                            tool_calls.append(part.function_call)
-
-                    # ========== Execute Tool Calls ==========
-                    if tool_calls:
-                        logger.info("🛠️ Gemini returned %d tool operations", len(tool_calls))
-
-                        for call in tool_calls:
-                            tool_name = call.name
-                            tool_args = call.args
-
-                            # Enforce Household list for reminders
-                            if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
-                                tool_args["list_name"] = "Household"
-
-                            logger.info(
-                                "🛠️ Executing Tool: %s with arguments %s",
-                                tool_name,
-                                tool_args,
-                            )
-
-                            if tool_name in globals():
-                                try:
-                                    tool_result = globals()[tool_name](**tool_args)
-                                except Exception as exec_err:
-                                    tool_result = f"Error: {str(exec_err)}"
-                            else:
-                                tool_result = f"Error: Function {tool_name} is undefined."
-
-                            logger.info("📤 Tool Output: %s", tool_result)
-
-                        # Follow-up call with tool results
-                        follow_up_kwargs = {
-                            "tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]
-                        }
-                        # Only pass system_instruction if NOT using caching (cache already includes it)
-                        if not use_caching:
-                            follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
-
-                        follow_up_response = gemini_model.generate_content(
-                            [
-                                *messages,
-                                {"role": "model", "parts": parts},
-                                {
-                                    "role": "function",
-                                    "parts": [
-                                        {"function_response": {"name": c.name, "response": {}}}
-                                        for c in tool_calls
-                                    ],
-                                },
-                            ],
-                            **follow_up_kwargs
-                        )
-                        if follow_up_response.candidates:
-                            follow_up_parts = follow_up_response.candidates[0].content.parts
-                            reply = "".join(
-                                [p.text for p in follow_up_parts if hasattr(p, "text")]
-                            ).strip()
-                    else:
-                        reply = text_reply.strip() if text_reply else None
-
-            except Exception as gemini_err:
+                logger.info("🧠 Querying Primary Engine (DeepSeek)...")
+                reply = execute_deepseek_call(text, deepseek_sys_instruction)
+            except Exception as deepseek_err:
                 logger.error(
-                    "❌ Gemini Primary Layer Fault: %s\nException type: %s\nFull traceback: %s. Switching to Failover Protocol...",
-                    str(gemini_err),
-                    type(gemini_err).__name__,
-                    repr(gemini_err),
+                    "❌ DeepSeek Primary Layer Fault: %s. Switching to Backup Protocol...",
+                    str(deepseek_err),
                 )
                 reply = None
 
-            # ========== PHASE 2: DEEPSEEK FAILOVER ==========
+            # ========== PHASE 2: GEMINI BACKUP (WITH CACHING) ==========
             if not reply:
                 try:
-                    logger.info("🛡️ Primary Engine Offline. Engaging Failover Core (DeepSeek)...")
-                    reply = execute_deepseek_call(text, deepseek_sys_instruction)
-                except Exception as loop_err:
-                    logger.error("❌ Failover Engine Layer Exception: %s", str(loop_err))
-                    reply = "❌ System Error: Both Primary and Failover layers are unavailable."
+                    logger.info("🛡️ Primary Engine Offline. Engaging Backup Core (Gemini SDK)...")
+                    reply = _gemini_backup_reply(text)
+                except Exception as gemini_err:
+                    logger.error(
+                        "❌ Gemini Backup Layer Fault: %s\nException type: %s\nFull traceback: %s.",
+                        str(gemini_err),
+                        type(gemini_err).__name__,
+                        repr(gemini_err),
+                    )
+                    reply = None
 
             # ========== DISPATCH RESPONSE ==========
             if reply:
                 logger.info("📤 Clean prose payload dispatched back via local AppleScript link.")
                 run_local_applescript_send(sender, str(reply))
+            else:
+                logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
 
             consecutive_failures = 0
 
@@ -1050,68 +1092,102 @@ def voice_query(
         if not session:
             raise HTTPException(status_code=400, detail="Invalid session")
 
-        # Create cached prompt using voice processor
-        messages = voice_processor.create_voice_prompt(
-            user_query=req.query,
-            session=session,
-            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-            tool_declarations=GEMINI_TOOL_DECLARATIONS
-        )
+        # Record the user's turn exactly once, regardless of which provider
+        # ends up answering.
+        session.add_message("user", req.query)
 
-        # Query Gemini with cache
-        # ⚠️ IMPORTANT: voice_processor includes system_instruction in messages,
-        # so don't pass it again as a kwarg (would cause conflicts)
+        reply = None
+        cached_tokens = 0
+
+        # ---- Phase 1: DeepSeek primary ----
         try:
-            response = gemini_model.generate_content(
-                messages,
-                tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+            reply = execute_deepseek_call(
+                req.query,
+                DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+                    current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+                ),
             )
+        except Exception as deepseek_err:
+            logger.warning(f"Voice: DeepSeek primary layer fault: {deepseek_err}")
+            reply = None
 
-            # Log cache metrics
-            cached_tokens = 0
-            if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
-                cached_tokens, _ = cache_manager.log_cache_efficiency(
-                    response,
-                    endpoint="voice_query",
-                    model="gemini-2.5-flash"
+        # ---- Phase 2: Gemini backup (cache-optimized, with tool execution) ----
+        if not reply:
+            try:
+                messages = voice_processor.create_voice_prompt(
+                    user_query=req.query,
+                    session=session,
+                    system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+                    tool_declarations=GEMINI_TOOL_DECLARATIONS
+                )
+                response = gemini_model.generate_content(
+                    messages,
+                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
                 )
 
-            # Extract response text
-            reply = ""
-            if response.candidates and response.candidates[0].content:
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, "text") and part.text:
-                        reply += part.text
+                if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
+                    cached_tokens, _ = cache_manager.log_cache_efficiency(
+                        response, endpoint="voice_query", model="gemini-2.5-flash"
+                    )
 
-            reply = reply.strip()
-            if not reply:
-                reply = "I didn't understand that. Please try again."
+                if response.candidates and response.candidates[0].content:
+                    parts = response.candidates[0].content.parts
+                    text_reply = ""
+                    tool_calls = []
+                    for part in parts:
+                        if hasattr(part, "text") and part.text:
+                            text_reply += part.text
+                        # Truthiness, not hasattr — see _gemini_backup_reply.
+                        if getattr(part, "function_call", None):
+                            tool_calls.append(part.function_call)
 
-            # Update session
-            session.add_message("assistant", reply)
-            voice_processor.log_voice_query(session, reply, cached_tokens)
+                    if tool_calls:
+                        tool_results = []
+                        for call in tool_calls:
+                            tool_name = call.name
+                            tool_args = call.args
+                            if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
+                                tool_args["list_name"] = "Household"
+                            tool_results.append((tool_name, _execute_tool_call(tool_name, tool_args)))
 
-            return VoiceQueryResponse(
-                session_id=session.session_id,
-                response=reply,
-                cached_tokens=cached_tokens,
-                total_queries=session.total_queries,
-                cache_hit_rate=(session.cache_hits / session.total_queries * 100) if session.total_queries > 0 else 0.0
-            )
+                        follow_up_response = gemini_model.generate_content(
+                            [
+                                *messages,
+                                {"role": "model", "parts": parts},
+                                {
+                                    "role": "function",
+                                    "parts": [
+                                        {"function_response": {"name": name, "response": {"result": result}}}
+                                        for name, result in tool_results
+                                    ],
+                                },
+                            ],
+                            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                        )
+                        if follow_up_response.candidates:
+                            follow_up_parts = follow_up_response.candidates[0].content.parts
+                            reply = "".join(
+                                p.text for p in follow_up_parts if hasattr(p, "text")
+                            ).strip() or None
+                    else:
+                        reply = text_reply.strip() or None
+            except Exception as gemini_err:
+                logger.warning(f"Voice: Gemini backup layer fault: {gemini_err}")
+                reply = None
 
-        except Exception as gemini_err:
-            logger.warning(f"Gemini error, falling back to DeepSeek: {gemini_err}")
-            reply = execute_deepseek_call(req.query, DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
-                current_date_str=datetime.now().strftime("%A, %B %d, %Y")
-            ))
-            session.add_message("assistant", reply)
-            return VoiceQueryResponse(
-                session_id=session.session_id,
-                response=reply,
-                cached_tokens=0,
-                total_queries=session.total_queries,
-                cache_hit_rate=0.0
-            )
+        if not reply:
+            reply = "I didn't understand that. Please try again."
+
+        session.add_message("assistant", reply)
+        voice_processor.log_voice_query(session, reply, cached_tokens)
+
+        return VoiceQueryResponse(
+            session_id=session.session_id,
+            response=reply,
+            cached_tokens=cached_tokens,
+            total_queries=session.total_queries,
+            cache_hit_rate=(session.cache_hits / session.total_queries * 100) if session.total_queries > 0 else 0.0
+        )
 
     except HTTPException:
         raise

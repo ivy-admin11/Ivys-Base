@@ -9,8 +9,8 @@ Modes:
      Usage: ./ivy run <job_name>
      Usage: ./ivy list
 
-Runs requests through Ivy's full dual-brain agent (Gemini 2.5 Flash →
-DeepSeek failover) with all live tools (calendar, reminders, Readwise, jobs).
+Runs requests through Ivy's full dual-brain agent (DeepSeek primary →
+Gemini 2.5 Flash backup) with all live tools (calendar, reminders, Readwise, jobs).
 Prints only Ivy's answer.
 
 Examples:
@@ -64,6 +64,6 @@ import main  # loads .env + wires the agent (does NOT start the server/poller)
 
 # Silence the agent's verbose reasoning chain; keep only the final answer.
 with contextlib.redirect_stdout(open(os.devnull, "w")):
-    reply = main._query_gemini_with_fallover(prompt)
+    reply = main.query_llm_with_tools(prompt)
 
 print(reply or "No response.")

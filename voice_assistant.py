@@ -211,9 +211,10 @@ class VoiceProcessor:
         """
         Create optimized prompt for voice query using cached system context.
         Returns messages list ready for Gemini with cache control.
+
+        Does NOT record the user's turn into session history — the caller
+        does that once, regardless of which provider ends up answering.
         """
-        # Update session context
-        session.add_message("user", user_query)
         conversation_context = session.get_context()
 
         # Build system prompt with conversation history
