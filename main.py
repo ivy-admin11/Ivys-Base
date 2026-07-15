@@ -547,6 +547,8 @@ def run_job(job_name: str) -> str:
         return f"⏳ {message}"
     elif status == JobStatus.NOT_FOUND:
         return f"❓ {message}"
+    elif status == JobStatus.UNAVAILABLE:
+        return f"🚫 {message}"
     else:
         return f"❌ {message}"
 
