@@ -2,12 +2,11 @@
 import sys
 import os
 
-# Dynamically calculate the project root and point directly to the hidden .ivy directory
+# Dynamically calculate the project root so the version-controlled ivy_core
+# package (and picks_formatter, below) resolve regardless of CWD.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-IVY_PATH = os.path.join(PROJECT_ROOT, ".ivy")
-
-if IVY_PATH not in sys.path:
-    sys.path.insert(0, IVY_PATH)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Native .env auto-loader (mirrors main.py) so this agent works standalone —
 # anchored to PROJECT_ROOT, not the CWD, and never clobbers vars already
@@ -48,7 +47,6 @@ import requests
 from ivy_core import require_env, send_imessage
 
 # PDF formatter for professional reports
-sys.path.insert(0, PROJECT_ROOT)
 from picks_formatter import PicksReportFormatter
 
 # xAI SDK (recommended) or OpenAI-compatible client

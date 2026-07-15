@@ -24,17 +24,9 @@ except ImportError:
     print("❌ Failed to import from main.py or config.py")
     sys.exit(1)
 
-# Try importing send_imessage via ivy_core
+# Try importing send_imessage via the version-controlled ivy_core package
 try:
-    import importlib.util
-    ivy_core_path = os.path.join(parent_dir, ".ivy", "ivy_core.py")
-    if os.path.exists(ivy_core_path):
-        spec = importlib.util.spec_from_file_location("ivy_core", ivy_core_path)
-        ivy_core = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(ivy_core)
-        send_imessage = ivy_core.send_imessage
-    else:
-        send_imessage = None
+    from ivy_core import send_imessage
 except Exception as e:
     print(f"⚠️  Could not import send_imessage: {e}")
     send_imessage = None

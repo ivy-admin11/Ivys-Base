@@ -36,16 +36,7 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-# Import from the .ivy module at the project root
-import importlib.util
-ivy_core_path = os.path.join(parent_dir, ".ivy", "ivy_core.py")
-spec = importlib.util.spec_from_file_location("ivy_core", ivy_core_path)
-ivy_core = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ivy_core)
-
-require_env = ivy_core.require_env
-send_imessage = ivy_core.send_imessage
-query_gemini = ivy_core.query_gemini
+from ivy_core import require_env, send_imessage, query_llm
 
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
@@ -199,7 +190,7 @@ def generate_family_meal_plan() -> Dict[str, Any]:
     """
 
     try:
-        response = query_gemini(
+        response = query_llm(
             meal_plan_prompt,
             temperature=0.7,
         )
