@@ -1,22 +1,22 @@
 #!/bin/bash
+# Scheduled entrypoint for Happy Hour Scout (com.ivy.happy_hour_scout).
+#
+# .env is loaded by the agent's own auto-loader — never export secrets from
+# a shell script; `export $(cat .env | xargs)` leaks every value into `ps`
+# output and breaks on anything containing spaces/quotes/$.
 
-# Happy Hour Scout Launcher — Lifestyle exploration automation
-# Scheduled via launchd for weekly Monday noon alerts
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
 
-cd /Users/lexi/openclaw-admin
-
-# Load environment
-if [ -f .env ]; then
-    export $(cat .env | grep -v '#' | xargs)
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: project venv python not found at $PYTHON" >&2
+    exit 1
 fi
 
-# Execute scout cycle with live alert dispatch
-python3 -c "
-from proactive_agents.happy_hour_scout import execute_scout_cycle
-import sys
-sys.path.insert(0, '/Users/lexi/openclaw-admin')
-result = execute_scout_cycle(send_alert=True)
-sys.exit(0 if result['status'] == 'success' else 1)
-" 2>&1 | tee -a ~/.ivy_logs/happy_hour_scout.log
+cd "$PROJECT_ROOT" || exit 1
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PYTHONPATH="$PROJECT_ROOT"
 
-exit $?
+mkdir -p "$PROJECT_ROOT/logs"
+exec "$PYTHON" -m proactive_agents.happy_hour_scout --scheduled --send >> "$PROJECT_ROOT/logs/happy_hour_scheduled.log" 2>&1

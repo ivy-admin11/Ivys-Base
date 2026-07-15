@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Replaces the old com.ivy.weeklyplanner label, which pointed at
+         proactive_agents/weekly_planner.py — a file that has never existed
+         in any committed branch, so this schedule never actually ran
+         anything. Points at the real, working Familia_meal_planner.py.
+         --scheduled preserves the 48-hour gate; --send actually delivers. -->
+    <key>Label</key>
+    <string>com.ivy.familia_meal_planner</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VENV_PYTHON__</string>
+        <string>-m</string>
+        <string>proactive_agents.Familia_meal_planner</string>
+        <string>--scheduled</string>
+        <string>--send</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT_ROOT__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>__PROJECT_ROOT__/logs/familia_meal_planner.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_ROOT__/logs/familia_meal_planner.log</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+        <key>Weekday</key>
+        <integer>0</integer>
+    </dict>
+</dict>
+</plist>

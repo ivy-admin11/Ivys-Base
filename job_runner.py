@@ -88,7 +88,11 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.happy_hour_scout",
         entrypoint="proactive_agents.happy_hour_scout:run",
-        schedule="Sundays 12pm CST",
+        # NOTE: the actual installed plist's StartCalendarInterval sets
+        # Weekday=1, which is Monday in launchd's convention (0/7=Sunday),
+        # not Sunday as this description previously (incorrectly) claimed.
+        # Preserved as-is pending confirmation of which day was intended.
+        schedule="Mondays 12pm CST",
     ),
     Job(
         name="bravo_scout",
@@ -117,7 +121,9 @@ JOB_REGISTRY = [
             "text it to the household"
         ),
         executor="entrypoint",
+        target="com.ivy.familia_meal_planner",  # new scheduled label — see deploy/launchd/
         entrypoint="proactive_agents.Familia_meal_planner:run",
+        schedule="Sundays 8am CST",
     ),
     Job(
         name="brain",

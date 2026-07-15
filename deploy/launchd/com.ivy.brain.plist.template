@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Brain's implementation lives outside this repo, at __HOME__/ai-admin-api/agent.py.
+         Tracked here for reference/backup only — this repo cannot fix or maintain that
+         project's code, only record what the currently-installed job points at. -->
+    <key>Label</key>
+    <string>com.ivy.brain</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__HOME__/ai-admin-api/agent.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/ai-admin-api/ivy_brain_output.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/ai-admin-api/ivy_brain_error.log</string>
+</dict>
+</plist>
