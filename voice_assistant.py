@@ -9,13 +9,11 @@ Features:
 - Session persistence and cleanup
 """
 
-import json
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, List, Any
-from pathlib import Path
 from enum import Enum
 
 try:

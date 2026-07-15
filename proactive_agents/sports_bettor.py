@@ -38,7 +38,7 @@ returns no usable picks, run() returns a "no_picks" result without sending
 import hashlib
 import json
 import re
-import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -714,7 +714,7 @@ def format_picks_pdf(merged):
     }
 
     # Generate PDF
-    pdf_path = f"/tmp/ivy_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    pdf_path = os.path.join(tempfile.gettempdir(), f"ivy_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     formatter.generate_pdf(
         filename=pdf_path,
         summary=summary,

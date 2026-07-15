@@ -3,7 +3,6 @@ a job was actually dispatched, not something an LLM gets to assert on its
 own. Backed by SQLite at logs/executions.db (gitignored).
 """
 
-import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone

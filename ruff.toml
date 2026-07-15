@@ -1,0 +1,9 @@
+line-length = 120
+exclude = [".venv", ".claude", "deploy", "logs", "data"]
+
+[lint]
+ignore = [
+    "E402",  # module-import-not-at-top-of-file — several scripts legitimately
+             # insert the project root onto sys.path before importing local
+             # packages (proactive_agents/*, the ivy CLI, tests/conftest.py)
+]

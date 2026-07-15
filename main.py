@@ -42,7 +42,6 @@ import google.generativeai as genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Callable
-from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
@@ -54,15 +53,12 @@ from config import (
     DB_RETRY_BACKOFF,
     CHAT_DB_PATH,
     EXTERNAL_API_TIMEOUT,
-    PLAYWRIGHT_TIMEOUT_MS,
     ENABLE_IMESSAGE_POLLER,
     ENABLE_CALENDAR_INTEGRATION,
     ENABLE_REMINDERS_INTEGRATION,
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
-    PLAYWRIGHT_HEADLESS,
     ADMIN_SECRET,
-    HENRY_PHONE,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,

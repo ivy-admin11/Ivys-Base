@@ -16,8 +16,9 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+import tempfile
+from datetime import datetime
+from typing import Dict, Optional, Any
 
 # Add parent directory to path for .ivy module access
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,7 +36,7 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-from ivy_core import require_env, send_imessage, send_imessage_attachment, query_llm, strip_json_fence
+from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
@@ -264,7 +265,7 @@ def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
         "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
     }
 
-    pdf_path = f"/tmp/happy_hour_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    pdf_path = os.path.join(tempfile.gettempdir(), f"happy_hour_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     formatter.generate_pdf(
         filename=pdf_path,
         summary=summary,

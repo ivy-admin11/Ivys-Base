@@ -180,9 +180,13 @@ class JobRunner:
         success — a missing plist, a nonexistent entrypoint module, or a
         nonzero launchctl exit code all come back as an explicit failure.
         """
-        execution_id = receipts.record_start(job_name, requester=requester)
-
+        # Record the receipt under the canonical job name once resolved, not
+        # the raw alias the caller typed — otherwise "picks", "sharppicks",
+        # and "sports picks" would each fragment execution history under a
+        # different job_name for what is really the same job.
         job = self.find_job(job_name)
+        execution_id = receipts.record_start(job.name if job else job_name, requester=requester)
+
         if not job:
             available_names = ", ".join(j.display_name for j in self.registry.values() if j.available)
             status, message = JobStatus.NOT_FOUND, f"Job '{job_name}' not found. Available jobs: {available_names}"

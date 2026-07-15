@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      ALLOW_INSECURE_ADMIN_SECRET: "true"
+      ADMIN_SECRET: "ci-test-secret"
+      HENRY_PHONE: "+15555550100"
+      LEXI_PHONE: "+15555550101"
+      GEMINI_API_KEY: ""
+      DEEPSEEK_API_KEY: ""
+      XAI_API_KEY: "test-xai-key-not-real"
+      ODDS_API_KEY: ""
+      READWISE_API_KEY: ""
+      ENABLE_IMESSAGE_POLLER: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: compileall
+        run: python -m compileall -q main.py config.py registry.py job_runner.py trigger_capabilities_alert.py cache_manager.py voice_assistant.py ivy_core proactive_agents utils tests
+
+      - name: Secret scan (fail on committed .env or credential files)
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$|google_credentials\.json$|token\.json$|service-account-key\.json$'; then
+            echo "A secret-shaped file is tracked in git — see the paths above." >&2
+            exit 1
+          fi
+          echo "No tracked secret files found."
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Bandit
+        run: bandit -r main.py config.py registry.py job_runner.py ivy_core proactive_agents utils cache_manager.py voice_assistant.py trigger_capabilities_alert.py -ll
+
+      - name: pytest
+        run: pytest -v

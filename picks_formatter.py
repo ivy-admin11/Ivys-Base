@@ -9,17 +9,16 @@ Effort: ~200 lines of reportlab code. Dependencies already in requirements.txt.
 """
 
 from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.colors import HexColor, black, white
+from reportlab.lib.colors import HexColor, white
 from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 )
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER
 
 
 class PicksReportFormatter:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from typing import List, Optional
+from typing import List
 
 logger = logging.getLogger("ivy.applescript")
 

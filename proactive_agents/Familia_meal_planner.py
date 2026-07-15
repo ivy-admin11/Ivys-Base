@@ -16,8 +16,9 @@ import os
 import sys
 import json
 import logging
+import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, Any
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -37,7 +38,7 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-from ivy_core import require_env, send_imessage, send_imessage_attachment, query_llm, strip_json_fence
+from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
@@ -339,7 +340,7 @@ def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
         "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
     }
 
-    pdf_path = f"/tmp/meal_plan_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    pdf_path = os.path.join(tempfile.gettempdir(), f"meal_plan_{datetime.now():%Y%m%d_%H%M%S}.pdf")
     formatter.generate_pdf(
         filename=pdf_path,
         summary=summary,

@@ -14,8 +14,8 @@ CLAUDE COST CRISIS FIX:
 import logging
 import hashlib
 import json
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime
+from typing import Dict, Any, List, Tuple
 
 try:
     import google.generativeai as genai
@@ -61,7 +61,7 @@ class PromptCacheManager:
             "system": system_instruction,
             "tools": tool_declarations
         }, sort_keys=True)
-        config_hash = hashlib.md5(config_str.encode()).hexdigest()
+        config_hash = hashlib.md5(config_str.encode(), usedforsecurity=False).hexdigest()
 
         # Return cached block if config hasn't changed
         if self._cached_system_hash == config_hash and self._cached_system_block:

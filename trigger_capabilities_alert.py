@@ -6,10 +6,8 @@ Fetches all available tools/skills and sends a formatted summary to Henry.
 
 import os
 import sys
-import json
 import logging
 from datetime import datetime
-from pathlib import Path
 
 # Add parent directory to path for module access
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,7 +55,7 @@ def format_capabilities_alert() -> str:
     # Build SMS-friendly format
     lines = [
         "🤖 IVY TOOLKIT STATUS",
-        f"━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━",
         f"✅ READY ({len(ready_tools)}):"
     ]
 
