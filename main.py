@@ -109,16 +109,9 @@ except ImportError:
     logger_temp.warning("job_runner not found; job execution disabled")
 
 # ============================================================================
-# ENVIRONMENT LOADER & LOGGING SETUP
+# LOGGING SETUP
 # ============================================================================
-
-# 🚀 Native Environment Auto-Loader
-if os.path.exists(".env"):
-    with open(".env", "r") as f:
-        for line in f:
-            if "=" in line and not line.strip().startswith("#"):
-                k, v = line.strip().split("=", 1)
-                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+# .env is loaded by config.py (imported above) before any settings are read.
 
 logging.basicConfig(
     level=LOG_LEVEL,

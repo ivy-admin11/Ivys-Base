@@ -7,7 +7,15 @@ This file is environment-agnostic; environment-specific secrets should go in .en
 """
 
 import os
+from pathlib import Path
 from typing import Dict, Any, List
+
+from dotenv import load_dotenv
+
+# Load .env from the project root before any os.environ.get() calls below run.
+# override=False so variables already exported by the shell or launchd win —
+# .env only fills in what isn't already set.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 # ============================================================================
 # POLLING & DATABASE CONFIGURATION
@@ -68,15 +76,50 @@ PLAYWRIGHT_ENABLED: bool = os.environ.get("PLAYWRIGHT_ENABLED", "true").lower() 
 PLAYWRIGHT_HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 """Run Playwright in headless mode (no window)"""
 
+ENABLE_SPORTS_PICKS: bool = os.environ.get("ENABLE_SPORTS_PICKS", "true").lower() == "true"
+"""Enable/disable the Sharp Picks sports-betting job/tool"""
+
 # ============================================================================
 # SECURITY & AUTHENTICATION
 # ============================================================================
 
-ADMIN_SECRET: str = os.environ.get("ADMIN_SECRET", "change_this_in_production")
+ADMIN_SECRET: str = os.environ.get("ADMIN_SECRET", "")
 """Shared secret for protecting FastAPI endpoints (HTTP header: X-API-Key)"""
+
+if not ADMIN_SECRET:
+    if os.environ.get("ALLOW_INSECURE_ADMIN_SECRET", "").lower() == "true":
+        ADMIN_SECRET = "insecure-test-secret-do-not-use-in-production"
+    else:
+        raise RuntimeError(
+            "ADMIN_SECRET is not set. Set ADMIN_SECRET in your environment or .env file. "
+            "For local/test use only, set ALLOW_INSECURE_ADMIN_SECRET=true instead."
+        )
 
 HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "+12147334061")
 """Primary authorized contact for approval workflows"""
+
+LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "+18179138648")
+"""Secondary authorized contact for approval workflows"""
+
+# ============================================================================
+# PROVIDER & EXTERNAL SERVICE API KEYS (optional — missing keys disable only
+# the dependent capability, they must never raise at import time)
+# ============================================================================
+
+DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
+"""DeepSeek API key (primary LLM)"""
+
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+"""Gemini API key (backup/failover LLM)"""
+
+XAI_API_KEY: str = os.environ.get("XAI_API_KEY", "")
+"""xAI (Grok) API key, used by the 'brain' job"""
+
+ODDS_API_KEY: str = os.environ.get("ODDS_API_KEY", "")
+"""The Odds API key, used by the Sharp Picks job"""
+
+READWISE_API_KEY: str = os.environ.get("READWISE_API_KEY", "")
+"""Readwise API key"""
 
 # ============================================================================
 # PROMPT CACHING (Token Cost Optimization)

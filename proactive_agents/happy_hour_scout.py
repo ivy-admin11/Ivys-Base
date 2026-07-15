@@ -24,6 +24,17 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
+# Native .env auto-loader (mirrors sports_bettor.py) so this agent works
+# standalone — anchored to parent_dir, not the CWD, and never clobbers vars
+# already exported in the shell/launchd.
+_ENV_PATH = os.path.join(parent_dir, ".env")
+if os.path.exists(_ENV_PATH):
+    with open(_ENV_PATH, "r") as _f:
+        for _line in _f:
+            if "=" in _line and not _line.strip().startswith("#"):
+                _k, _v = _line.strip().split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 # Import from the .ivy module at the project root
 import importlib.util
 ivy_core_path = os.path.join(parent_dir, ".ivy", "ivy_core.py")
