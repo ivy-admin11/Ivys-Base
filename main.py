@@ -1,12 +1,12 @@
 """
-Ivy Local Admin API Gateway v2.1 — Refactored Main Module
+Ivy Local Admin API Gateway v2.2 — Voice Assistant Edition
 
 Architecture:
 - Phase 1: Critical fixes (duplicates, auth, f-string bugs)
 - Phase 2: Config consolidation (tool schemas, timeouts, feature flags)
 - Phase 3: Gemini SDK refactor (use google.generativeai official library)
 - Phase 4: Prompt caching for 80-90% token cost reduction ✅ IMPLEMENTED
-- Phase 5: /stage_groceries authorization (favorites.json validation)
+- Phase 5: Voice assistant with session management and cache optimization ✅ IMPLEMENTED
 
 All hardcoded values are extracted to config.py for centralized tuning.
 Environment-specific secrets go in .env (see .env.example).
@@ -16,9 +16,15 @@ Security:
 - Database reads use SQLite read-only mode to prevent accidental mutations
 - iMessage poller validates sender against favorites.json whitelist
 
+Voice Assistant Features:
+- Session-based conversation management with automatic cleanup
+- Cache-optimized queries for 80-90% token savings on repeated interactions
+- Fallover from Gemini to DeepSeek for reliability
+- Real-time cache statistics and session monitoring
+
 Cost Optimization:
-- Prompt caching enabled: 80-90% reduction on repeated Gemini input tokens
-- Cache statistics logged: monitor savings in real-time
+- Prompt caching enabled: 80-90% reduction on repeated input tokens
+- Voice queries benefit from cached system instructions and context
 - Expected monthly cost: $8-12 (down from $230+)
 """
 
@@ -49,7 +55,6 @@ from config import (
     EXTERNAL_API_TIMEOUT,
     PLAYWRIGHT_TIMEOUT_MS,
     ENABLE_IMESSAGE_POLLER,
-    ENABLE_GROCERY_STAGING,
     ENABLE_CALENDAR_INTEGRATION,
     ENABLE_REMINDERS_INTEGRATION,
     ENABLE_READWISE_INTEGRATION,
@@ -81,6 +86,18 @@ except ImportError:
     logger_temp = logging.getLogger("ivy.gateway")
     logger_temp.warning("cache_manager not found; prompt caching disabled")
 
+# Import voice assistant module
+try:
+    from voice_assistant import voice_session_manager, VoiceProcessor
+    VOICE_ASSISTANT_AVAILABLE = True
+    # Initialize with cache manager if available
+    voice_processor = VoiceProcessor(cache_manager=cache_manager if CACHING_AVAILABLE else None)
+except ImportError:
+    VOICE_ASSISTANT_AVAILABLE = False
+    voice_processor = None
+    logger_temp = logging.getLogger("ivy.gateway")
+    logger_temp.warning("voice_assistant not found; voice features disabled")
+
 # ============================================================================
 # ENVIRONMENT LOADER & LOGGING SETUP
 # ============================================================================
@@ -99,17 +116,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ivy.gateway")
 
-# 🛡️ Guarded Playwright import
+# 🛡️ Guarded Playwright import (grocery staging removed)
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = PLAYWRIGHT_ENABLED
 except ImportError:
     async_playwright = None
     PLAYWRIGHT_AVAILABLE = False
-    logger.warning(
-        "Playwright not installed — /stage_groceries will be unavailable. "
-        "Run: pip install playwright && playwright install chromium"
-    )
+    logger.info("Playwright not available (optional — grocery staging removed)")
 
 # ============================================================================
 # GEMINI SDK CONFIGURATION
@@ -117,6 +131,32 @@ except ImportError:
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+
+# ============================================================================
+# PYDANTIC MODELS (Voice Assistant)
+# ============================================================================
+
+class VoiceQueryRequest(BaseModel):
+    """Voice query request with optional session ID."""
+    query: str
+    user_id: str
+    session_id: Optional[str] = None
+
+class VoiceQueryResponse(BaseModel):
+    """Voice query response with session and cache info."""
+    session_id: str
+    response: str
+    cached_tokens: int = 0
+    total_queries: int = 0
+    cache_hit_rate: float = 0.0
+
+class VoiceSessionResponse(BaseModel):
+    """Voice session information."""
+    session_id: str
+    user_id: str
+    state: str
+    message_count: int
+    cache_hit_rate: float
 
 # ============================================================================
 # TOOL REGISTRY (Powers /capabilities, /health, startup banner)
@@ -163,10 +203,10 @@ TOOLS_LIST = [
         "required_env": [["DEEPSEEK_API_KEY"]],
     },
     {
-        "name": "stage_groceries",
-        "description": "Stages a grocery cart at H-E-B or Kroger via headless browser (human checks out).",
-        "required_env": [["HEB_USERNAME", "KROGER_USERNAME"]],
-        "enabled": ENABLE_GROCERY_STAGING,
+        "name": "voice_assistant",
+        "description": "Voice conversation with session management and cache-optimized queries.",
+        "required_env": [],
+        "enabled": True,
     },
     {
         "name": "get_capabilities",
@@ -199,16 +239,9 @@ def compute_tool_statuses() -> List[Dict[str, Any]]:
             g for g in tool.get("required_env", [])
             if not _env_group_satisfied(g)
         ]
-        extra_block = ""
-        if tool["name"] == "stage_groceries" and not PLAYWRIGHT_AVAILABLE:
-            extra_block = "Playwright not installed (pip install playwright && playwright install chromium)"
 
-        if missing_groups or extra_block:
-            reasons = []
-            for g in missing_groups:
-                reasons.append("Missing " + " or ".join(g) + " environment variable")
-            if extra_block:
-                reasons.append(extra_block)
+        if missing_groups:
+            reasons = ["Missing " + " or ".join(g) + " environment variable" for g in missing_groups]
             status, reason = "unavailable", "; ".join(reasons)
         else:
             status, reason = "ready", None
@@ -225,14 +258,19 @@ def compute_tool_statuses() -> List[Dict[str, Any]]:
 def print_startup_banner() -> None:
     """Colorful ANSI banner of every tool's health."""
     GREEN, RED, YELLOW, BOLD, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[1m", "\033[0m"
-    lines = [f"{BOLD}🚀 Ivy Gateway v2.1 — Refactored{RESET}"]
-    
-    # Add caching status
+    lines = [f"{BOLD}🚀 Ivy Gateway v2.2 — Voice Assistant Edition{RESET}"]
+
+    # Add feature statuses
     if ENABLE_PROMPT_CACHING and CACHING_AVAILABLE:
         lines.append(f"{GREEN}💾 Prompt Caching:     ENABLED (80-90% token savings){RESET}")
     else:
         lines.append(f"{YELLOW}⊘ Prompt Caching:     DISABLED{RESET}")
-    
+
+    if VOICE_ASSISTANT_AVAILABLE:
+        lines.append(f"{GREEN}🎙️  Voice Assistant:    ENABLED (session-based, cache-optimized){RESET}")
+    else:
+        lines.append(f"{YELLOW}⊘ Voice Assistant:    DISABLED{RESET}")
+
     for s in compute_tool_statuses():
         if s["status"] == "ready":
             lines.append(f"{GREEN}✅ {s['tool_name']:<22} Ready{RESET}")
@@ -249,28 +287,14 @@ def print_startup_banner() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Launch persistent Chromium, print banner, start iMessage poller."""
+    """Print banner, start iMessage poller, initialize voice assistant."""
     print_startup_banner()
 
-    # Initialize browser state (may be None if Playwright unavailable)
-    app.state.browser = None
-    app.state.playwright = None
+    # Initialize voice session manager if available
+    if VOICE_ASSISTANT_AVAILABLE:
+        logger.info("Voice session manager initialized and ready.")
 
-    if PLAYWRIGHT_AVAILABLE:
-        try:
-            app.state.playwright = await async_playwright().start()
-            app.state.browser = await app.state.playwright.chromium.launch(
-                headless=PLAYWRIGHT_HEADLESS
-            )
-            logger.info("Headless Chromium launched and held in app.state.browser.")
-        except Exception as launch_err:
-            logger.error(
-                "Could not launch Chromium (%s) — /stage_groceries disabled this run.",
-                launch_err,
-            )
-            app.state.browser = None
-    else:
-        logger.warning("Skipping browser launch — Playwright unavailable.")
+    # Start iMessage poller if enabled
 
     # Start iMessage poller if enabled
     if ENABLE_IMESSAGE_POLLER:
@@ -281,20 +305,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if app.state.browser is not None:
-            try:
-                await app.state.browser.close()
-            except Exception:
-                pass
-        if app.state.playwright is not None:
-            try:
-                await app.state.playwright.stop()
-            except Exception:
-                pass
-        logger.info("Gateway shutdown complete; browser resources released.")
+        logger.info("Gateway shutdown complete.")
 
 
-app = FastAPI(title="Ivy Local Admin API Gateway v2.1", lifespan=lifespan)
+app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", lifespan=lifespan)
 
 # ============================================================================
 # SECURITY: Authentication Middleware
@@ -966,165 +980,178 @@ def get_cache_stats(authenticated: bool = Depends(verify_api_key)):
 
 
 # ============================================================================
-# GROCERY STAGING: Playwright Browser Automation
+# ============================================================================
+# VOICE ASSISTANT ENDPOINTS
 # ============================================================================
 
 
-class GroceryRequest(BaseModel):
-    """Request schema for /stage_groceries endpoint."""
-    store: str
-    ingredients: List[str]
-
-
-async def _add_single_ingredient(page: Any, cfg: Dict[str, str], store: str, ingredient: str) -> bool:
-    """Search and add one ingredient. Returns True on success."""
-    for attempt in (1, 2):
-        try:
-            logger.info(
-                "search | store=%s ingredient=%s attempt=%s",
-                store,
-                ingredient,
-                attempt,
-            )
-            search = page.locator(cfg["search_selector"])
-            await search.wait_for(timeout=PLAYWRIGHT_TIMEOUT_MS)
-            await search.fill(ingredient, timeout=PLAYWRIGHT_TIMEOUT_MS)
-
-            if cfg.get("search_button_selector"):
-                await page.locator(cfg["search_button_selector"]).click(
-                    timeout=PLAYWRIGHT_TIMEOUT_MS
-                )
-            else:
-                await search.press("Enter", timeout=PLAYWRIGHT_TIMEOUT_MS)
-
-            await page.locator(cfg["first_result_selector"]).wait_for(
-                timeout=PLAYWRIGHT_TIMEOUT_MS
-            )
-
-            logger.info(
-                "add_to_cart | store=%s ingredient=%s attempt=%s",
-                store,
-                ingredient,
-                attempt,
-            )
-            await page.locator(cfg["add_to_cart_selector"]).click(
-                timeout=PLAYWRIGHT_TIMEOUT_MS
-            )
-            return True
-        except Exception as step_err:
-            logger.warning(
-                "step_failed | store=%s ingredient=%s attempt=%s error=%s",
-                store,
-                ingredient,
-                attempt,
-                step_err,
-            )
-            if attempt == 2:
-                return False
-    return False
-
-
-@app.post("/stage_groceries")
-async def stage_groceries(
-    req: GroceryRequest,
+@app.post("/voice/query", response_model=VoiceQueryResponse)
+def voice_query(
+    req: VoiceQueryRequest,
     authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Stage a grocery cart at H-E-B or Kroger.
-    NEVER proceeds to payment/checkout — human checks out.
-    Requires authorization from favorites.json.
-    """
-
-    store = req.store
-    configs = load_store_configs()
-
-    if store not in configs:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported store '{store}'. Use one of: {list(configs)}",
-        )
-
-    if not PLAYWRIGHT_AVAILABLE or getattr(app.state, "browser", None) is None:
+    """Process a voice query with session management and cache optimization."""
+    if not VOICE_ASSISTANT_AVAILABLE:
         raise HTTPException(
             status_code=503,
-            detail="Grocery staging unavailable: browser engine not running.",
+            detail="Voice assistant not available"
         )
-
-    username = os.environ.get(f"{store.upper()}_USERNAME", "")
-    password = os.environ.get(f"{store.upper()}_PASSWORD", "")
-    if not username or not password:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Missing {store.upper()}_USERNAME/{store.upper()}_PASSWORD "
-                "environment variables."
-            ),
-        )
-
-    cfg = configs[store]
-    added, failed = [], []
-
-    # Isolated context per request
-    context = await app.state.browser.new_context()
-    page = await context.new_page()
-
-    # 🛡️ Hard guardrail: block checkout URLs
-    async def _block_checkout(route):
-        if "checkout" in route.request.url.lower():
-            logger.warning("blocked_checkout | store=%s url=%s", store, route.request.url)
-            await route.abort()
-        else:
-            await route.continue_()
-
-    await context.route("**/checkout*", _block_checkout)
 
     try:
-        logger.info("login | store=%s url=%s", store, cfg["login_url"])
-        await page.goto(cfg["login_url"], timeout=PLAYWRIGHT_TIMEOUT_MS)
-        await page.locator(cfg["username_selector"]).fill(username, timeout=PLAYWRIGHT_TIMEOUT_MS)
-        await page.locator(cfg["password_selector"]).fill(password, timeout=PLAYWRIGHT_TIMEOUT_MS)
-        await page.locator(cfg["password_selector"]).press("Enter", timeout=PLAYWRIGHT_TIMEOUT_MS)
+        # Get or create session
+        if req.session_id:
+            session = voice_session_manager.get_session(req.session_id)
+        else:
+            session = voice_session_manager.get_user_session(req.user_id)
 
-        for ingredient in req.ingredients:
-            ok = await _add_single_ingredient(page, cfg, store, ingredient)
-            if ok:
-                added.append(ingredient)
-            else:
-                failed.append(f"{ingredient} (unavailable)")
+        if not session:
+            raise HTTPException(status_code=400, detail="Invalid session")
 
-        # Optional cart verification
-        cart_selector = cfg.get("cart_confirmation_selector")
-        if cart_selector:
-            try:
-                await page.locator(cart_selector).wait_for(timeout=PLAYWRIGHT_TIMEOUT_MS)
-                logger.info("cart_verified | store=%s items=%s", store, len(added))
-            except Exception:
-                logger.warning(
-                    "cart_verify_skipped | store=%s (confirmation element not found)",
-                    store,
-                )
-    except Exception as flow_err:
-        logger.error("staging_flow_error | store=%s error=%s", store, flow_err)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Grocery staging failed during login/flow: {flow_err}",
+        # Create cached prompt using voice processor
+        messages = voice_processor.create_voice_prompt(
+            user_query=req.query,
+            session=session,
+            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+            tool_declarations=GEMINI_TOOL_DECLARATIONS
         )
-    finally:
-        await context.close()
 
-    if added and failed:
-        status = "partial_success"
-    elif added:
-        status = "success"
-    else:
-        status = "failed"
+        # Query Gemini with cache
+        try:
+            response = gemini_model.generate_content(
+                messages,
+                tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+            )
 
-    store_label = "H-E-B" if store.upper() == "HEB" else store
+            # Log cache metrics
+            cached_tokens = 0
+            if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
+                cached_tokens, _ = cache_manager.log_cache_efficiency(
+                    response,
+                    endpoint="voice_query",
+                    model="gemini-2.5-flash"
+                )
+
+            # Extract response text
+            reply = ""
+            if response.candidates and response.candidates[0].content:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "text") and part.text:
+                        reply += part.text
+
+            reply = reply.strip()
+            if not reply:
+                reply = "I didn't understand that. Please try again."
+
+            # Update session
+            session.add_message("assistant", reply)
+            voice_processor.log_voice_query(session, reply, cached_tokens)
+
+            return VoiceQueryResponse(
+                session_id=session.session_id,
+                response=reply,
+                cached_tokens=cached_tokens,
+                total_queries=session.total_queries,
+                cache_hit_rate=(session.cache_hits / session.total_queries * 100) if session.total_queries > 0 else 0.0
+            )
+
+        except Exception as gemini_err:
+            logger.warning(f"Gemini error, falling back to DeepSeek: {gemini_err}")
+            reply = execute_deepseek_call(req.query, DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+                current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+            ))
+            session.add_message("assistant", reply)
+            return VoiceQueryResponse(
+                session_id=session.session_id,
+                response=reply,
+                cached_tokens=0,
+                total_queries=session.total_queries,
+                cache_hit_rate=0.0
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Voice query error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/voice/session")
+def create_voice_session(
+    user_id: str,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Create a new voice session for a user."""
+    if not VOICE_ASSISTANT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice assistant not available"
+        )
+
+    session = voice_session_manager.create_session(user_id)
     return {
-        "status": status,
-        "added": added,
-        "failed": failed,
-        "message": f"Cart staged at {store_label}. Awaiting human checkout.",
+        "session_id": session.session_id,
+        "user_id": session.user_id,
+        "created_at": session.created_at.isoformat(),
+        "ttl_seconds": session.ttl_seconds
+    }
+
+
+@app.get("/voice/session/{session_id}")
+def get_voice_session(
+    session_id: str,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Get voice session details."""
+    if not VOICE_ASSISTANT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice assistant not available"
+        )
+
+    session = voice_session_manager.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return VoiceSessionResponse(
+        session_id=session.session_id,
+        user_id=session.user_id,
+        state=session.state.value,
+        message_count=len(session.messages),
+        cache_hit_rate=(session.cache_hits / session.total_queries * 100) if session.total_queries > 0 else 0.0
+    )
+
+
+@app.delete("/voice/session/{session_id}")
+def close_voice_session(
+    session_id: str,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Close a voice session."""
+    if not VOICE_ASSISTANT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice assistant not available"
+        )
+
+    if voice_session_manager.close_session(session_id):
+        return {"status": "closed", "session_id": session_id}
+    raise HTTPException(status_code=404, detail="Session not found")
+
+
+@app.get("/voice/stats")
+def get_voice_stats(authenticated: bool = Depends(verify_api_key)):
+    """Get voice assistant statistics."""
+    if not VOICE_ASSISTANT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice assistant not available"
+        )
+
+    stats = voice_session_manager.get_stats()
+    return {
+        "voice_stats": stats,
+        "cache_stats": cache_manager.get_cache_statistics() if CACHING_AVAILABLE else None
     }
 
 
