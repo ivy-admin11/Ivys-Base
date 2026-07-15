@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ivy — System Architecture & Capabilities</title>
+<style>
+  :root{
+    --bg:#0b1f3a; --panel:#ffffff; --ink:#0f172a; --muted:#64748b; --line:#cbd5e1;
+    --live:#16a34a; --live-bg:#dcfce7; --built:#d97706; --built-bg:#fef3c7;
+    --blocked:#dc2626; --blocked-bg:#fee2e2; --plan:#94a3b8; --plan-bg:#f1f5f9;
+    --layer:#eef2f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);background:#e9eef4;padding:28px}
+  h1{margin:0 0 2px;font-size:26px;color:var(--bg)}
+  .sub{color:var(--muted);margin:0 0 18px;font-size:13.5px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 22px;font-size:13px}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .dot{width:12px;height:12px;border-radius:3px;display:inline-block}
+  .wrap{max-width:1180px;margin:0 auto}
+  .layer{background:var(--layer);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:0 0 14px;position:relative}
+  .layer > .lname{position:absolute;top:-10px;left:16px;background:var(--bg);color:#fff;
+    font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:2px 10px;border-radius:20px}
+  .row{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}
+  .card{flex:1 1 190px;min-width:170px;background:var(--panel);border:1px solid var(--line);
+    border-left:5px solid var(--plan);border-radius:10px;padding:11px 13px;box-shadow:0 1px 2px rgba(15,23,42,.05)}
+  .card h3{margin:0 0 3px;font-size:14.5px}
+  .card p{margin:0;font-size:12.5px;color:var(--muted)}
+  .card .tag{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;float:right}
+  .live{border-left-color:var(--live)}   .live .tag{color:var(--live)}
+  .built{border-left-color:var(--built)} .built .tag{color:var(--built)}
+  .blocked{border-left-color:var(--blocked)} .blocked .tag{color:var(--blocked)}
+  .plan{border-left-color:var(--plan)}   .plan .tag{color:var(--plan)}
+  .arrow{text-align:center;color:var(--muted);font-size:20px;line-height:1;margin:-6px 0 6px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:720px){.two{grid-template-columns:1fr}}
+  .note{font-size:12px;color:var(--muted);margin-top:8px;padding:8px 10px;background:#fff;
+    border:1px dashed var(--line);border-radius:8px}
+  .pill{display:inline-block;background:var(--bg);color:#fff;border-radius:6px;font-size:11px;padding:1px 7px;margin-right:5px}
+  footer{color:var(--muted);font-size:11.5px;text-align:center;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ivy — System Architecture &amp; Capabilities</h1>
+  <p class="sub">Local admin AI running on the iMac · dual-brain (Gemini → DeepSeek) · iMessage-driven · as of Jul 2026</p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--live)"></i> Live &amp; verified</span>
+    <span><i class="dot" style="background:var(--built)"></i> Built (endpoint ready, not run live)</span>
+    <span><i class="dot" style="background:var(--blocked)"></i> Blocked (external bot wall)</span>
+    <span><i class="dot" style="background:var(--plan)"></i> Planned / stub</span>
+  </div>
+
+  <!-- LAYER 1: ENTRY POINTS -->
+  <div class="layer">
+    <span class="lname">1 · Triggers &amp; Entry Points</span>
+    <div class="row">
+      <div class="card live"><span class="tag">live</span><h3>📩 iMessage</h3><p>Someone texts "ivy…"; poller reads macOS <code>chat.db</code> (read-only, Full Disk Access).</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🔌 HTTP API</h3><p>X-API-Key protected: <code>/health</code>, <code>/capabilities</code>, <code>/stage_groceries</code>.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>⏰ launchd Schedules</h3><p>Sports picks 17×/day (4 windows); brain agent always-on.</p></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <!-- LAYER 2: GATEWAY -->
+  <div class="layer">
+    <span class="lname">2 · Gateway (FastAPI v3.0) — cross-cutting</span>
+    <div class="row">
+      <div class="card live"><span class="tag">live</span><h3>🔑 Shared-secret auth</h3><p>ADMIN_SECRET via <code>Depends</code>; required to boot.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🚦 Rate limiting</h3><p>slowapi per-IP (e.g. /health 10/min).</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🧾 Correlation IDs</h3><p>UUID per request, in/out logging, X-Request-ID.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🛡️ Sanitized errors</h3><p>Typed exception hierarchy → clean ErrorResponse.</p></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <!-- LAYER 3: REASONING -->
+  <div class="layer">
+    <span class="lname">3 · Reasoning — dual-brain agent</span>
+    <div class="row">
+      <div class="card live"><span class="tag">live</span><h3>🧭 MessageProcessor</h3><p>Authorizes sender (favorites.json) &amp; detects the "ivy" trigger. Fails closed.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🤖 LangChain AgentExecutor</h3><p>Tool-calling agent, max 5 steps, step-by-step reasoning.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🧠 Gemini 2.5 Flash → DeepSeek</h3><p>Primary brain with automatic failover (verified).</p></div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <!-- LAYER 4: SKILLS / TOOLS -->
+  <div class="layer">
+    <span class="lname">4 · Skills / Tools (what Ivy can do)</span>
+    <div class="row">
+      <div class="card live"><span class="tag">live</span><h3>📅 Calendar (read)</h3><p>Scans the "Hilla" calendar via AppleScript.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>✅ Reminders (read/write)</h3><p>Reads lists &amp; adds tasks/groceries with quantities.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>📚 Readwise</h3><p>Fetches saved highlights (async httpx).</p></div>
+      <div class="card live"><span class="tag">live</span><h3>💬 iMessage send</h3><p>Outbound replies via AppleScript (quote-escaped).</p></div>
+      <div class="card blocked"><span class="tag">blocked</span><h3>🛒 Grocery staging</h3><p>Playwright cart-builder, hard checkout-block. Code done, but HEB &amp; Kroger bot-wall all automation.</p></div>
+    </div>
+    <div class="note"><b>Grocery note:</b> the <span class="pill">/stage_groceries</span> flow is fully built and safe (never checks out), but HEB serves a bot block page and Kroger drops the connection at the TLS/HTTP-2 layer. Neither store is automatable from this machine — use the store app for the actual cart.</div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <!-- LAYER 5: PROACTIVE AGENTS + EXTERNAL -->
+  <div class="two">
+    <div class="layer" style="margin:0">
+      <span class="lname">5 · Proactive Agents (scheduled)</span>
+      <div class="row" style="flex-direction:column">
+        <div class="card live"><span class="tag">live</span><h3>🎯 Sports picks</h3><p>Odds API slate + Grok x_search over curated handicappers → consensus plays → <b>net-new dedup</b> → texts Henry (17×/day). No repeats.</p></div>
+        <div class="card live"><span class="tag">live</span><h3>🧠 Ivy brain</h3><p><code>com.ivy.brain</code> always-on Gemini agent; secrets load from a symlinked .env (no keys in the plist).</p></div>
+        <div class="card plan"><span class="tag">planned</span><h3>🗓️ Automations (stubs)</h3><p>meal planner · monthly/weekly chores · watchlist · happy-hour scout · market analyst — empty scaffolds, not built.</p></div>
+      </div>
+    </div>
+    <div class="layer" style="margin:0">
+      <span class="lname">6 · External Services &amp; Data</span>
+      <div class="row" style="flex-direction:column">
+        <div class="card live"><span class="tag">llms</span><h3>🧠 LLMs</h3><p>Gemini 2.5 Flash (primary) · DeepSeek (failover) · Grok/xAI grok-4.3 (sports).</p></div>
+        <div class="card live"><span class="tag">data</span><h3>🍎 Apple / macOS</h3><p>Calendar · Reminders · Messages &amp; chat.db (via AppleScript + SQLite).</p></div>
+        <div class="card live"><span class="tag">apis</span><h3>🌐 Web APIs</h3><p>Readwise · The Odds API · X (via Grok) · Google Docs/Slides (config).</p></div>
+        <div class="card blocked"><span class="tag">blocked</span><h3>🛒 Grocery sites</h3><p>HEB · Kroger — Akamai bot walls block automation.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Ivy Local Admin API Gateway v3.0 · dual-brain agentic core · iMessage in / out · generated for architecture review</footer>
+</div>
+</body>
+</html>

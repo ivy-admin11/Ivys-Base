@@ -1,0 +1,44 @@
+# Environment & Secrets
+.env
+.env.local
+*.pem
+!.env.example
+service-account-key.json
+token.json
+google_credentials.json
+discord_backup_codes.txt
+
+# Python & Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+*.egg
+
+# IDE & System
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Temporary Files
+logs/
+*.log
+
+# Configuration Files (local overrides)
+.ivy/
+store_configs.json
+
+# Documentation (PDFs)
+*.pdf
+
+# Runtime State
+proactive_agents/sports_last_report.json
+proactive_agents/*/output/
+
+# Docker
+docker-compose.yml
+Dockerfile

@@ -98,6 +98,16 @@ except ImportError:
     logger_temp = logging.getLogger("ivy.gateway")
     logger_temp.warning("voice_assistant not found; voice features disabled")
 
+# Import job runner for ad-hoc job execution
+try:
+    from job_runner import job_runner, JobStatus
+    JOB_RUNNER_AVAILABLE = True
+except ImportError:
+    JOB_RUNNER_AVAILABLE = False
+    job_runner = None
+    logger_temp = logging.getLogger("ivy.gateway")
+    logger_temp.warning("job_runner not found; job execution disabled")
+
 # ============================================================================
 # ENVIRONMENT LOADER & LOGGING SETUP
 # ============================================================================
@@ -530,6 +540,23 @@ def add_apple_reminder(title: str, list_name: str = "Household") -> str:
     return f"❌ Reminders Integration Error: {raw_output}"
 
 
+def run_job(job_name: str) -> str:
+    """Execute a background job by name (sharp_picks, happy_hour, meals, etc.)."""
+    if not JOB_RUNNER_AVAILABLE:
+        return "❌ Job execution system unavailable."
+
+    status, message = job_runner.run_job(job_name)
+
+    if status == JobStatus.SUCCESS:
+        return message
+    elif status == JobStatus.ALREADY_RUNNING:
+        return f"⏳ {message}"
+    elif status == JobStatus.NOT_FOUND:
+        return f"❓ {message}"
+    else:
+        return f"❌ {message}"
+
+
 # ============================================================================
 # IMESSAGE ROUTING
 # ============================================================================
@@ -790,21 +817,27 @@ def background_imessage_worker() -> None:
             try:
                 logger.info("🧠 Querying Primary Engine (Gemini SDK)...")
 
+                # Check if Gemini API key is configured
+                if not os.environ.get("GEMINI_API_KEY", "").strip():
+                    raise ValueError("GEMINI_API_KEY not configured in environment")
+
                 # ✅ USE CACHED PROMPTS IF ENABLED
-                if ENABLE_PROMPT_CACHING and CACHING_AVAILABLE:
+                use_caching = ENABLE_PROMPT_CACHING and CACHING_AVAILABLE
+                if use_caching:
                     # Create messages with prompt caching enabled
                     messages = cache_manager.create_cached_gemini_request(
                         user_message=text,
                         system_instruction=GEMINI_SYSTEM_INSTRUCTION,
                         tool_declarations=GEMINI_TOOL_DECLARATIONS
                     )
-                    
+
                     if messages is None:
                         logger.warning("Caching failed, falling back to non-cached request")
                         messages = [genai.types.ContentDict(
                             role="user",
                             parts=[genai.types.PartDict(text=text)]
                         )]
+                        use_caching = False
                 else:
                     # No caching: use traditional method
                     messages = [genai.types.ContentDict(
@@ -812,11 +845,19 @@ def background_imessage_worker() -> None:
                         parts=[genai.types.PartDict(text=text)]
                     )]
 
-                response = gemini_model.generate_content(
-                    messages,
-                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
-                    system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-                )
+                # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
+                # The cache_manager already includes it in the message stream
+                if use_caching:
+                    response = gemini_model.generate_content(
+                        messages,
+                        tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                    )
+                else:
+                    response = gemini_model.generate_content(
+                        messages,
+                        tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                        system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+                    )
 
                 # 💾 LOG CACHE METRICS
                 if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
@@ -867,6 +908,13 @@ def background_imessage_worker() -> None:
                             logger.info("📤 Tool Output: %s", tool_result)
 
                         # Follow-up call with tool results
+                        follow_up_kwargs = {
+                            "tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]
+                        }
+                        # Only pass system_instruction if NOT using caching (cache already includes it)
+                        if not use_caching:
+                            follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
+
                         follow_up_response = gemini_model.generate_content(
                             [
                                 *messages,
@@ -879,7 +927,7 @@ def background_imessage_worker() -> None:
                                     ],
                                 },
                             ],
-                            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
+                            **follow_up_kwargs
                         )
                         if follow_up_response.candidates:
                             follow_up_parts = follow_up_response.candidates[0].content.parts
@@ -890,9 +938,11 @@ def background_imessage_worker() -> None:
                         reply = text_reply.strip() if text_reply else None
 
             except Exception as gemini_err:
-                logger.warning(
-                    "⚠️ Gemini Primary Layer Fault: %s. Switching to Failover Protocol...",
+                logger.error(
+                    "❌ Gemini Primary Layer Fault: %s\nException type: %s\nFull traceback: %s. Switching to Failover Protocol...",
                     str(gemini_err),
+                    type(gemini_err).__name__,
+                    repr(gemini_err),
                 )
                 reply = None
 
@@ -1016,11 +1066,12 @@ def voice_query(
         )
 
         # Query Gemini with cache
+        # ⚠️ IMPORTANT: voice_processor includes system_instruction in messages,
+        # so don't pass it again as a kwarg (would cause conflicts)
         try:
             response = gemini_model.generate_content(
                 messages,
                 tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
-                system_instruction=GEMINI_SYSTEM_INSTRUCTION,
             )
 
             # Log cache metrics
@@ -1152,6 +1203,40 @@ def get_voice_stats(authenticated: bool = Depends(verify_api_key)):
     return {
         "voice_stats": stats,
         "cache_stats": cache_manager.get_cache_statistics() if CACHING_AVAILABLE else None
+    }
+
+
+@app.get("/jobs")
+def list_jobs(authenticated: bool = Depends(verify_api_key)):
+    """List all available jobs that can be run on-demand."""
+    if not JOB_RUNNER_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Job runner not available"
+        )
+
+    return {
+        "jobs": job_runner.list_jobs(),
+        "message": "Run jobs via 'ivy run <job_name>' in iMessage or POST /run-job with X-API-Key header"
+    }
+
+
+@app.post("/run-job")
+def run_job_endpoint(
+    job_name: str,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """Execute a job by name (API endpoint for direct access)."""
+    if not JOB_RUNNER_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Job runner not available"
+        )
+
+    result = run_job(job_name)
+    return {
+        "job": job_name,
+        "result": result
     }
 
 

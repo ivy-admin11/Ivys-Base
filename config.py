@@ -145,6 +145,20 @@ GEMINI_TOOL_DECLARATIONS: List[Dict[str, Any]] = [
             },
             "required": ["title"]
         }
+    },
+    {
+        "name": "run_job",
+        "description": "Execute a background job on-demand. Available jobs: sharp_picks (daily picks), happy_hour (scout nearby happy hours), bravo_scout (reality TV monitor), weekly_planner (meal plan generator), brain (knowledge queries).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "job_name": {
+                    "type": "STRING",
+                    "description": "Job to run: 'sharp_picks', 'happy_hour', 'bravo_scout', 'weekly_planner', 'brain', or natural language like 'picks', 'meals', 'scout'"
+                }
+            },
+            "required": ["job_name"]
+        }
     }
 ]
 """Tool schema for Google Gemini function calling"""
@@ -198,6 +212,23 @@ DEEPSEEK_TOOL_SCHEMA: List[Dict[str, Any]] = [
                 "required": ["title"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_job",
+            "description": "Execute a background job on-demand. Available jobs: sharp_picks (daily sports picks), happy_hour (scout venues), bravo_scout (reality TV), weekly_planner (meal planning), brain (knowledge).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_name": {
+                        "type": "string",
+                        "description": "Job name: 'sharp_picks', 'happy_hour', 'bravo_scout', 'weekly_planner', 'brain', or natural language variants"
+                    }
+                },
+                "required": ["job_name"]
+            }
+        }
     }
 ]
 """Tool schema for DeepSeek function calling"""
@@ -223,12 +254,20 @@ GEMINI_SYSTEM_INSTRUCTION: str = (
     "based on a list of ingredients fetched from their reminders, do NOT tell them you lack information. "
     "You MUST automatically use your internal knowledge base to supply the exact, standard traditional "
     "culinary proportions/measurements for those items and present them clearly.\n"
-    "6. SKILLS DISCLOSURE MANDATE: If the user asks about your skills, features, capabilities, "
-    "or what you can do, you MUST explicitly list your local system integration privileges: scanning "
-    "iCloud Calendars (check_apple_calendar), reading custom uncompleted Reminders lists "
-    "(fetch_apple_reminders), writing new tasks and programmatic recipe lists with measurements "
-    "directly into Apple Reminders (add_apple_reminder), and connecting to their Readwise database.\n"
-    "7. Always provide your complete conversational analysis, commentary, and problem-solving reasoning "
+    "6. JOB EXECUTION MANDATE: When the user asks to 'run', 'start', 'execute', or 'trigger' any of "
+    "these jobs, you MUST call the 'run_job' tool: sharp_picks (daily sports matchup analysis), "
+    "happy_hour (scout nearby venues and deals), bravo_scout (monitor reality TV schedules), "
+    "weekly_planner (generate weekly meal plan and save to Google Drive), brain (Grok knowledge queries). "
+    "Accept natural language variants like 'picks', 'meals', 'scout', 'planner'.\n"
+    "7. PROACTIVE JOB SUGGESTIONS: If the user mentions activities related to sports, dining, happy hours, "
+    "meals, TV, or general knowledge queries, PROACTIVELY OFFER to run the relevant job in your response "
+    "(e.g., 'I can run sharp_picks for you right now if you'd like the latest picks').\n"
+    "8. SKILLS DISCLOSURE MANDATE: If the user asks about your skills, features, capabilities, "
+    "or what you can do, you MUST explicitly list: scanning iCloud Calendars (check_apple_calendar), "
+    "reading Reminders lists (fetch_apple_reminders), adding tasks to Apple Reminders (add_apple_reminder), "
+    "connecting to Readwise database, and EXECUTING BACKGROUND JOBS on-demand "
+    "(run_job: sharp_picks, happy_hour, bravo_scout, weekly_planner, brain).\n"
+    "9. Always provide your complete conversational analysis, commentary, and problem-solving reasoning "
     "alongside your actions."
 )
 """System instruction for Gemini LLM"""
@@ -239,11 +278,14 @@ DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE: str = (
     "2. Today's date is strictly {current_date_str}.\n"
     "3. ONLY call 'check_apple_calendar' if the user explicitly asks to see their schedule, calendar, "
     "or upcoming events.\n"
-    "4. For specific chores, or concrete tasks, call 'add_apple_reminder' and sort into 'Meal Plan' "
-    "or 'Household'.\n"
-    "5. If the user asks a general open-ended question, advice, or strategy (e.g., 'can you create a "
+    "4. For specific chores, or concrete tasks, call 'add_apple_reminder' and sort into 'Household'.\n"
+    "5. JOB EXECUTION: When user says 'run', 'start', or requests sharp_picks, happy_hour, bravo_scout, "
+    "weekly_planner, or brain, call 'run_job' with the job name.\n"
+    "6. If the user asks a general open-ended question, advice, or strategy (e.g., 'can you create a "
     "system/plan'), DO NOT call any tools. Respond conversationally via text.\n"
-    "6. You are fully authorized to use the 'stage_groceries' tool to stage digital carts. It explicitly "
+    "7. PROACTIVE: If user mentions sports, meals, happy hours, or knowledge queries, offer to run "
+    "the relevant job (e.g., 'I can run sharp_picks for you now').\n"
+    "8. You are fully authorized to use the 'stage_groceries' tool to stage digital carts. It explicitly "
     "aborts before checkout and DOES NOT violate financial guardrails. You MUST use 'stage_groceries' "
     "instead of Apple Reminders when asked to add items to a cart."
 )
