@@ -1,19 +1,26 @@
 """
 Job registry and executor for Ivy — maps natural language requests to launchd
 agents (scheduled jobs with a real launchd target) or direct Python
-entrypoints (ad-hoc jobs that don't have a working launchd target).
+entrypoints (ad-hoc jobs run as a detached subprocess, independent of
+whether the calling process — a short-lived `ivy run ...` invocation, or a
+request handler inside the long-lived gateway — is still alive when the job
+finishes).
 """
 
-import importlib
-import inspect
 import logging
 import os
 import subprocess
-import threading
+import time
 from enum import Enum
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from ivy_core import receipts
+
 logger = logging.getLogger("ivy.jobs")
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
 
 
 class JobStatus(Enum):
@@ -68,8 +75,9 @@ JOB_REGISTRY = [
                   "sports bettor", "sports_bettor", "my sports picks", "run picks",
                   "send me sharp picks"],
         description="Run daily sports picks job — analyzes matchups and sends picks",
-        executor="launchctl",
-        target="com.ivy.sharppicks",
+        executor="entrypoint",
+        target="com.ivy.sharppicks",  # scheduled cadence — still installed via launchd
+        entrypoint="proactive_agents.sports_bettor:run",  # ad-hoc requests bypass launchd entirely
         schedule="Every 30 min (4 CST windows daily)",
     ),
     Job(
@@ -77,8 +85,9 @@ JOB_REGISTRY = [
         display_name="Happy Hour Scout",
         aliases=["happy hour", "hh scout", "happy_hour_scout", "scout"],
         description="Find happy hours near you — searches venues and deals",
-        executor="launchctl",
+        executor="entrypoint",
         target="com.ivy.happy_hour_scout",
+        entrypoint="proactive_agents.happy_hour_scout:run",
         schedule="Sundays 12pm CST",
     ),
     Job(
@@ -108,7 +117,7 @@ JOB_REGISTRY = [
             "text it to the household"
         ),
         executor="entrypoint",
-        entrypoint="proactive_agents.Familia_meal_planner:execute_meal_plan_cycle",
+        entrypoint="proactive_agents.Familia_meal_planner:run",
     ),
     Job(
         name="brain",
@@ -173,18 +182,25 @@ class JobRunner:
         if not job.available:
             return JobStatus.UNAVAILABLE, f"{job.display_name} is unavailable: {job.unavailable_reason}"
 
+        execution_id = receipts.record_start(job.name, requester=requester)
         try:
             if job.executor == "entrypoint":
-                return self._run_entrypoint_job(job, force=force, send=send, requester=requester)
+                status, message = self._run_entrypoint_job(job, force=force, send=send, requester=requester)
             elif job.executor == "launchctl":
-                return self._run_launchctl_job(job)
+                status, message = self._run_launchctl_job(job)
             elif job.executor == "shell":
-                return self._run_shell_job(job)
+                status, message = self._run_shell_job(job)
             else:
-                return JobStatus.ERROR, f"Unknown executor type: {job.executor}"
+                status, message = JobStatus.ERROR, f"Unknown executor type: {job.executor}"
         except Exception as e:
             logger.error(f"Error running job {job.name}: {e}")
-            return JobStatus.ERROR, f"Error running {job.display_name}: {str(e)}"
+            status, message = JobStatus.ERROR, f"Error running {job.display_name}: {str(e)}"
+
+        # Records the dispatch outcome, not necessarily the detached
+        # subprocess's eventual completion (entrypoint jobs run
+        # independently after being launched — see _run_entrypoint_job).
+        receipts.record_finish(execution_id, status.value, message)
+        return status, message
 
     def _run_launchctl_job(self, job: Job) -> Tuple[JobStatus, str]:
         """Run a launchd agent, verifying every launchctl call's actual exit
@@ -237,43 +253,52 @@ class JobRunner:
         send: bool = True,
         requester: Optional[str] = None,
     ) -> Tuple[JobStatus, str]:
-        """Run a job by importing its module and calling its entrypoint
-        function directly, in a background thread — no launchd involved.
-        This is how ad-hoc requests reach jobs with no working launchd
-        target, and works without any launchd job being preloaded.
+        """Run a job as a detached `python -m <module> --force --send`
+        subprocess — no launchd involved, and no launchd job needs to be
+        preloaded. Deliberately a subprocess, not an in-process thread: an
+        in-process daemon thread would be killed the instant a short-lived
+        `ivy run ...` CLI invocation exits, well before a multi-minute sweep
+        (sports odds, X handicappers, PDF generation, iMessage delivery)
+        actually finishes. A detached subprocess survives independently of
+        whichever process requested it.
         """
-        module_name, _, func_name = job.entrypoint.partition(":")
+        if not VENV_PYTHON.exists():
+            return JobStatus.ERROR, (
+                f"Could not run {job.display_name}: project venv python not found at {VENV_PYTHON}"
+            )
+
+        module_name = job.entrypoint.split(":", 1)[0]
+        args = [str(VENV_PYTHON), "-m", module_name]
+        if force:
+            args.append("--force")
+        if send:
+            args.append("--send")
+
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{job.name}_adhoc_{int(time.time())}.log"
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(PROJECT_ROOT)
+
+        logger.info(
+            "Ad-hoc %s requested by %s (force=%s, send=%s) -> %s",
+            job.name, requester or "unknown", force, send, " ".join(args),
+        )
         try:
-            module = importlib.import_module(module_name)
-            func = getattr(module, func_name)
+            with open(log_path, "wb") as log_file:
+                subprocess.Popen(
+                    args,
+                    cwd=str(PROJECT_ROOT),
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
         except Exception as exc:
-            return JobStatus.ERROR, f"Could not load {job.display_name} entrypoint ({job.entrypoint}): {exc}"
+            return JobStatus.ERROR, f"Could not start {job.display_name}: {exc}"
 
-        # Bridge both the agent's current signature and the standardized
-        # run(*, force, send, requester, request_id) signature it may adopt
-        # later, without needing a follow-up edit here when it does.
-        try:
-            sig_params = inspect.signature(func).parameters
-        except (TypeError, ValueError):
-            sig_params = {}
-        kwargs = {}
-        if "send_alert" in sig_params:
-            kwargs["send_alert"] = send
-        elif "send" in sig_params:
-            kwargs["send"] = send
-        if "force" in sig_params:
-            kwargs["force"] = force
-        if "requester" in sig_params:
-            kwargs["requester"] = requester
-
-        def _run_in_background():
-            try:
-                func(**kwargs)
-            except Exception as exc:
-                logger.error("Ad-hoc run of %s failed: %s", job.name, exc)
-
-        threading.Thread(target=_run_in_background, daemon=True).start()
-        return JobStatus.SUCCESS, f"✓ {job.display_name} started. {job.description}"
+        return JobStatus.SUCCESS, f"✓ {job.display_name} started (log: {log_path}). {job.description}"
 
     def _run_shell_job(self, job: Job) -> Tuple[JobStatus, str]:
         """Run a shell script."""

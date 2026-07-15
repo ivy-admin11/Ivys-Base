@@ -35,7 +35,7 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-from ivy_core import require_env, send_imessage, query_llm
+from ivy_core import require_env, send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
@@ -150,9 +150,10 @@ def fetch_local_specials() -> Dict[str, Any]:
                     # Parse LLM response for venues and specials
                     logger.debug(f"Search result: {search_result[:200]}")
 
-                    # Extract venue data
+                    # Extract venue data — both providers routinely wrap it
+                    # in a markdown code fence even when told not to.
                     try:
-                        result_data = json.loads(search_result)
+                        result_data = json.loads(strip_json_fence(search_result))
                         if isinstance(result_data, dict):
                             result_data = [result_data]
                         elif not isinstance(result_data, list):
@@ -381,27 +382,38 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
             logger.info("⏭️  No specials found; skipping notification")
             result["alert_sent"] = False
         elif send_alert:
-            # Send notification + PDF to both Henry and Lexi
-            notification = (
+            # Send the PDF attachment to each recipient, then a status line
+            # that reflects what actually happened — never claim "attached"
+            # before knowing the attachment was actually delivered.
+            stats_line = (
                 f"🍹 Happy Hour Scout Report\n\n"
                 f"{result['discovery_count']} specials across Frisco/Dallas\n"
                 f"Includes: wine, oysters, martinis, upscale dining\n\n"
-                f"Full report attached (PDF)."
             )
             send_results = {}
+            attach_results = {}
             for recipient_name, phone in ALERT_RECIPIENTS.items():
                 try:
-                    success = send_imessage(phone, notification)
+                    attached = send_imessage_attachment(phone, pdf_path)
+                    if attached:
+                        final_text = stats_line + "Full report attached (PDF)."
+                    else:
+                        final_text = stats_line + f"Report generated, but attachment delivery failed. Path: {pdf_path}"
+                    success = send_imessage(phone, final_text)
                     send_results[recipient_name] = success
+                    attach_results[recipient_name] = attached
                     logger.info(
-                        f"✅ Sent to {recipient_name}: {'SUCCESS' if success else 'FAILED'}"
+                        f"✅ Sent to {recipient_name}: text={'SUCCESS' if success else 'FAILED'}, "
+                        f"attachment={'SUCCESS' if attached else 'FAILED'}"
                     )
                 except Exception as e:
                     send_results[recipient_name] = False
+                    attach_results[recipient_name] = False
                     logger.error(f"❌ Failed to send to {recipient_name}: {e}")
 
             result["alert_sent"] = any(send_results.values())
             result["recipients_status"] = send_results
+            result["attachment_status"] = attach_results
         else:
             logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
             result["alert_sent"] = False
@@ -419,17 +431,40 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
     return result
 
 
+def run(
+    *,
+    force: bool = False,
+    send: bool = True,
+    requester: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Standardized entrypoint — forwards to execute_scout_cycle. `force` has
+    no gating effect here (this job has no duplicate-suppression window);
+    kept for interface consistency with the other proactive agents."""
+    return execute_scout_cycle(send_alert=send)
+
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":
-    # Configure logging
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Happy Hour Scout")
+    parser.add_argument("--force", action="store_true", help="No-op here (no duplicate-suppression window)")
+    parser.add_argument("--send", action="store_true", help="Actually send the iMessage/PDF")
+    parser.add_argument("--dry-run", action="store_true", help="Discover but don't send (default)")
+    parser.add_argument("--scheduled", action="store_true", help="Scheduled run")
+    cli_args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    # Execute a single scout cycle
-    result = execute_scout_cycle(send_alert=False)  # Dry-run by default
+    result = run(
+        force=cli_args.force,
+        send=cli_args.send and not cli_args.dry_run,
+    )
     print(json.dumps(result, indent=2))

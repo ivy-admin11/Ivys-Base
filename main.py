@@ -535,11 +535,18 @@ def add_apple_reminder(title: str, list_name: str = "Household") -> str:
 
 
 def run_job(job_name: str) -> str:
-    """Execute a background job by name (sharp_picks, happy_hour, meals, etc.)."""
+    """Execute a background job by name (sharp_picks, happy_hour, meals, etc.).
+
+    Every call here is an explicit, on-demand request (via iMessage, voice,
+    the CLI, or /run-job) — never the scheduled invocation, which launchd
+    triggers directly. force=True so an ad-hoc "run picks now" always
+    delivers even if the underlying agent has its own duplicate-suppression
+    gate (sharp_picks) or 48h cadence (familia_meal_planner).
+    """
     if not JOB_RUNNER_AVAILABLE:
         return "❌ Job execution system unavailable."
 
-    status, message = job_runner.run_job(job_name)
+    status, message = job_runner.run_job(job_name, force=True)
 
     if status == JobStatus.SUCCESS:
         return message

@@ -7,11 +7,24 @@ answer the caller didn't expect.
 
 import logging
 import os
+import re
+from typing import Optional
 
 from google import genai
 from openai import OpenAI
 
 logger = logging.getLogger("ivy.llm")
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+
+
+def strip_json_fence(text: str) -> str:
+    """Strip a markdown code fence (```json ... ``` or ``` ... ```) that both
+    DeepSeek and Gemini routinely wrap JSON responses in, even when asked for
+    "ONLY valid JSON, no markdown formatting" — json.loads() chokes on the
+    fence otherwise. Returns the input unchanged if there's no fence."""
+    match = _JSON_FENCE_RE.match(text.strip())
+    return match.group(1).strip() if match else text.strip()
 
 _deepseek_client = None
 _gemini_client = None
@@ -47,15 +60,21 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def query_llm(prompt_text: str) -> str:
-    """Dual-brain failover: deepseek-chat (primary) -> gemini-2.5-flash (backup)."""
+def query_llm(prompt_text: str, temperature: Optional[float] = None) -> str:
+    """Dual-brain failover: deepseek-chat (primary) -> gemini-2.5-flash (backup).
+
+    temperature is optional and forwarded to whichever provider answers —
+    both SDKs accept it as a real generation parameter, not a made-up one.
+    """
     deepseek = _get_deepseek_client()
     if deepseek is not None:
         try:
             logger.info("Querying primary engine (DeepSeek)...")
+            kwargs = {} if temperature is None else {"temperature": temperature}
             response = deepseek.chat.completions.create(
                 model="deepseek-chat",
                 messages=[{"role": "user", "content": prompt_text}],
+                **kwargs,
             )
             text = (response.choices[0].message.content or "").strip()
             if text:
@@ -70,9 +89,11 @@ def query_llm(prompt_text: str) -> str:
     if gemini is not None:
         try:
             logger.info("Engaging backup engine (Gemini)...")
+            config = None if temperature is None else genai.types.GenerateContentConfig(temperature=temperature)
             response = gemini.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt_text,
+                config=config,
             )
             return (response.text or "").strip()
         except Exception as exc:

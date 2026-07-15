@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Add parent directory to path for .ivy module access
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +37,7 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-from ivy_core import require_env, send_imessage, query_llm
+from ivy_core import require_env, send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
@@ -79,8 +80,9 @@ ALERT_RECIPIENTS = {
     "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
 }
 
-# Initialize state threshold: July 15, 2026 8am CST
-INIT_THRESHOLD = datetime(2026, 7, 15, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+# Initialize state threshold: July 15, 2026 8am America/Chicago (handles DST
+# transitions correctly, unlike a permanently fixed UTC-5 offset).
+INIT_THRESHOLD = datetime(2026, 7, 15, 8, 0, 0, tzinfo=ZoneInfo("America/Chicago"))
 
 
 def initialize_state_file() -> None:
@@ -121,12 +123,20 @@ def save_state(state: Dict[str, Any]) -> None:
         logger.error(f"Failed to save state: {e}")
 
 
-def check_48h_gate() -> bool:
+def check_48h_gate(force: bool = False) -> bool:
     """
     Check if 48 hours have elapsed since last execution.
 
+    force=True bypasses the gate entirely — for explicitly requested ad-hoc
+    runs. Scheduled runs must always call this with force=False so the
+    48-hour cadence is preserved.
+
     Returns True if execution should proceed, False if within 48-hour window.
     """
+    if force:
+        logger.info("⚡ force=True — bypassing 48h gate (ad-hoc run)")
+        return True
+
     state = load_state()
     last_run_str = state.get("last_run_date", INIT_THRESHOLD.isoformat())
 
@@ -199,9 +209,10 @@ def generate_family_meal_plan() -> Dict[str, Any]:
             logger.warning("LLM returned no recipes")
             return {"status": "error", "recipes": []}
 
-        # Parse JSON response
+        # Parse JSON response — both providers routinely wrap it in a
+        # markdown code fence even when told not to.
         try:
-            recipes = json.loads(response)
+            recipes = json.loads(strip_json_fence(response))
             if not isinstance(recipes, list):
                 recipes = [recipes]
         except json.JSONDecodeError:
@@ -345,18 +356,20 @@ def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
 # ============================================================================
 
 
-def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
+def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dict[str, Any]:
     """
     Main execution function: state check → generation → compression → notification dispatch.
 
     Orchestrates the full meal planner workflow:
-    1. Check 48-hour gate (skip if within window)
+    1. Check 48-hour gate (skip if within window, unless force=True)
     2. Generate family meal plan via LLM
-    3. Compress to SMS format
+    3. Generate PDF report
     4. Route via iMessage to recipients
+    5. Update state
 
     Args:
         send_alert: If True, dispatch notification; if False, dry-run only
+        force: If True, bypass the 48-hour gate (for explicit ad-hoc runs)
 
     Returns:
         dict: Execution summary
@@ -375,8 +388,8 @@ def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
     }
 
     # Step 1: Check 48-hour gate
-    logger.info("Step 1/4: Checking 48-hour execution gate...")
-    if not check_48h_gate():
+    logger.info("Step 1/5: Checking 48-hour execution gate...")
+    if not check_48h_gate(force=force):
         result["status"] = "skipped"
         result["gate_passed"] = False
         logger.info("⏭️  Skipping execution (within 48-hour window)")
@@ -386,7 +399,7 @@ def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
     logger.info("✅ Gate check passed")
 
     # Step 2: Generate meal plan
-    logger.info("Step 2/4: Generating fusion meal plan...")
+    logger.info("Step 2/5: Generating fusion meal plan...")
     meal_data = generate_family_meal_plan()
 
     if meal_data.get("status") != "success":
@@ -399,42 +412,53 @@ def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
     logger.info(f"✅ Generated {result['recipe_count']} recipes")
 
     # Step 3: Generate PDF report
-    logger.info("Step 3/4: Generating PDF report...")
+    logger.info("Step 3/5: Generating PDF report...")
     pdf_path = format_meal_plan_pdf(meal_data)
     logger.info(f"✅ PDF generated: {pdf_path}")
 
     # Step 4: Dispatch via iMessage with notification
-    logger.info("Step 4/4: Routing notification...")
+    logger.info("Step 4/5: Routing notification...")
     if result["recipe_count"] == 0:
         logger.info("⏭️  No meal plan content; skipping notification")
         result["alert_sent"] = False
     elif send_alert:
-        notification = (
+        # Send the PDF attachment first, then a status line that reflects
+        # what actually happened — never claim "attached" up front.
+        stats_line = (
             f"🍽️  Familia Meal Plan Ready\n\n"
             f"{result['recipe_count']} recipes (Venezuelan-American-Asian fusion)\n"
             f"Toddler-friendly, macro-balanced\n\n"
-            f"Full plan attached (PDF)."
         )
         send_results = {}
+        attach_results = {}
         for recipient_name, phone in ALERT_RECIPIENTS.items():
             try:
-                success = send_imessage(phone, notification)
+                attached = send_imessage_attachment(phone, pdf_path)
+                if attached:
+                    final_text = stats_line + "Full plan attached (PDF)."
+                else:
+                    final_text = stats_line + f"Report generated, but attachment delivery failed. Path: {pdf_path}"
+                success = send_imessage(phone, final_text)
                 send_results[recipient_name] = success
+                attach_results[recipient_name] = attached
                 logger.info(
-                    f"✅ Sent to {recipient_name}: {'SUCCESS' if success else 'FAILED'}"
+                    f"✅ Sent to {recipient_name}: text={'SUCCESS' if success else 'FAILED'}, "
+                    f"attachment={'SUCCESS' if attached else 'FAILED'}"
                 )
             except Exception as e:
                 send_results[recipient_name] = False
+                attach_results[recipient_name] = False
                 logger.error(f"❌ Failed to send to {recipient_name}: {e}")
 
         result["alert_sent"] = any(send_results.values())
         result["recipients_status"] = send_results
+        result["attachment_status"] = attach_results
     else:
         logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
         result["alert_sent"] = False
 
     # Step 5: Update state file
-    logger.info("Step 5/4: Updating state...")
+    logger.info("Step 5/5: Updating state...")
     state = load_state()
     state["last_run_date"] = datetime.now(timezone.utc).astimezone().isoformat()
     state["recipe_count"] = result["recipe_count"]
@@ -456,18 +480,41 @@ def execute_meal_plan_cycle(send_alert: bool = True) -> Dict[str, Any]:
     return result
 
 
+def run(
+    *,
+    force: bool = False,
+    send: bool = True,
+    requester: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Standardized entrypoint. force=True bypasses the 48-hour gate for an
+    explicitly requested ad-hoc run; scheduled runs must call with
+    force=False so the normal cadence is preserved."""
+    return execute_meal_plan_cycle(send_alert=send, force=force)
+
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
 
 
 if __name__ == "__main__":
-    # Configure logging
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Familia Meal Planner")
+    parser.add_argument("--force", action="store_true", help="Bypass the 48-hour gate")
+    parser.add_argument("--send", action="store_true", help="Actually send the iMessage/PDF")
+    parser.add_argument("--dry-run", action="store_true", help="Generate but don't send (default)")
+    parser.add_argument("--scheduled", action="store_true", help="Scheduled run (preserves the 48h gate)")
+    cli_args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    # Execute a single meal plan cycle
-    result = execute_meal_plan_cycle(send_alert=False)  # Dry-run by default
+    result = run(
+        force=cli_args.force and not cli_args.scheduled,
+        send=cli_args.send and not cli_args.dry_run,
+    )
     print(json.dumps(result, indent=2))

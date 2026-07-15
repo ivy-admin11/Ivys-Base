@@ -25,13 +25,14 @@ Pulls the live 48-hour slate (scheduled matchups + real-time lines) from The
 Odds API, sweeps the curated handicapper accounts via Grok's x_search tool and
 aligns their calls to that slate, merges duplicate picks into consensus plays
 (2+ sharps → 🔥 HIGH LIKELIHOOD 🔥), enriches them with live Grok context, and
-texts the formatted pick list straight to Henry (text only — no PDF).
+generates a PDF report and sends it to Henry as a real iMessage attachment.
 
 Run by launchd (com.ivy.sharppicks) on a 30-minute cadence across four daily
 windows, so it deliberately texts only *net-new* reports: a content fingerprint
 of the picks is compared against the last report and an unchanged slate is
 skipped (see _report_signature / sports_last_report.json). If the X sweep
-returns no usable picks, the script exits silently.
+returns no usable picks, run() returns a "no_picks" result without sending
+(unless force=True, which sends an honest "nothing to report" note instead).
 """
 
 import hashlib
@@ -40,11 +41,12 @@ import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
 
-from ivy_core import require_env, send_imessage
+from ivy_core import require_env, send_imessage, send_imessage_attachment
 
 # PDF formatter for professional reports
 from picks_formatter import PicksReportFormatter
@@ -842,23 +844,30 @@ def save_last_report(signature, message):
         print(f"⚠️ Could not persist last-report state: {e}")
 
 
-if __name__ == "__main__":
+def run(
+    *,
+    force: bool = False,
+    send: bool = True,
+    requester: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> dict:
+    """Sweep the sharp-picks pipeline once.
+
+    force=True bypasses the duplicate-suppression gate (used for ad-hoc/
+    on-demand requests, so "run picks now" always delivers even if the slate
+    hasn't changed since the last scheduled report). send=False runs the
+    full sweep and generates the PDF without texting anything (dry-run).
+    """
     print("🚀 Starting 48-Hour X-Sourced Sports Picks Loop...")
 
     games = fetch_live_odds()
     picks = sweep_with_retry(games)
 
-    # TEST INJECTION: bypass empty-list filter with hardcoded mock data
-    if not picks:
-        raw_picks = [{"account": "@Sharp1", "sport": "MLB", "matchup": "HR Derby", "side": "Harper Over 21.5", "confidence": 0.88, "reasoning": "Home stadium depth"}]
-        picks = raw_picks
-        print(f"🧪 TEST MODE: injected {len(picks)} mock pick(s) to bypass empty sweep.")
-
     if not picks:
         print("📭 No active picks pulled from X sweep.")
         # On an ad-hoc (forced) request, never fail silently — Ivy already told
         # Henry "picks on the way", so close the loop with an honest note.
-        if os.environ.get("SPORTS_FORCE_SEND", "").strip():
+        if force and send:
             send_imessage(
                 HENRY_PHONE,
                 "🔒 Ivy's Sharp Picks: no bettable picks surfaced right now — the "
@@ -866,7 +875,7 @@ if __name__ == "__main__":
                 "watching and send them the moment there's a play.",
             )
             print("📨 Sent 'no picks' notice to Henry (ad-hoc run).")
-        sys.exit(0)
+        return {"result_type": "no_picks", "sent": False, "attached": False}
 
     merged = merge_picks(picks)
     attach_odds(merged, games)
@@ -879,31 +888,66 @@ if __name__ == "__main__":
 
     # Duplicate suppression: only text Henry net-new information. Skip if the
     # picks fingerprint matches the last report (same slate, unchanged lines).
-    force = bool(os.environ.get("SPORTS_FORCE_SEND", "").strip())
     if force:
-        print("⚡ SPORTS_FORCE_SEND set — bypassing duplicate suppression (ad-hoc run).")
+        print("⚡ force=True — bypassing duplicate suppression (ad-hoc run).")
     last = load_last_report()
     if not force and last.get("signature") == signature:
         print("🔁 Picks unchanged since last report (same fingerprint) — skipping duplicate report.")
-        sys.exit(0)
+        return {"result_type": "duplicate", "sent": False, "attached": False}
 
-    # Generate PDF report and send to Henry.
+    # Generate PDF report.
     print("📄 Generating professional PDF report...")
     pdf_path = format_picks_pdf(merged)
     print(f"✅ PDF generated: {pdf_path}")
 
-    # Text notification (brief alert) + PDF attachment.
-    notification = (
+    stats_line = (
         f"📊 Ivy's Sharp Picks Report Ready\n\n"
         f"🔥 {consensus_n} consensus play(s) • {len(merged) - consensus_n} additional picks\n"
         f"48-hour window • Priced vs live Vegas odds\n\n"
-        f"Full report attached (PDF)."
     )
 
-    # Only record the report as sent if the text actually went through; otherwise a
-    # failed send would suppress this net-new report on every future run.
-    if send_imessage(HENRY_PHONE, notification):
+    if not send:
+        print("🧪 send=False — dry run, not sending.")
+        return {
+            "result_type": "picks", "sent": False, "attached": False,
+            "pdf_path": pdf_path, "pick_count": len(merged),
+        }
+
+    # Attempt the PDF attachment first — only claim "Full report attached"
+    # once we actually know it was delivered, never up front.
+    attached = send_imessage_attachment(HENRY_PHONE, pdf_path)
+    if attached:
+        final_text = stats_line + "Full report attached (PDF)."
+    else:
+        final_text = stats_line + f"Report generated, but attachment delivery failed. Path: {pdf_path}"
+    delivered_text = send_imessage(HENRY_PHONE, final_text)
+
+    if attached:
         save_last_report(signature, signature)  # Track by signature, not text
         print(f"✅ {len(merged)} pick(s) reported to Henry ({consensus_n} consensus).")
     else:
-        print("⚠️ Send failed — not recording report state so it retries next run.")
+        print("⚠️ Attachment delivery failed — not recording report state so it retries next run.")
+
+    return {
+        "result_type": "picks", "sent": delivered_text, "attached": attached,
+        "pdf_path": pdf_path, "pick_count": len(merged),
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Sports Bettor / Sharp Picks")
+    parser.add_argument("--force", action="store_true", help="Bypass duplicate-report suppression")
+    parser.add_argument("--send", action="store_true", help="Actually send the iMessage/PDF")
+    parser.add_argument("--dry-run", action="store_true", help="Sweep but don't send (default)")
+    parser.add_argument("--scheduled", action="store_true", help="Scheduled run (preserves suppression)")
+    cli_args = parser.parse_args()
+
+    # Back-compat: the launchd plist's shell script may still export
+    # SPORTS_FORCE_SEND rather than pass --force.
+    force = (cli_args.force or bool(os.environ.get("SPORTS_FORCE_SEND", "").strip())) and not cli_args.scheduled
+    send = cli_args.send and not cli_args.dry_run
+
+    result = run(force=force, send=send)
+    print(json.dumps(result, indent=2))

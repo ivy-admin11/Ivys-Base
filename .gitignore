@@ -38,6 +38,7 @@ store_configs.json
 # Runtime State
 proactive_agents/sports_last_report.json
 proactive_agents/*/output/
+data/
 
 # Docker
 docker-compose.yml
