@@ -26,7 +26,7 @@
         <key>Minute</key>
         <integer>0</integer>
         <key>Weekday</key>
-        <integer>1</integer>
+        <integer>0</integer>
     </dict>
 </dict>
 </plist>
