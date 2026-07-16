@@ -677,7 +677,9 @@ def format_picks_pdf(merged):
     consensus_picks = []
     for pick in consensus:
         enrichment = pick.get("enrichment") or {}
-        reasoning = enrichment.get("take") or "Sharp consensus play"
+        handles = pick.get("handicappers") or []
+        credit = ", ".join(f"@{h}" for h in handles)
+        reasoning = enrichment.get("take") or (f"Consensus: {credit}" if credit else "Sharp consensus play")
         consensus_picks.append({
             "sport": pick.get("sport", ""),
             "matchup": pick.get("matchup", ""),
@@ -690,7 +692,11 @@ def format_picks_pdf(merged):
     other_picks = []
     for pick in others:
         enrichment = pick.get("enrichment") or {}
-        reasoning = enrichment.get("take") or f"{pick.get('consensus_count', 1)} sharp backing"
+        handles = pick.get("handicappers") or []
+        credit = ", ".join(f"@{h}" for h in handles)
+        reasoning = enrichment.get("take") or (
+            f"Backed by {credit}" if credit else f"{pick.get('consensus_count', 1)} sharp backing"
+        )
         other_picks.append({
             "sport": pick.get("sport", ""),
             "matchup": pick.get("matchup", ""),
@@ -752,10 +758,11 @@ def format_picks_text(merged):
             block.append(f"   🕒 {start}")
 
         # Confidence — always shown; graded by how many sharps back the bet.
+        # Name the actual handicapper handle(s) instead of just a bare count.
         _grade, _cnt = _confidence(e)
-        block.append(
-            f"   📊 Confidence: {_grade} · {_cnt} sharp{'' if _cnt == 1 else 's'} backing"
-        )
+        handles = e.get("handicappers") or []
+        credit = ", ".join(f"@{h}" for h in handles) if handles else f"{_cnt} sharp{'' if _cnt == 1 else 's'}"
+        block.append(f"   📊 Confidence: {_grade} · Backed by {credit}")
 
         # Enrichment — only rendered when it carries real signal.
         enr = e.get("enrichment") or {}
