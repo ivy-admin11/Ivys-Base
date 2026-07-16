@@ -161,16 +161,17 @@ class PicksReportFormatter:
         story.append(Paragraph(summary, summary_style))
         story.append(Spacer(1, 0.15 * inch))
 
+        heading_style = ParagraphStyle(
+            "TableHeading",
+            parent=styles["Heading2"],
+            fontSize=12,
+            textColor=self.theme["accent"],
+            spaceAfter=8,
+            fontName="Helvetica-Bold",
+        )
+
         # ====== CONSENSUS PICKS TABLE ======
         if consensus_picks:
-            heading_style = ParagraphStyle(
-                "TableHeading",
-                parent=styles["Heading2"],
-                fontSize=12,
-                textColor=self.theme["accent"],
-                spaceAfter=8,
-                fontName="Helvetica-Bold",
-            )
             story.append(Paragraph(consensus_heading, heading_style))
 
             consensus_table_data = [_row(headers)]
