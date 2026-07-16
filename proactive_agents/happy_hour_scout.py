@@ -275,6 +275,8 @@ def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
         metadata=metadata,
         headers=["Venue", "Category", "Status", "Type", "Details"],
         col_widths=[1.6, 1.4, 0.6, 0.7, 3.2],
+        consensus_heading="🍹 Top Deals Tonight",
+        other_heading="More Specials",
     )
 
     return pdf_path

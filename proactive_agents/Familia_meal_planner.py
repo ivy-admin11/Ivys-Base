@@ -349,6 +349,8 @@ def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
         metadata=metadata,
         headers=["Cuisine", "Recipe", "Time", "Difficulty", "Kid-Friendly Adaptations"],
         col_widths=[0.7, 1.7, 0.6, 0.9, 3.6],
+        consensus_heading="🍽️ This Week's Recipes",
+        other_heading="More Recipe Ideas",
     )
 
     return pdf_path

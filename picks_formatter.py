@@ -70,6 +70,8 @@ class PicksReportFormatter:
         metadata: Optional[Dict[str, str]] = None,
         headers: Optional[List[str]] = None,
         col_widths: Optional[List[float]] = None,
+        consensus_heading: str = "🔥 High-Likelihood Consensus Plays",
+        other_heading: str = "Other Sharp Picks",
     ) -> str:
         """
         Generate a professional PDF report.
@@ -84,6 +86,11 @@ class PicksReportFormatter:
                 labels); pass domain-appropriate labels for non-sports callers.
             col_widths: Optional column widths in inches (must sum to <= 6.5in
                 given the 0.75in margins); defaults to the sports-report widths.
+            consensus_heading: Section title above the first table (defaults to
+                the sports-report heading; pass a domain-appropriate title for
+                non-sports callers).
+            other_heading: Section title above the second table (same default
+                caveat as consensus_heading).
 
         Returns:
             Path to generated PDF
@@ -164,7 +171,7 @@ class PicksReportFormatter:
                 spaceAfter=8,
                 fontName="Helvetica-Bold",
             )
-            story.append(Paragraph("🔥 High-Likelihood Consensus Plays", heading_style))
+            story.append(Paragraph(consensus_heading, heading_style))
 
             consensus_table_data = [_row(headers)]
             for pick in consensus_picks:
@@ -206,7 +213,7 @@ class PicksReportFormatter:
 
         # ====== OTHER PICKS TABLE ======
         if other_picks:
-            story.append(Paragraph("Other Sharp Picks", heading_style))
+            story.append(Paragraph(other_heading, heading_style))
 
             other_table_data = [[Paragraph(str(h), header_style) for h in headers]]
             for pick in other_picks:
