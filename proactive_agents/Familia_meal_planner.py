@@ -347,6 +347,8 @@ def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
         consensus_picks=meal_picks[:3] if len(meal_picks) > 3 else meal_picks,
         other_picks=meal_picks[3:] if len(meal_picks) > 3 else [],
         metadata=metadata,
+        headers=["Cuisine", "Recipe", "Time", "Difficulty", "Kid-Friendly Adaptations"],
+        col_widths=[0.7, 1.7, 0.6, 0.9, 3.6],
     )
 
     return pdf_path

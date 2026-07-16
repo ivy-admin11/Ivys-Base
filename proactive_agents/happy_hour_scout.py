@@ -242,12 +242,13 @@ def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
     )
 
     # Format specials as "picks" for the formatter
+    venue_category = {v.get("name"): v.get("category", "Happy Hour") for v in venues}
     special_picks = [
         {
-            "sport": special.get("venue", "").split()[0],  # Venue name (truncated)
-            "matchup": special.get("venue", ""),  # Full venue
-            "side": "Happy Hour Special",
-            "odds": "ACTIVE",
+            "sport": special.get("venue", ""),  # Full venue name
+            "matchup": venue_category.get(special.get("venue", ""), "Happy Hour"),
+            "side": "Active",
+            "odds": "Special",
             "reasoning": special.get("detail", "Check venue for details"),
         }
         for special in specials[:10]  # Top 10 specials
@@ -272,6 +273,8 @@ def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
         consensus_picks=special_picks[:5] if len(special_picks) > 5 else special_picks,
         other_picks=special_picks[5:] if len(special_picks) > 5 else [],
         metadata=metadata,
+        headers=["Venue", "Category", "Status", "Type", "Details"],
+        col_widths=[1.6, 1.4, 0.6, 0.7, 3.2],
     )
 
     return pdf_path

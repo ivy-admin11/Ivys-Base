@@ -68,6 +68,8 @@ class PicksReportFormatter:
         consensus_picks: List[Dict[str, str]],
         other_picks: List[Dict[str, str]],
         metadata: Optional[Dict[str, str]] = None,
+        headers: Optional[List[str]] = None,
+        col_widths: Optional[List[float]] = None,
     ) -> str:
         """
         Generate a professional PDF report.
@@ -78,10 +80,26 @@ class PicksReportFormatter:
             consensus_picks: List of dicts with keys: sport, matchup, side, odds, reasoning
             other_picks: List of dicts with same structure
             metadata: Optional dict with pick_count, source, timestamp
+            headers: Optional column header labels (defaults to the sports-report
+                labels); pass domain-appropriate labels for non-sports callers.
+            col_widths: Optional column widths in inches (must sum to <= 6.5in
+                given the 0.75in margins); defaults to the sports-report widths.
 
         Returns:
             Path to generated PDF
         """
+        headers = headers or ["Sport", "Matchup", "Side", "Odds", "Reasoning"]
+        col_widths = col_widths or [0.8, 2.0, 1.0, 0.9, 2.8]
+        cell_style = ParagraphStyle(
+            "TableCell", parent=getSampleStyleSheet()["Normal"], fontSize=8, leading=10,
+        )
+        header_style = ParagraphStyle(
+            "TableCellHeader", parent=getSampleStyleSheet()["Normal"],
+            fontSize=9, leading=11, textColor=white, fontName="Helvetica-Bold",
+        )
+
+        def _row(cells: List[str]) -> List[Paragraph]:
+            return [Paragraph(str(c), cell_style) for c in cells]
         doc = SimpleDocTemplate(
             filename,
             pagesize=letter,
@@ -148,21 +166,25 @@ class PicksReportFormatter:
             )
             story.append(Paragraph("🔥 High-Likelihood Consensus Plays", heading_style))
 
-            consensus_table_data = [["Sport", "Matchup", "Side", "Odds", "Reasoning"]]
+            consensus_table_data = [_row(headers)]
             for pick in consensus_picks:
                 consensus_table_data.append(
-                    [
-                        pick.get("sport", ""),
-                        pick.get("matchup", ""),
-                        pick.get("side", ""),
-                        pick.get("odds", ""),
-                        pick.get("reasoning", ""),
-                    ]
+                    _row(
+                        [
+                            pick.get("sport", ""),
+                            pick.get("matchup", ""),
+                            pick.get("side", ""),
+                            pick.get("odds", ""),
+                            pick.get("reasoning", ""),
+                        ]
+                    )
                 )
+            # Header row keeps the bold/white header style regardless of _row's default.
+            consensus_table_data[0] = [Paragraph(str(h), header_style) for h in headers]
 
             consensus_table = Table(
                 consensus_table_data,
-                colWidths=[0.8 * inch, 2.0 * inch, 1.5 * inch, 0.8 * inch, 2.4 * inch],
+                colWidths=[w * inch for w in col_widths],
             )
             consensus_table.setStyle(
                 TableStyle(
@@ -170,13 +192,11 @@ class PicksReportFormatter:
                         ("BACKGROUND", (0, 0), (-1, 0), self.theme["table_header"]),
                         ("TEXTCOLOR", (0, 0), (-1, 0), white),
                         ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                        ("FONTSIZE", (0, 0), (-1, 0), 9),
                         ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
                         ("BACKGROUND", (0, 1), (-1, -1), self.theme["highlight"]),
                         ("GRID", (0, 0), (-1, -1), 0.5, self.theme["header"]),
-                        ("FONTSIZE", (0, 1), (-1, -1), 8),
-                        ("ROWHEIGHTS", (0, 0), (-1, -1), 0.4 * inch),
+                        ("TOPPADDING", (0, 0), (-1, -1), 5),
+                        ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
                         ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ]
                 )
@@ -188,21 +208,23 @@ class PicksReportFormatter:
         if other_picks:
             story.append(Paragraph("Other Sharp Picks", heading_style))
 
-            other_table_data = [["Sport", "Matchup", "Side", "Odds", "Reasoning"]]
+            other_table_data = [[Paragraph(str(h), header_style) for h in headers]]
             for pick in other_picks:
                 other_table_data.append(
-                    [
-                        pick.get("sport", ""),
-                        pick.get("matchup", ""),
-                        pick.get("side", ""),
-                        pick.get("odds", ""),
-                        pick.get("reasoning", ""),
-                    ]
+                    _row(
+                        [
+                            pick.get("sport", ""),
+                            pick.get("matchup", ""),
+                            pick.get("side", ""),
+                            pick.get("odds", ""),
+                            pick.get("reasoning", ""),
+                        ]
+                    )
                 )
 
             other_table = Table(
                 other_table_data,
-                colWidths=[0.8 * inch, 2.0 * inch, 1.5 * inch, 0.8 * inch, 2.4 * inch],
+                colWidths=[w * inch for w in col_widths],
             )
             other_table.setStyle(
                 TableStyle(
@@ -210,12 +232,10 @@ class PicksReportFormatter:
                         ("BACKGROUND", (0, 0), (-1, 0), self.theme["table_header"]),
                         ("TEXTCOLOR", (0, 0), (-1, 0), white),
                         ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                        ("FONTSIZE", (0, 0), (-1, 0), 9),
                         ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
                         ("GRID", (0, 0), (-1, -1), 0.5, self.theme["header"]),
-                        ("FONTSIZE", (0, 1), (-1, -1), 8),
-                        ("ROWHEIGHTS", (0, 0), (-1, -1), 0.35 * inch),
+                        ("TOPPADDING", (0, 0), (-1, -1), 5),
+                        ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
                         ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ]
                 )

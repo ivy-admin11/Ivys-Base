@@ -44,16 +44,28 @@ SEND_FILE_ARGV_SCRIPT = """
 on run argv
     set recipientValue to item 1 of argv
     set filePathValue to item 2 of argv
-    tell application "Messages"
-        try
-            set targetService to first service whose service type is iMessage
-            set targetBuddy to buddy recipientValue of targetService
-            send (POSIX file filePathValue) to targetBuddy
-            return "SUCCESS"
-        on error errMsg
-            return "ERROR: " & errMsg
-        end try
-    end tell
+    try
+        -- Messages' scripting `send (POSIX file ...) to buddy` verb creates a
+        -- local message/attachment record but unreliably triggers the actual
+        -- upload when driven headlessly — the receiving side ends up with an
+        -- unopenable placeholder. Emulate an actual human paste instead: put
+        -- the file on the clipboard the same way Finder's Cmd+C does, deep-link
+        -- to the specific conversation's compose field via the imessage: URL
+        -- scheme (focuses it reliably, unlike GUI sidebar navigation), paste,
+        -- then send — this goes through the same code path a real attach does.
+        set the clipboard to (POSIX file filePathValue)
+        tell application "Messages" to activate
+        open location "imessage:" & recipientValue
+        delay 1.5
+        tell application "System Events"
+            keystroke "v" using command down
+            delay 1.5
+            key code 36
+        end tell
+        return "SUCCESS"
+    on error errMsg
+        return "ERROR: " & errMsg
+    end try
 end run
 """
 
