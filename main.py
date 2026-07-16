@@ -934,10 +934,6 @@ def background_imessage_worker() -> None:
             msg_id, text, sender = row
             last_id = msg_id
 
-            if "ivy" not in text.lower():
-                consecutive_failures = 0
-                continue
-
             # ========== Authorization Check ==========
             is_authorized = False
             if sender.lower() == "me":
