@@ -70,6 +70,7 @@ class PicksReportFormatter:
         metadata: Optional[Dict[str, str]] = None,
         headers: Optional[List[str]] = None,
         col_widths: Optional[List[float]] = None,
+        fields: Optional[List[str]] = None,
         consensus_heading: str = "🔥 High-Likelihood Consensus Plays",
         other_heading: str = "Other Sharp Picks",
     ) -> str:
@@ -80,12 +81,18 @@ class PicksReportFormatter:
             filename: Output PDF path
             summary: Executive summary paragraph
             consensus_picks: List of dicts with keys: sport, matchup, side, odds, reasoning
+                (or whatever keys `fields` names)
             other_picks: List of dicts with same structure
             metadata: Optional dict with pick_count, source, timestamp
             headers: Optional column header labels (defaults to the sports-report
                 labels); pass domain-appropriate labels for non-sports callers.
+                Must have the same length as `fields`.
             col_widths: Optional column widths in inches (must sum to <= 6.5in
                 given the 0.75in margins); defaults to the sports-report widths.
+            fields: Optional list of pick dict keys, in column order (defaults to
+                the 5 sports-report keys). Lets a caller add/reorder columns —
+                e.g. a "when" column for game date/time — as long as `headers`
+                and `col_widths` are updated to match.
             consensus_heading: Section title above the first table (defaults to
                 the sports-report heading; pass a domain-appropriate title for
                 non-sports callers).
@@ -97,6 +104,7 @@ class PicksReportFormatter:
         """
         headers = headers or ["Sport", "Matchup", "Side", "Odds", "Reasoning"]
         col_widths = col_widths or [0.8, 2.0, 1.0, 0.9, 2.8]
+        fields = fields or ["sport", "matchup", "side", "odds", "reasoning"]
         cell_style = ParagraphStyle(
             "TableCell", parent=getSampleStyleSheet()["Normal"], fontSize=8, leading=10,
         )
@@ -176,17 +184,7 @@ class PicksReportFormatter:
 
             consensus_table_data = [_row(headers)]
             for pick in consensus_picks:
-                consensus_table_data.append(
-                    _row(
-                        [
-                            pick.get("sport", ""),
-                            pick.get("matchup", ""),
-                            pick.get("side", ""),
-                            pick.get("odds", ""),
-                            pick.get("reasoning", ""),
-                        ]
-                    )
-                )
+                consensus_table_data.append(_row([pick.get(f, "") for f in fields]))
             # Header row keeps the bold/white header style regardless of _row's default.
             consensus_table_data[0] = [Paragraph(str(h), header_style) for h in headers]
 
@@ -218,17 +216,7 @@ class PicksReportFormatter:
 
             other_table_data = [[Paragraph(str(h), header_style) for h in headers]]
             for pick in other_picks:
-                other_table_data.append(
-                    _row(
-                        [
-                            pick.get("sport", ""),
-                            pick.get("matchup", ""),
-                            pick.get("side", ""),
-                            pick.get("odds", ""),
-                            pick.get("reasoning", ""),
-                        ]
-                    )
-                )
+                other_table_data.append(_row([pick.get(f, "") for f in fields]))
 
             other_table = Table(
                 other_table_data,

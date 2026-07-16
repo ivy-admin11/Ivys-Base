@@ -650,6 +650,18 @@ def _fmt_start(value):
         return ""
 
 
+def _pick_when(e):
+    """Best-effort scheduled start for a pick: odds-feed time -> Grok
+    start_time -> today/tomorrow tag. Shared by the iMessage text body and
+    the PDF table so both surfaces show the same game date/time."""
+    start = _fmt_start(e.get("start"))
+    if not start and e.get("start"):
+        start = str(e["start"])
+    if not start and e.get("game_day"):
+        start = e["game_day"].capitalize()
+    return start
+
+
 def _confidence(e):
     """Confidence grade for a pick, set purely by how many curated X/Grok
     handicapper accounts back the SAME bet: 1 -> LOW, 2 -> MEDIUM, 3+ -> HIGH."""
@@ -683,6 +695,7 @@ def format_picks_pdf(merged):
         consensus_picks.append({
             "sport": pick.get("sport", ""),
             "matchup": pick.get("matchup", ""),
+            "when": _pick_when(pick),
             "side": pick.get("side", ""),
             "odds": pick.get("odds", ""),
             "reasoning": reasoning,
@@ -700,6 +713,7 @@ def format_picks_pdf(merged):
         other_picks.append({
             "sport": pick.get("sport", ""),
             "matchup": pick.get("matchup", ""),
+            "when": _pick_when(pick),
             "side": pick.get("side", ""),
             "odds": pick.get("odds", ""),
             "reasoning": reasoning,
@@ -727,6 +741,9 @@ def format_picks_pdf(merged):
         consensus_picks=consensus_picks,
         other_picks=other_picks,
         metadata=metadata,
+        headers=["Sport", "Matchup", "Date/Time", "Side", "Odds", "Reasoning"],
+        col_widths=[0.6, 1.5, 1.1, 0.8, 0.6, 2.1],
+        fields=["sport", "matchup", "when", "side", "odds", "reasoning"],
     )
 
     return pdf_path
@@ -749,11 +766,7 @@ def format_picks_text(merged):
         block = [head]
 
         # Scheduled start: odds-feed time → Grok start_time → today/tomorrow tag.
-        start = _fmt_start(e.get("start"))
-        if not start and e.get("start"):
-            start = str(e["start"])
-        if not start and e.get("game_day"):
-            start = e["game_day"].capitalize()
+        start = _pick_when(e)
         if start:
             block.append(f"   🕒 {start}")
 
