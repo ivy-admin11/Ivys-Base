@@ -87,7 +87,7 @@ def test_launchctl_nonzero_returncode_is_error_not_success():
     runner = JobRunner()
     job = Job(
         name="fake", display_name="Fake", aliases=[], description="test",
-        executor="launchctl", target="com.ivy.brain",  # real installed plist, for the os.path.exists check
+        executor="launchctl", target="com.ivy.brain",
     )
 
     def side_effect(cmd, **kwargs):
@@ -98,7 +98,8 @@ def test_launchctl_nonzero_returncode_is_error_not_success():
             result.returncode, result.stderr, result.stdout = 1, "boom", ""
         return result
 
-    with patch("job_runner.subprocess.run", side_effect=side_effect):
+    with patch("job_runner.os.path.exists", return_value=True), \
+         patch("job_runner.subprocess.run", side_effect=side_effect):
         status, message = runner._run_launchctl_job(job)
     assert status == JobStatus.ERROR
 
@@ -115,7 +116,8 @@ def test_launchctl_success_path_returns_success():
         result.stdout, result.returncode, result.stderr = "com.ivy.brain\n", 0, ""
         return result
 
-    with patch("job_runner.subprocess.run", side_effect=side_effect):
+    with patch("job_runner.os.path.exists", return_value=True), \
+         patch("job_runner.subprocess.run", side_effect=side_effect):
         status, message = runner._run_launchctl_job(job)
     assert status == JobStatus.SUCCESS
 
@@ -134,7 +136,8 @@ def test_launchctl_uses_dynamic_uid_not_hardcoded_501():
         result.stdout, result.returncode, result.stderr = "com.ivy.brain\n", 0, ""
         return result
 
-    with patch("job_runner.subprocess.run", side_effect=side_effect):
+    with patch("job_runner.os.path.exists", return_value=True), \
+         patch("job_runner.subprocess.run", side_effect=side_effect):
         runner._run_launchctl_job(job)
     kickstart_call = next(c for c in calls if c[:2] == ["launchctl", "kickstart"])
     assert kickstart_call[-1] == f"gui/{os.getuid()}/com.ivy.brain"
