@@ -4,6 +4,7 @@ Stores picks with their outcomes in a SQLite database, enabling:
 - Historical record of all picks
 - Win/loss/push tallies by sport, handicapper, confidence level
 - Season-to-date ROI and hit rate calculations
+- Google Sheets logging for shared visibility
 """
 
 import json
@@ -12,6 +13,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from ivy_core.sheets_logger import log_picks_to_sheet, update_result_in_sheet
 
 logger = logging.getLogger("ivy.picks_tracker")
 
@@ -62,7 +65,7 @@ def _init_db():
 
 
 def save_picks(picks: List[Dict], report_date: str):
-    """Save a batch of picks from a report."""
+    """Save a batch of picks from a report to SQLite and Google Sheets."""
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
@@ -91,13 +94,26 @@ def save_picks(picks: List[Dict], report_date: str):
     conn.commit()
     conn.close()
     logger.info(f"Saved {len(picks)} picks to database")
+    
+    # Also log to Google Sheets for shared visibility
+    try:
+        log_picks_to_sheet(picks, report_date)
+    except Exception as e:
+        logger.warning(f"Could not log picks to Google Sheets: {e}")
 
 
 def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = None):
-    """Update the result of a pick (W/L/P)."""
+    """Update the result of a pick (W/L/P) in database and Google Sheets."""
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
+    
+    # Get the pick details for sheet update
+    cursor.execute(
+        "SELECT matchup, side FROM picks WHERE id = ?",
+        (pick_id,)
+    )
+    pick_data = cursor.fetchone()
     
     cursor.execute("""
         UPDATE results
@@ -107,6 +123,14 @@ def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = N
     
     conn.commit()
     conn.close()
+    
+    # Also update in Google Sheets
+    if pick_data:
+        matchup, side = pick_data
+        try:
+            update_result_in_sheet(matchup, side, result, notes=final_score)
+        except Exception as e:
+            logger.warning(f"Could not update result in Google Sheets: {e}")
 
 
 def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
