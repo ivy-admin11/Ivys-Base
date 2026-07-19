@@ -14,8 +14,7 @@ aiofiles==24.1.0
 slowapi==0.1.9
 pydantic>=2.7,<3
 reportlab==5.0.0
-pillow==12.2.0
-mcp>=1.0.0
+pillow==11.3.0
 xai-sdk==1.17.0
 openai==2.37.0
 pymupdf==1.28.0

@@ -89,6 +89,7 @@ def send_imessage_attachment(
         os.makedirs(_IMSG_ATTACH_STAGE, exist_ok=True)
         staged = os.path.join(_IMSG_ATTACH_STAGE, os.path.basename(file_path))
         shutil.copyfile(file_path, staged)
+        logger.info("Staged attachment for delivery: %s → %s", file_path, staged)
     except OSError as exc:
         logger.warning(
             "Could not stage attachment into ~/Pictures (%s); sending from source.", exc
