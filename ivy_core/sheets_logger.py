@@ -166,23 +166,24 @@ def get_sheet_summary():
         ).execute()
         
         values = result_obj.get("values", [])
-        if not values:
+        if not values or len(values) < 2:  # Header + at least one data row
             return None
         
         # Count results in column J (index 9)
         wins = losses = pushes = pending = 0
         
         for row in values[1:]:  # Skip header
-            if len(row) > 9:
-                result = row[9].upper().strip()
-                if result == "W":
-                    wins += 1
-                elif result == "L":
-                    losses += 1
-                elif result == "P":
-                    pushes += 1
-                elif result == "":
-                    pending += 1
+            # Handle rows with fewer columns
+            result = row[9].upper().strip() if len(row) > 9 else ""
+            
+            if result == "W":
+                wins += 1
+            elif result == "L":
+                losses += 1
+            elif result == "P":
+                pushes += 1
+            else:  # Empty or unrecognized
+                pending += 1
         
         hit_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
         
