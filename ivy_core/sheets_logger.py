@@ -21,7 +21,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Sheet IDs (from URL: /spreadsheets/d/{SPREADSHEET_ID}/edit)
 SPREADSHEET_ID = "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
-SHEET_NAME = "Sheet1"  # Tab name in the spreadsheet
+SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 
 
 def _get_sheets_service():
