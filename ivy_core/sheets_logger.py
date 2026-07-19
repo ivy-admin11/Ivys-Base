@@ -29,6 +29,8 @@ def _get_sheets_service():
     try:
         # Try service account first (for automated deployments)
         for cred_path in [
+            Path("~/openclaw-admin/service-account-key.json").expanduser(),
+            Path("~/ai-admin-api/service-account-key.json").expanduser(),
             Path("~/ai-admin-api/google_credentials.json").expanduser(),
             Path("~/openclaw-admin/google_credentials.json").expanduser(),
             Path("/Users/lexi/Ivys-Base/google_credentials.json"),
