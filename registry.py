@@ -69,12 +69,12 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
         description=(
             "Execute a background job on-demand. Available jobs: sharp_picks (daily picks), "
             "happy_hour (scout nearby happy hours), bravo_scout (reality TV monitor), "
-            "weekly_planner (meal plan generator), brain (knowledge queries)."
+            "familia_meal_planner (Venezuelan-American-Asian fusion meal plan), brain (knowledge queries)."
         ),
         params=(
             ToolParam(
                 "job_name", "string",
-                "Job to run: 'sharp_picks', 'happy_hour', 'bravo_scout', 'weekly_planner', "
+                "Job to run: 'sharp_picks', 'happy_hour', 'bravo_scout', 'familia_meal_planner', "
                 "'brain', or natural language like 'picks', 'meals', 'scout'",
                 required=True,
             ),
