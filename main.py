@@ -75,6 +75,9 @@ from config import (
 # Canonical tool schema — single source of truth for both providers
 from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 from ivy_core import receipts
+from ivy_core import outbox as _outbox
+from ivy_core.messaging import send_imessage_attachment
+from ivy_core.report_fallback import build_attachment_failure_notice
 
 # Import prompt caching manager
 try:
@@ -195,14 +198,16 @@ TOOLS_LIST = [
         "enabled": ENABLE_READWISE_INTEGRATION,
     },
     {
-        "name": "gemini",
-        "description": "Primary AI conversation/reasoning engine via Google Gemini (with prompt caching).",
-        "required_env": [["GEMINI_API_KEY"]],
+        "name": "deepseek",
+        "description": "Primary AI conversation/reasoning engine via the DeepSeek API.",
+        "required_env": [["DEEPSEEK_API_KEY"]],
+        "role": "primary",
     },
     {
-        "name": "deepseek",
-        "description": "Failover AI conversation engine via the DeepSeek API.",
-        "required_env": [["DEEPSEEK_API_KEY"]],
+        "name": "gemini",
+        "description": "Failover/backup AI engine via Google Gemini (prompt caching enabled).",
+        "required_env": [["GEMINI_API_KEY"]],
+        "role": "failover",
     },
     {
         "name": "voice_assistant",
@@ -255,6 +260,121 @@ def compute_tool_statuses() -> List[Dict[str, Any]]:
             "reason": reason,
         })
     return statuses
+
+
+# ---------------------------------------------------------------------------
+# Provider auth probes — distinguish "configured" from "authenticated"
+# ---------------------------------------------------------------------------
+
+_PROVIDER_PROBE_CACHE: Dict[str, Any] = {}
+_PROVIDER_PROBE_LOCK = threading.Lock()
+_PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health poll
+
+
+def _probe_deepseek() -> Dict[str, Any]:
+    """Make a minimal (~1-token) HTTP call to DeepSeek and map the result to
+    {configured, authenticated, reachable, role, status, reason}."""
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "configured": False, "authenticated": False, "reachable": False,
+            "role": "primary", "status": "unconfigured", "reason": "DEEPSEEK_API_KEY not set",
+        }
+    try:
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            },
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            return {
+                "configured": True, "authenticated": True, "reachable": True,
+                "role": "primary", "status": "ready", "reason": None,
+            }
+        if resp.status_code in (401, 403):
+            return {
+                "configured": True, "authenticated": False, "reachable": True,
+                "role": "primary", "status": "degraded",
+                "reason": f"Provider returned HTTP {resp.status_code}",
+            }
+        return {
+            "configured": True, "authenticated": False, "reachable": True,
+            "role": "primary", "status": "error",
+            "reason": f"Unexpected HTTP {resp.status_code}",
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "configured": True, "authenticated": False, "reachable": False,
+            "role": "primary", "status": "unreachable", "reason": "Request timed out",
+        }
+    except requests.exceptions.ConnectionError as exc:
+        return {
+            "configured": True, "authenticated": False, "reachable": False,
+            "role": "primary", "status": "unreachable", "reason": str(exc)[:120],
+        }
+    except Exception as exc:
+        return {
+            "configured": True, "authenticated": False, "reachable": True,
+            "role": "primary", "status": "error", "reason": str(exc)[:120],
+        }
+
+
+def _probe_gemini() -> Dict[str, Any]:
+    """Make a minimal (~1-token) call to Gemini and map the result."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "configured": False, "authenticated": False, "reachable": False,
+            "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
+        }
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        model.generate_content("hi", generation_config={"max_output_tokens": 1})
+        return {
+            "configured": True, "authenticated": True, "reachable": True,
+            "role": "failover", "status": "ready", "reason": None,
+        }
+    except Exception as exc:
+        msg = str(exc)
+        if any(code in msg for code in ("401", "403", "API_KEY_INVALID", "PERMISSION_DENIED")):
+            return {
+                "configured": True, "authenticated": False, "reachable": True,
+                "role": "failover", "status": "degraded",
+                "reason": "Provider returned auth error",
+            }
+        return {
+            "configured": True, "authenticated": False, "reachable": True,
+            "role": "failover", "status": "error", "reason": msg[:120],
+        }
+
+
+def probe_providers(*, force: bool = False) -> Dict[str, Any]:
+    """Return per-provider auth status. Cached for _PROVIDER_PROBE_TTL seconds
+    so repeated /health polls don't hammer external APIs.
+
+    Pass force=True to bypass the cache (e.g., after a key rotation)."""
+    import time as _time
+    now = _time.monotonic()
+    with _PROVIDER_PROBE_LOCK:
+        cached_at = _PROVIDER_PROBE_CACHE.get("_ts", 0.0)
+        if not force and (now - cached_at) < _PROVIDER_PROBE_TTL:
+            return {k: v for k, v in _PROVIDER_PROBE_CACHE.items() if k != "_ts"}
+
+        result: Dict[str, Any] = {
+            "deepseek": _probe_deepseek(),
+            "gemini": _probe_gemini(),
+            "_ts": now,
+        }
+        _PROVIDER_PROBE_CACHE.clear()
+        _PROVIDER_PROBE_CACHE.update(result)
+        return {k: v for k, v in result.items() if k != "_ts"}
+
 
 
 def print_startup_banner() -> None:
@@ -895,12 +1015,108 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 
 
 # ============================================================================
+# RESEND COMMAND HANDLER
+# ============================================================================
+
+import re as _re
+
+_RESEND_PATTERN = _re.compile(
+    r"^\s*resend\s+"
+    r"(picks|sharp\s+picks|happy\s+hour|meal\s+plan|[A-Z]{2}-\d{8}-\d{4}(?::\d{2})?)\s*$",
+    _re.IGNORECASE,
+)
+
+_RESEND_ALIASES: Dict[str, str] = {
+    "picks": "sharp_picks",
+    "sharp picks": "sharp_picks",
+    "happy hour": "happy_hour",
+    "meal plan": "familia_meal_planner",
+}
+
+_RESEND_COMMANDS: Dict[str, str] = {
+    "sharp_picks": "RESEND PICKS",
+    "happy_hour": "RESEND HAPPY HOUR",
+    "familia_meal_planner": "RESEND MEAL PLAN",
+}
+
+_RESEND_REPORT_NAMES: Dict[str, str] = {
+    "sharp_picks": "Sharp Picks",
+    "happy_hour": "Happy Hour Scout",
+    "familia_meal_planner": "Familia Meal Plan",
+}
+
+
+def handle_resend_command(text: str, sender: str) -> Optional[str]:
+    """Deterministic RESEND handler — never calls an LLM.
+
+    Returns a user-facing reply string if the text is a RESEND command,
+    or None if the text is not a RESEND command (caller should proceed to LLM).
+
+    Supported commands:
+      RESEND PICKS / RESEND SHARP PICKS
+      RESEND HAPPY HOUR
+      RESEND MEAL PLAN
+      RESEND <REPORT_ID>          e.g. RESEND SP-20260719-1430
+    """
+    m = _RESEND_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    target = m.group(1).strip().lower()
+    job_name: Optional[str] = None
+    report_id: Optional[str] = None
+
+    # Is this an explicit report ID (e.g. SP-20260719-1430)?
+    if _re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, _re.IGNORECASE):
+        report_id = target.upper()
+        job_name = _outbox.job_name_for_report_id(report_id)
+        if not job_name:
+            return "I don't recognise that report ID. Try RESEND PICKS, RESEND HAPPY HOUR, or RESEND MEAL PLAN."
+    else:
+        job_name = _RESEND_ALIASES.get(target)
+        if not job_name:
+            return "I didn't understand that resend command. Try RESEND PICKS, RESEND HAPPY HOUR, or RESEND MEAL PLAN."
+        report_id = _outbox.find_newest_pending(job_name)
+        if not report_id:
+            return f"No pending {_RESEND_REPORT_NAMES.get(job_name, job_name)} report found to resend."
+
+    meta = _outbox.load_report_meta(report_id)
+    if not meta:
+        return f"Report {report_id} metadata not found. It may have expired."
+
+    pdf_path = _outbox.get_outbox_pdf_path(report_id)
+    if not pdf_path:
+        return f"The PDF for {report_id} is no longer available. You may need to run the job again."
+
+    logger.info("RESEND: retrying attachment for %s → %s", report_id, sender)
+    receipt = send_imessage_attachment(sender, str(pdf_path), report_id=report_id)
+    attempts = (meta.get("send_attempts") or 0) + receipt.attempts
+    _outbox.update_report_status(report_id, receipt.status, attempts=attempts)
+
+    report_name = _RESEND_REPORT_NAMES.get(job_name, job_name)
+    resend_cmd = _RESEND_COMMANDS.get(job_name, "RESEND")
+
+    if receipt:
+        return f"✅ {report_name} PDF resent (ref: {report_id})."
+
+    # Attachment failed again.
+    notice = build_attachment_failure_notice(
+        report_name=report_name,
+        report_id=report_id,
+        resend_command=resend_cmd,
+        retry_queued=False,
+    )
+    run_local_applescript_send(sender, notice)
+    return f"PDF delivery failed again. The report ({report_id}) is preserved in the outbox."
+
+
+# ============================================================================
 # BACKGROUND IMESSAGE WORKER: DeepSeek Primary + Gemini Backup with CACHING
 # ============================================================================
 
 
 def background_imessage_worker() -> None:
-    """Poll iMessage database and respond via Gemini → DeepSeek failover chain.
+    """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
     
     🆕 Now with prompt caching enabled for 80-90% token savings!
     """
@@ -969,6 +1185,13 @@ def background_imessage_worker() -> None:
             logger.info("📩 Inbound Trigger Isolated: %s", text)
             reply = None
 
+            # ========== RESEND COMMAND (deterministic, no LLM) ==========
+            resend_reply = handle_resend_command(text, sender)
+            if resend_reply is not None:
+                run_local_applescript_send(sender, resend_reply)
+                consecutive_failures = 0
+                continue
+
             # ========== PHASE 1: DEEPSEEK PRIMARY ==========
             try:
                 logger.info("🧠 Querying Primary Engine (DeepSeek)...")
@@ -1021,14 +1244,21 @@ def background_imessage_worker() -> None:
 
 @app.get("/health")
 def health_endpoint(authenticated: bool = Depends(verify_api_key)):
-    """Lightweight liveness check with authentication."""
+    """Liveness check with per-provider auth status.
+
+    Reports configured/authenticated/reachable for each LLM provider so the
+    difference between a missing key and a rejected key is always visible.
+    Results are cached for 60 s to avoid hammering external APIs on every poll.
+    """
+    providers = probe_providers()
     return {
         "status": "ok",
+        "providers": providers,
         "tools": compute_tool_statuses(),
         "caching": {
             "enabled": ENABLE_PROMPT_CACHING and CACHING_AVAILABLE,
-            "cache_ttl_seconds": 3600 if ENABLE_PROMPT_CACHING else None
-        }
+            "cache_ttl_seconds": 3600 if ENABLE_PROMPT_CACHING else None,
+        },
     }
 
 
@@ -1049,12 +1279,13 @@ def capabilities_endpoint(authenticated: bool = Depends(verify_api_key)):
 def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     """Readiness probe — distinct from /health's bare liveness check.
     Returns 503 (not 200 with status:"degraded" buried in the body) when a
-    component actually required to serve requests is unavailable."""
-    checks = {
+    component actually required to serve requests is unavailable.
+
+    llm_provider_authenticated requires at least one provider to have passed a
+    live auth probe — a key being present in the environment is not sufficient.
+    """
+    checks: Dict[str, Any] = {
         "chat_db_readable": os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK),
-        "llm_provider_configured": bool(
-            os.environ.get("DEEPSEEK_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
-        ),
     }
     try:
         receipts.list_recent(limit=1)
@@ -1063,8 +1294,13 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
         logger.warning("Receipts DB check failed: %s", exc)
         checks["receipts_db_writable"] = False
 
+    # Use cached probe result so /ready doesn't trigger a new network call.
+    providers = probe_providers()
+    any_authenticated = any(p.get("authenticated") for p in providers.values())
+    checks["llm_provider_authenticated"] = any_authenticated
+
     ready = all(checks.values())
-    payload = {"ready": ready, "checks": checks}
+    payload: Dict[str, Any] = {"ready": ready, "checks": checks}
     if not ready:
         raise HTTPException(status_code=503, detail=payload)
     return payload

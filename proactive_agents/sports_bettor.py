@@ -45,8 +45,14 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import requests
+from filelock import FileLock, Timeout
 
 from ivy_core import require_env, send_imessage, send_imessage_attachment
+from ivy_core import outbox as _outbox
+from ivy_core.report_fallback import (
+    build_attachment_failure_notice,
+    split_imessage_content,
+)
 
 # PDF formatter for professional reports
 from picks_formatter import PicksReportFormatter
@@ -857,7 +863,34 @@ def run(
     on-demand requests, so "run picks now" always delivers even if the slate
     hasn't changed since the last scheduled report). send=False runs the
     full sweep and generates the PDF without texting anything (dry-run).
+
+    A non-blocking filelock prevents overlapping scheduled + ad-hoc executions.
     """
+    _lock_path = os.path.join(PROJECT_ROOT, "data", "sharp_picks.lock")
+    os.makedirs(os.path.dirname(_lock_path), exist_ok=True)
+    _lock = FileLock(_lock_path, timeout=0)
+
+    try:
+        _lock.acquire()
+    except Timeout:
+        msg = "Another Sharp Picks execution is already running — skipped to prevent overlap."
+        print(f"⏭️  {msg}")
+        return {"result_type": "skipped", "reason": msg}
+
+    try:
+        return _run_pipeline(force=force, send=send, requester=requester, request_id=request_id)
+    finally:
+        _lock.release()
+
+
+def _run_pipeline(
+    *,
+    force: bool = False,
+    send: bool = True,
+    requester: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> dict:
+    """Internal pipeline — called only when the run() filelock is held."""
     print("🚀 Starting 48-Hour X-Sourced Sports Picks Loop...")
 
     games = fetch_live_odds()
@@ -900,6 +933,19 @@ def run(
     pdf_path = format_picks_pdf(merged)
     print(f"✅ PDF generated: {pdf_path}")
 
+    # Assign a report ID and persist to the durable outbox before sending.
+    report_id = _outbox.make_report_id("sharp_picks")
+    content_summary = (
+        f"{len(merged)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
+    )
+    _outbox.save_report(
+        report_id, pdf_path,
+        job_name="sharp_picks",
+        recipient=HENRY_PHONE,
+        content_summary=content_summary,
+    )
+    print(f"📦 Outbox: {report_id}")
+
     stats_line = (
         f"📊 Ivy's Sharp Picks Report Ready\n\n"
         f"🔥 {consensus_n} consensus play(s) • {len(merged) - consensus_n} additional picks\n"
@@ -909,28 +955,58 @@ def run(
     if not send:
         print("🧪 send=False — dry run, not sending.")
         return {
-            "result_type": "picks", "sent": False, "attached": False,
+            "result_type": "picks", "report_id": report_id,
+            "sent": False, "attached": False,
             "pdf_path": pdf_path, "pick_count": len(merged),
         }
 
     # Attempt the PDF attachment first — only claim "Full report attached"
-    # once we actually know it was delivered, never up front.
-    attached = send_imessage_attachment(HENRY_PHONE, pdf_path)
-    if attached:
-        final_text = stats_line + "Full report attached (PDF)."
-    else:
-        final_text = stats_line + f"Report generated, but attachment delivery failed. Path: {pdf_path}"
-    delivered_text = send_imessage(HENRY_PHONE, final_text)
+    # once we actually know it was delivered (or at least submitted), never up front.
+    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
+    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
 
-    if attached:
-        save_last_report(signature, signature)  # Track by signature, not text
+    if receipt:
+        # submitted_unverified or verified_delivered — treat as success.
+        final_text = stats_line + "Full report attached (PDF)."
+        delivered_text = send_imessage(HENRY_PHONE, final_text)
+        save_last_report(signature, signature)
         print(f"✅ {len(merged)} pick(s) reported to Henry ({consensus_n} consensus).")
-    else:
-        print("⚠️ Attachment delivery failed — not recording report state so it retries next run.")
+        return {
+            "result_type": "picks",
+            "report_id": report_id,
+            "sent": delivered_text,
+            "text_sent": True,
+            "attachment_status": receipt.status,
+            "fallback_sent": False,
+            "retry_queued": False,
+            "pick_count": len(merged),
+        }
+
+    # Explicit failure — send two-message fallback, do NOT mark as delivered.
+    print("⚠️ Attachment delivery failed — sending text fallback.")
+    notice = build_attachment_failure_notice(
+        report_name="Sharp Picks",
+        report_id=report_id,
+        resend_command="RESEND PICKS",
+        retry_queued=True,
+    )
+    notice_sent = send_imessage(HENRY_PHONE, notice)
+
+    # Build and split the text content fallback (consensus first, up to 5 others).
+    full_text = stats_line + format_picks_text(merged)
+    bubbles = split_imessage_content(full_text)
+    fallback_sent = all(send_imessage(HENRY_PHONE, b) for b in bubbles)
+    print(f"📝 Text fallback {'sent' if fallback_sent else 'failed'} ({len(bubbles)} bubble(s)).")
 
     return {
-        "result_type": "picks", "sent": delivered_text, "attached": attached,
-        "pdf_path": pdf_path, "pick_count": len(merged),
+        "result_type": "picks",
+        "report_id": report_id,
+        "sent": notice_sent,
+        "text_sent": fallback_sent,
+        "attachment_status": "failed",
+        "fallback_sent": fallback_sent,
+        "retry_queued": True,
+        "pick_count": len(merged),
     }
 
 

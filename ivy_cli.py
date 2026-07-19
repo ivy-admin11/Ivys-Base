@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""ivy — Ivy's terminal interface for queries and job execution.
+
+Modes:
+  1. Query mode (default): Ask Ivy questions or run commands
+     Usage: ./ivy "what's on my calendar today?"
+
+  2. Job management: Run background jobs on-demand
+     Usage: ./ivy run <job_name>
+     Usage: ./ivy list
+
+Runs requests through Ivy's full dual-brain agent (DeepSeek primary →
+Gemini 2.5 Flash backup) with all live tools (calendar, reminders, Readwise, jobs).
+Prints only Ivy's answer.
+
+Examples:
+    ./ivy "what's on my calendar today?"
+    ./ivy add oat milk and eggs to my reminders
+    ./ivy run sharp_picks       # Run sports picks job
+    ./ivy run happy hour        # Run happy hour scout
+    ./ivy list                  # List available jobs
+"""
+import contextlib
+import os
+import sys
+
+# Run from the project root so `import main` resolves and .env loads.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+args = sys.argv[1:]
+
+# Handle job management commands
+if args and args[0] == "list":
+    from job_runner import job_runner
+    jobs = job_runner.list_jobs()
+    print("\n📋 Available Ivy Jobs:\n")
+    for job in jobs:
+        print(f"  {job['display_name']}")
+        print(f"    → {job['description']}")
+        print(f"    Aliases: {job['aliases']}")
+        print()
+    sys.exit(0)
+
+elif args and args[0] == "run":
+    from job_runner import job_runner
+    if len(args) < 2:
+        sys.exit("usage: ivy run <job_name>")
+    job_name = " ".join(args[1:])
+    status, message = job_runner.run_job(job_name)
+    print(f"\n{message}\n")
+    sys.exit(0 if status.name == "SUCCESS" else 1)
+
+elif args and args[0] in ["help", "-h", "--help"]:
+    print(__doc__)
+    sys.exit(0)
+
+# Query mode (default)
+prompt = " ".join(args).strip()
+if not prompt:
+    print(__doc__)
+    sys.exit(0)
+
+import main  # loads .env + wires the agent (does NOT start the server/poller)
+
+# Silence the agent's verbose reasoning chain; keep only the final answer.
+with contextlib.redirect_stdout(open(os.devnull, "w")):
+    reply = main.query_llm_with_tools(prompt)
+
+print(reply or "No response.")

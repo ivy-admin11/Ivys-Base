@@ -7,6 +7,7 @@ everything needed to import and execute the jobs.
 from ivy_core.env import MissingEnvironmentVariable, require_env
 from ivy_core.llm import query_llm, strip_json_fence
 from ivy_core.messaging import send_imessage, send_imessage_attachment
+from ivy_core.report_fallback import AttachmentDeliveryReceipt
 
 __all__ = [
     "MissingEnvironmentVariable",
@@ -15,4 +16,5 @@ __all__ = [
     "strip_json_fence",
     "send_imessage",
     "send_imessage_attachment",
+    "AttachmentDeliveryReceipt",
 ]
