@@ -100,6 +100,12 @@ def save_picks(picks: List[Dict], report_date: str):
         log_picks_to_sheet(picks, report_date)
     except Exception as e:
         logger.warning(f"Could not log picks to Google Sheets: {e}")
+    
+    # Auto-sync to export sheet
+    try:
+        auto_sync_to_export_sheet()
+    except Exception as e:
+        logger.warning(f"Could not sync picks to export sheet: {e}")
 
 
 def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = None):
@@ -284,3 +290,104 @@ def format_stats_for_pdf(days_back: int = 30) -> str:
             lines.append(f"  {hand}: {stats['wins']}W-{stats['losses']}L-{stats['pushes']}P ({stats['hit_rate']:.1f}%)")
     
     return "\n".join(lines)
+
+
+def auto_sync_to_export_sheet():
+    """Auto-sync all picks to the export sheet in Google Sheets.
+    
+    Called automatically after picks are saved. This populates the
+    "Sharp Picks" sheet in the export tab for easy sharing and analysis.
+    """
+    try:
+        from ivy_core.sheets_logger import _get_sheets_service
+        
+        service = _get_sheets_service()
+        if not service:
+            logger.debug("Skipping auto-sync to export sheet: no Google Sheets access")
+            return
+        
+        SPREADSHEET_ID = "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+        TARGET_SHEET_GID = 1305096861
+        
+        # Find the target sheet
+        spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        target_sheet_name = None
+        for sheet in spreadsheet['sheets']:
+            if sheet['properties']['sheetId'] == TARGET_SHEET_GID:
+                target_sheet_name = sheet['properties']['title']
+                break
+        
+        if not target_sheet_name:
+            logger.debug(f"Target sheet (gid={TARGET_SHEET_GID}) not found for export")
+            return
+        
+        # Get all picks from database
+        conn = sqlite3.connect(PICKS_DB)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                p.id,
+                p.sport,
+                p.matchup,
+                p.side,
+                p.odds,
+                p.handicapper,
+                p.confidence,
+                p.game_day,
+                p.start_time,
+                p.report_date,
+                COALESCE(r.result, '') as result,
+                COALESCE(r.final_score, '') as final_score
+            FROM picks p
+            LEFT JOIN results r ON p.id = r.pick_id
+            ORDER BY p.created_at
+        """)
+        
+        picks = cursor.fetchall()
+        conn.close()
+        
+        # Format for sheet
+        rows = []
+        for pick in picks:
+            row = [
+                pick[1],  # sport
+                pick[2],  # matchup
+                pick[3],  # side
+                str(pick[4]) if pick[4] else "",  # odds
+                pick[5],  # handicapper
+                pick[6],  # confidence
+                pick[7],  # game_day
+                pick[8],  # start_time
+                pick[9],  # report_date
+                pick[10],  # result
+                pick[11],  # final_score
+            ]
+            rows.append(row)
+        
+        # Clear and write to sheet
+        header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Result", "FinalScore"]
+        
+        service.spreadsheets().values().clear(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{target_sheet_name}!A2:K"
+        ).execute()
+        
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{target_sheet_name}!A1:K1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [header]}
+        ).execute()
+        
+        if rows:
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{target_sheet_name}!A2:K",
+                valueInputOption="USER_ENTERED",
+                body={"values": rows}
+            ).execute()
+        
+        logger.info(f"Auto-synced {len(picks)} picks to export sheet")
+    except Exception as e:
+        logger.warning(f"Failed to auto-sync picks to export sheet: {e}")
