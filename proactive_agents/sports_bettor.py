@@ -49,6 +49,7 @@ from filelock import FileLock, Timeout
 
 from ivy_core import require_env, send_imessage, send_imessage_attachment
 from ivy_core import outbox as _outbox
+from ivy_core.picks_tracker import save_picks, format_stats_for_pdf
 from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     split_imessage_content,
@@ -726,10 +727,12 @@ def format_picks_pdf(merged):
         })
 
     # Summary paragraph
+    stats_section = format_stats_for_pdf(days_back=30)
     summary = (
         f"Ivy has surfaced {len(consensus)} consensus play(s) and {len(others)} additional sharp pick(s) "
         f"across the next 48 hours. Consensus plays are backed by 2+ handicappers. "
-        f"All picks are priced against live Vegas odds and enriched with real-time context from X."
+        f"All picks are priced against live Vegas odds and enriched with real-time context from X.\n\n"
+        f"{stats_section}"
     )
 
     # Metadata
@@ -935,6 +938,9 @@ def _run_pipeline(
     enrich_picks(merged, games)  # Grok enrichment for every surfaced pick
     consensus_n = sum(1 for p in merged if p["is_consensus"])
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique ({consensus_n} consensus).")
+    
+    # Track picks in the database for historical win/loss/push analysis
+    save_picks(picks, report_date=datetime.now().strftime("%Y-%m-%d"))
 
     # Build the outbound body and its content fingerprint.
     signature = _report_signature(merged)
