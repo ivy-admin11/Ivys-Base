@@ -940,7 +940,7 @@ def _run_pipeline(
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique ({consensus_n} consensus).")
     
     # Track picks in the database for historical win/loss/push analysis
-    save_picks(picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    save_picks(merged, report_date=datetime.now().strftime("%Y-%m-%d"))
 
     # Build the outbound body and its content fingerprint.
     signature = _report_signature(merged)

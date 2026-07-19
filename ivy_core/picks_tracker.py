@@ -71,6 +71,16 @@ def save_picks(picks: List[Dict], report_date: str):
     cursor = conn.cursor()
     
     for pick in picks:
+        # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
+        start_time = pick.get("start_time") or pick.get("start")
+        handicappers = pick.get("handicappers") or pick.get("handicapper")
+        
+        # If handicappers is a list, join into a comma-separated string
+        if isinstance(handicappers, list):
+            handicapper = ", ".join(handicappers) if handicappers else None
+        else:
+            handicapper = handicappers
+        
         cursor.execute("""
             INSERT INTO picks (
                 sport, matchup, side, odds, handicapper, confidence,
@@ -81,10 +91,10 @@ def save_picks(picks: List[Dict], report_date: str):
             pick.get("matchup"),
             pick.get("side"),
             pick.get("odds"),
-            pick.get("handicapper"),
+            handicapper,
             pick.get("confidence"),
             pick.get("game_day"),
-            pick.get("start_time"),
+            start_time,
             pick.get("reasoning"),
             report_date,
         ))
