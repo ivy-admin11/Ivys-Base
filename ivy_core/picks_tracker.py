@@ -43,6 +43,7 @@ def _init_db():
             start_time TEXT,
             reasoning TEXT,
             report_date TEXT NOT NULL,
+            sharp_count INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -75,17 +76,19 @@ def save_picks(picks: List[Dict], report_date: str):
         start_time = pick.get("start_time") or pick.get("start")
         handicappers = pick.get("handicappers") or pick.get("handicapper")
         
-        # If handicappers is a list, join into a comma-separated string
+        # Count the number of sharps backing this pick
         if isinstance(handicappers, list):
+            sharp_count = len(handicappers)
             handicapper = ", ".join(handicappers) if handicappers else None
         else:
+            sharp_count = 1 if handicappers else 0
             handicapper = handicappers
         
         cursor.execute("""
             INSERT INTO picks (
                 sport, matchup, side, odds, handicapper, confidence,
-                game_day, start_time, reasoning, report_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                game_day, start_time, reasoning, report_date, sharp_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             pick.get("sport"),
             pick.get("matchup"),
@@ -97,6 +100,7 @@ def save_picks(picks: List[Dict], report_date: str):
             start_time,
             pick.get("reasoning"),
             report_date,
+            sharp_count,
         ))
         pick_id = cursor.lastrowid
         cursor.execute("INSERT INTO results (pick_id) VALUES (?)", (pick_id,))
@@ -347,6 +351,7 @@ def auto_sync_to_export_sheet():
                 p.game_day,
                 p.start_time,
                 p.report_date,
+                p.sharp_count,
                 COALESCE(r.result, '') as result,
                 COALESCE(r.final_score, '') as final_score
             FROM picks p
@@ -359,6 +364,8 @@ def auto_sync_to_export_sheet():
         
         # Format for sheet
         rows = []
+        header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Sharps", "Result", "FinalScore"]
+        
         for pick in picks:
             row = [
                 pick[1],  # sport
@@ -370,25 +377,25 @@ def auto_sync_to_export_sheet():
                 pick[7],  # game_day
                 pick[8],  # start_time
                 pick[9],  # report_date
-                pick[10],  # result
-                pick[11],  # final_score
+                str(pick[10]) if pick[10] else "1",  # sharp_count
+                pick[11],  # result
+                pick[12],  # final_score
             ]
             rows.append(row)
         
         # Append-only: do not clear existing data, only add new picks
         # This prevents losing picks from old job runs that aren't in the current database
-        header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Result", "FinalScore"]
         
         # Initialize header if empty
         current = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{target_sheet_name}!A1:K1"
+            range=f"{target_sheet_name}!A1:L1"
         ).execute()
         
         if not current.get('values'):
             service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{target_sheet_name}!A1:K1",
+                range=f"{target_sheet_name}!A1:L1",
                 valueInputOption="USER_ENTERED",
                 body={"values": [header]}
             ).execute()
@@ -396,7 +403,7 @@ def auto_sync_to_export_sheet():
         if rows:
             service.spreadsheets().values().append(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{target_sheet_name}!A2:K",
+                range=f"{target_sheet_name}!A2:L",
                 valueInputOption="USER_ENTERED",
                 body={"values": rows}
             ).execute()

@@ -99,7 +99,7 @@ def log_picks_to_sheet(picks: list, report_date: str):
 
 
 def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional[str] = None):
-    """Update the result column for a specific pick in the sheet.
+    """Update the result column for a specific pick in the export sheet.
     
     Args:
         matchup: The matchup identifier (e.g., "Kansas City Chiefs @ Buffalo Bills")
@@ -113,41 +113,50 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
         return
     
     try:
+        # Update export sheet (Sharp Picks tab, gid=1305096861)
+        export_sheet = "Sharp Picks"
+        
         # Read the current sheet to find the matching row
         result_obj = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A:K",
+            range=f"'{export_sheet}'!A:L",
         ).execute()
         
         values = result_obj.get("values", [])
         
-        # Find the matching row (matchup in column C, side in column D)
+        # Find the matching row
+        # Columns: A=Sport, B=Matchup, C=Side, D=Odds, E=Handicapper, F=Confidence, 
+        #          G=GameDay, H=StartTime, I=ReportDate, J=Sharps, K=Result, L=FinalScore
         for row_idx, row in enumerate(values[1:], start=2):  # Skip header
-            if len(row) >= 4 and row[2].lower() == matchup.lower() and row[3].lower() == side.lower():
-                # Found matching pick; update result (column J = index 9) and notes (column K = index 10)
-                update_range = f"{SHEET_NAME}!J{row_idx}"
-                update_body = {"values": [[result]]}
-                service.spreadsheets().values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=update_range,
-                    valueInputOption="USER_ENTERED",
-                    body=update_body,
-                ).execute()
+            if len(row) >= 3:
+                row_matchup = row[1].lower() if len(row) > 1 else ""
+                row_side = row[2].lower() if len(row) > 2 else ""
                 
-                if notes:
-                    notes_range = f"{SHEET_NAME}!K{row_idx}"
-                    notes_body = {"values": [[notes]]}
+                if row_matchup == matchup.lower() and row_side == side.lower():
+                    # Found matching pick; update result (column K = index 10) and final_score (column L = index 11)
+                    update_range = f"'{export_sheet}'!K{row_idx}"
+                    update_body = {"values": [[result]]}
                     service.spreadsheets().values().update(
                         spreadsheetId=SPREADSHEET_ID,
-                        range=notes_range,
+                        range=update_range,
                         valueInputOption="USER_ENTERED",
-                        body=notes_body,
+                        body=update_body,
                     ).execute()
-                
-                logger.info(f"Updated {matchup} {side} to {result}")
-                return
+                    
+                    if notes:
+                        notes_range = f"'{export_sheet}'!L{row_idx}"
+                        notes_body = {"values": [[notes]]}
+                        service.spreadsheets().values().update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=notes_range,
+                            valueInputOption="USER_ENTERED",
+                            body=notes_body,
+                        ).execute()
+                    
+                    logger.info(f"Updated export sheet: {matchup} {side} to {result}")
+                    return
         
-        logger.warning(f"Pick not found in sheet: {matchup} {side}")
+        logger.warning(f"Pick not found in export sheet: {matchup} {side}")
     except Exception as e:
         logger.error(f"Failed to update result in Google Sheet: {e}")
 
