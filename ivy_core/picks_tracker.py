@@ -375,20 +375,23 @@ def auto_sync_to_export_sheet():
             ]
             rows.append(row)
         
-        # Clear and write to sheet
+        # Append-only: do not clear existing data, only add new picks
+        # This prevents losing picks from old job runs that aren't in the current database
         header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Result", "FinalScore"]
         
-        service.spreadsheets().values().clear(
+        # Initialize header if empty
+        current = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{target_sheet_name}!A2:K"
+            range=f"{target_sheet_name}!A1:K1"
         ).execute()
         
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{target_sheet_name}!A1:K1",
-            valueInputOption="USER_ENTERED",
-            body={"values": [header]}
-        ).execute()
+        if not current.get('values'):
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"{target_sheet_name}!A1:K1",
+                valueInputOption="USER_ENTERED",
+                body={"values": [header]}
+            ).execute()
         
         if rows:
             service.spreadsheets().values().append(
@@ -398,6 +401,6 @@ def auto_sync_to_export_sheet():
                 body={"values": rows}
             ).execute()
         
-        logger.info(f"Auto-synced {len(picks)} picks to export sheet")
+        logger.info(f"Auto-synced {len(picks)} picks to export sheet (append-only mode)")
     except Exception as e:
         logger.warning(f"Failed to auto-sync picks to export sheet: {e}")
