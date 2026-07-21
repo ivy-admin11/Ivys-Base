@@ -128,16 +128,17 @@ class SourceHealth:
 
 
 class PipelineResult:
-    """Result tracking for Sharp Picks pipeline execution.
+    """Result tracking for pipeline execution.
     
     Provides explicit status tracking, source health monitoring, and detailed
-    result serialization for sharp picks runs. Currently used exclusively by
-    Sharp Picks (sports_bettor) which uses text-only delivery.
+    result serialization for proactive agent runs. Currently used by Sharp Picks
+    (sports_bettor), which delivers text-only results. Designed for reuse by other
+    agents that may use PDF or other attachment methods.
     
-    Note: The `attached` field is always False as Sharp Picks uses text-only
-    delivery. This field is included for backward compatibility with older
-    API contracts that expected this field. Future extensions using PDF or
-    other attachment methods would need to modify this field's handling.
+    Note: The `attached` field indicates whether results were delivered with an
+    attachment (PDF, file, etc.). Currently always False for Sharp Picks (text-only
+    delivery) but set during initialization to support other delivery mechanisms.
+    This field is also included for backward compatibility with older API contracts.
     """
     
     # Mapping of new status values to old result_type values for backward compatibility
@@ -159,7 +160,9 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
-        self.attached = False  # Can be overridden by subclasses or callers for other delivery methods
+        # Set to True if results were delivered via attachment (PDF, file, etc.)
+        # Currently always False for Sharp Picks; other agents should set appropriately
+        self.attached = False
         self.report_id: Optional[str] = None
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:

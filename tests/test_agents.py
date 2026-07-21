@@ -76,6 +76,38 @@ def test_sports_bettor_sends_picks_when_available(monkeypatch):
     assert result["status"] == "success"
 
 
+def test_sports_bettor_rejects_low_quality_picks(monkeypatch):
+    """Verify that picks below quality threshold are rejected and no message is sent."""
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
+    # Create a non-consensus pick that doesn't meet quality threshold
+    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
+        {"is_consensus": False, "consensus_count": 1}  # Single pick, below threshold
+    ])
+    monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, **k: None)
+
+    send_calls = []
+    monkeypatch.setattr(
+        sports_bettor, "send_imessage",
+        lambda phone, text, **k: send_calls.append((phone, text)) or True,
+    )
+
+    result = sports_bettor.run(force=True, send=True)
+
+    # Low-quality picks should result in no picks qualifying, so no message sent
+    assert not send_calls, "send_imessage should not be called for low-quality picks"
+    # Check backward-compatible result_type field for legacy API contracts
+    assert result["result_type"] == "no_picks", "result_type should be 'no_picks' for backward compatibility"
+    # Also verify status uses new enum format
+    assert result["status"] == "no_qualifying_picks", "status should use new enum format"
+
+
+
+
 
 def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, fake_pdf):
     monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
