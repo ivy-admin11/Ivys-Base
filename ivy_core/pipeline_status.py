@@ -135,6 +135,16 @@ class PipelineResult:
     API contracts that expected this field.
     """
     
+    # Mapping of new status values to old result_type values for backward compatibility
+    _STATUS_TO_RESULT_TYPE = {
+        PipelineStatus.SUCCESS: "success",
+        PipelineStatus.DEGRADED: "degraded",
+        PipelineStatus.AUTH_FAILURE: "auth_failure",
+        PipelineStatus.UPSTREAM_UNAVAILABLE: "upstream_unavailable",
+        PipelineStatus.NO_QUALIFYING_PICKS: "no_picks",
+        PipelineStatus.INTERNAL_ERROR: "internal_error",
+    }
+    
     def __init__(self, status: PipelineStatus):
         self.status = status
         self.sources: dict[str, SourceHealth] = {}
@@ -154,23 +164,13 @@ class PipelineResult:
     
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict for logging/API response."""
-        # Map new status values to old result_type values for backward compatibility
-        status_to_result_type = {
-            PipelineStatus.SUCCESS: "success",
-            PipelineStatus.DEGRADED: "degraded",
-            PipelineStatus.AUTH_FAILURE: "auth_failure",
-            PipelineStatus.UPSTREAM_UNAVAILABLE: "upstream_unavailable",
-            PipelineStatus.NO_QUALIFYING_PICKS: "no_picks",
-            PipelineStatus.INTERNAL_ERROR: "internal_error",
-        }
-        
         return {
             "status": self.status.value,
-            "result_type": status_to_result_type.get(self.status, self.status.value),
+            "result_type": self._STATUS_TO_RESULT_TYPE.get(self.status, self.status.value),
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
-            "attached": False,  # Sharp Picks uses text-only delivery, not PDF attachment
+            "attached": False,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
