@@ -128,11 +128,16 @@ class SourceHealth:
 
 
 class PipelineResult:
-    """Comprehensive result of a Sharp Picks run.
+    """Result tracking for Sharp Picks pipeline execution.
+    
+    Provides explicit status tracking, source health monitoring, and detailed
+    result serialization for sharp picks runs. Currently used exclusively by
+    Sharp Picks (sports_bettor) which uses text-only delivery.
     
     Note: The `attached` field is always False as Sharp Picks uses text-only
     delivery. This field is included for backward compatibility with older
-    API contracts that expected this field.
+    API contracts that expected this field. Future extensions using PDF or
+    other attachment methods would need to modify this field's handling.
     """
     
     # Mapping of new status values to old result_type values for backward compatibility
