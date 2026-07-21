@@ -117,7 +117,7 @@ def check_db_cache_build_runtime(paths: List[str]) -> List[Violation]:
 _PRIVATE_KEY_MARKER_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _TEXT_SCAN_EXTENSIONS = (
     ".py", ".sh", ".json", ".md", ".txt", ".cfg", ".ini", ".toml",
-    ".yml", ".yaml", ".template", ".plist", ".env",
+    ".yml", ".yaml", ".template", ".plist", ".env", ".pem", ".key",
 )
 
 

@@ -22,7 +22,7 @@ from ivy_core import picks_tracker, picks_sync  # noqa: E402
 def _dry_run() -> int:
     rows = picks_tracker.get_canonical_snapshot_rows()
     overall = picks_tracker.get_stats_overall()
-    print(f"Dry run — no network writes.")
+    print("Dry run — no network writes.")
     print(f"Configured spreadsheet: {config.GOOGLE_SHEETS_SPREADSHEET_ID or '(not configured)'}")
     print(f"Picks tab: {config.GOOGLE_SHEETS_PICKS_TAB}")
     print(f"Summary tab: {config.GOOGLE_SHEETS_SUMMARY_TAB}")

@@ -171,7 +171,7 @@ def _mark_duplicates_and_carry_results(conn: sqlite3.Connection) -> None:
     resolved outcome are recorded in pick_conflicts and left untouched —
     never silently resolved."""
     candidates = conn.execute(
-        f"SELECT pick_key, id FROM picks WHERE {_CANONICAL_FILTER} "
+        "SELECT pick_key, id FROM picks WHERE duplicate_of IS NULL "
         "ORDER BY pick_key, created_at, id"
     ).fetchall()
 
@@ -188,7 +188,7 @@ def _mark_duplicates_and_carry_results(conn: sqlite3.Connection) -> None:
         resolved = [
             (pid, result, score)
             for pid, result, score in conn.execute(
-                f"SELECT pick_id, result, final_score FROM results WHERE pick_id IN ({placeholders})",
+                f"SELECT pick_id, result, final_score FROM results WHERE pick_id IN ({placeholders})",  # nosec B608 - placeholders is a fixed count of '?' chars, never data; values bound separately
                 ids,
             ).fetchall()
             if result
@@ -305,7 +305,7 @@ def save_picks(picks: List[Dict], report_date: str) -> Dict:
             pick_key = compute_pick_key({**fields, "report_date": report_date})
 
             existing = conn.execute(
-                f"SELECT id, sharp_count FROM picks WHERE pick_key = ? AND {_CANONICAL_FILTER}",
+                "SELECT id, sharp_count FROM picks WHERE pick_key = ? AND duplicate_of IS NULL",
                 (pick_key,),
             ).fetchone()
 
@@ -365,12 +365,12 @@ def get_pending_picks() -> List[Dict]:
     conn = sqlite3.connect(PICKS_DB)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT p.id, p.sport, p.matchup, p.side, p.game_day, p.start_time,
                    p.sharp_count, p.handicapper, p.report_date
             FROM picks p
             LEFT JOIN results r ON p.id = r.pick_id
-            WHERE {_CANONICAL_FILTER} AND (r.result IS NULL OR r.result = '')
+            WHERE duplicate_of IS NULL AND (r.result IS NULL OR r.result = '')
             ORDER BY p.created_at DESC
         """).fetchall()
         return [dict(row) for row in rows]
@@ -440,13 +440,13 @@ def get_canonical_snapshot_rows() -> List[Dict]:
     conn = sqlite3.connect(PICKS_DB)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT p.id, p.sport, p.matchup, p.side, p.odds, p.handicapper,
                    p.confidence, p.game_day, p.start_time, p.report_date,
                    p.sharp_count, p.pick_key, r.result, r.final_score
             FROM picks p
             LEFT JOIN results r ON p.id = r.pick_id
-            WHERE {_CANONICAL_FILTER}
+            WHERE duplicate_of IS NULL
             ORDER BY p.id ASC
         """).fetchall()
         return [dict(row) for row in rows]
@@ -486,7 +486,7 @@ def get_stats_overall() -> Dict:
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     try:
-        row = conn.execute(f"""
+        row = conn.execute("""
             SELECT
                 SUM(CASE WHEN r.result = 'W' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN r.result = 'L' THEN 1 ELSE 0 END),
@@ -494,7 +494,7 @@ def get_stats_overall() -> Dict:
                 SUM(CASE WHEN r.result IS NULL OR r.result = '' THEN 1 ELSE 0 END)
             FROM picks p
             LEFT JOIN results r ON p.id = r.pick_id
-            WHERE {_CANONICAL_FILTER}
+            WHERE duplicate_of IS NULL
         """).fetchone()
     finally:
         conn.close()
@@ -506,7 +506,7 @@ def get_stats_by_sport() -> Dict[str, Dict]:
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT p.sport,
                 SUM(CASE WHEN r.result = 'W' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN r.result = 'L' THEN 1 ELSE 0 END),
@@ -514,9 +514,9 @@ def get_stats_by_sport() -> Dict[str, Dict]:
                 SUM(CASE WHEN r.result IS NULL OR r.result = '' THEN 1 ELSE 0 END)
             FROM picks p
             LEFT JOIN results r ON p.id = r.pick_id
-            WHERE {_CANONICAL_FILTER}
+            WHERE duplicate_of IS NULL
             GROUP BY p.sport
         """).fetchall()
     finally:
         conn.close()
-    return {sport: _record_from_counts(w, l, pu, pe) for sport, w, l, pu, pe in rows}
+    return {sport: _record_from_counts(w, losses, pu, pe) for sport, w, losses, pu, pe in rows}
