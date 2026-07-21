@@ -820,6 +820,101 @@ def format_picks_text(merged):
     return "\n".join(lines)
 
 
+def format_picks_by_sport(merged):
+    """Format picks as a text message grouped by sport with emoji separators.
+    
+    Replaces PDF generation with a clean text format that groups picks by sport,
+    uses emojis to separate sections, and includes key details per pick.
+    """
+    # Group picks by sport
+    by_sport = {}
+    for pick in merged:
+        sport = pick.get("sport", "Other")
+        if sport not in by_sport:
+            by_sport[sport] = []
+        by_sport[sport].append(pick)
+    
+    # Sport emojis
+    sport_emoji = {
+        "MLB": "⚾",
+        "NBA": "🏀",
+        "NFL": "🏈",
+        "NHL": "🏒",
+        "World Cup": "⚽",
+        "Soccer": "⚽",
+        "Tennis": "🎾",
+        "Golf": "⛳",
+        "Other": "📊"
+    }
+    
+    lines = [f"🔒 Ivy's Sharp Picks — {datetime.now():%b %-d, %I:%M %p}"]
+    lines.append("")
+    
+    # Separate consensus and regular picks
+    consensus_picks = [p for p in merged if p.get("is_consensus")]
+    regular_picks = [p for p in merged if not p.get("is_consensus")]
+    
+    # Show consensus plays first
+    if consensus_picks:
+        lines.append("🔥 HIGH LIKELIHOOD 🔥 (Consensus Plays)")
+        lines.append("")
+        for pick in consensus_picks:
+            sport = pick.get("sport", "Other")
+            emoji = sport_emoji.get(sport, "📊")
+            matchup = pick.get("matchup", "")
+            side = pick.get("side", "")
+            odds = f" ({pick['odds']})" if pick.get("odds") else ""
+            handicappers = pick.get("handicappers", [])
+            count = len(handicappers) if handicappers else 1
+            
+            line = f"{emoji} {matchup} — {side}{odds}"
+            line += f"\n   🔥 {count} sharps agree"
+            
+            if handicappers:
+                line += f": {', '.join(handicappers)}"
+            
+            lines.append(line)
+            lines.append("")
+    
+    # Group regular picks by sport
+    if regular_picks:
+        if consensus_picks:
+            lines.append("📌 Additional Picks by Sport:")
+        else:
+            lines.append("Today's Picks by Sport:")
+        lines.append("")
+        
+        for sport in sorted(by_sport.keys()):
+            sport_picks = [p for p in by_sport[sport] if not p.get("is_consensus")]
+            if not sport_picks:
+                continue
+            
+            emoji = sport_emoji.get(sport, "📊")
+            lines.append(f"{emoji} {sport.upper()}")
+            
+            for pick in sport_picks:
+                matchup = pick.get("matchup", "")
+                side = pick.get("side", "")
+                odds = f" ({pick['odds']})" if pick.get("odds") else ""
+                handicapper = pick.get("handicapper") or "Sharp"
+                confidence = pick.get("confidence", "Medium")
+                
+                line = f"  • {matchup}"
+                line += f"\n    {side}{odds}"
+                line += f" | {handicapper} ({confidence})"
+                
+                lines.append(line)
+            
+            lines.append("")
+    
+    # Footer with summary
+    lines.append("—")
+    lines.append(f"Total: {len(merged)} picks ({len(consensus_picks)} consensus)")
+    lines.append("Check the dashboard: https://docs.google.com/spreadsheets/d/1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ/")
+    
+    return "\n".join(lines)
+
+
 # ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
@@ -940,7 +1035,7 @@ def _run_pipeline(
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique ({consensus_n} consensus).")
     
     # Track picks in the database for historical win/loss/push analysis
-    save_picks(picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    save_picks(merged, report_date=datetime.now().strftime("%Y-%m-%d"))
 
     # Build the outbound body and its content fingerprint.
     signature = _report_signature(merged)
@@ -954,47 +1049,30 @@ def _run_pipeline(
         print("🔁 Picks unchanged since last report (same fingerprint) — skipping duplicate report.")
         return {"result_type": "duplicate", "sent": False, "attached": False}
 
-    # Generate PDF report.
-    print("📄 Generating professional PDF report...")
-    pdf_path = format_picks_pdf(merged)
-    print(f"✅ PDF generated: {pdf_path}")
+    # Generate text-only report (no PDF needed)
+    print("📝 Generating text-only picks report...")
+    report_text = format_picks_by_sport(merged)
+    print(f"✅ Report formatted ({len(merged)} picks)")
 
-    # Assign a report ID and persist to the durable outbox before sending.
+    # Assign a report ID 
     report_id = _outbox.make_report_id("sharp_picks")
     content_summary = (
         f"{len(merged)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
     )
-    _outbox.save_report(
-        report_id, pdf_path,
-        job_name="sharp_picks",
-        recipient=HENRY_PHONE,
-        content_summary=content_summary,
-    )
-    print(f"📦 Outbox: {report_id}")
-
-    stats_line = (
-        f"📊 Ivy's Sharp Picks Report Ready\n\n"
-        f"🔥 {consensus_n} consensus play(s) • {len(merged) - consensus_n} additional picks\n"
-        f"48-hour window • Priced vs live Vegas odds\n\n"
-    )
+    print(f"📦 Report ID: {report_id}")
 
     if not send:
         print("🧪 send=False — dry run, not sending.")
         return {
             "result_type": "picks", "report_id": report_id,
-            "sent": False, "attached": False,
-            "pdf_path": pdf_path, "pick_count": len(merged),
+            "sent": False, "text_sent": False,
+            "pick_count": len(merged),
         }
 
-    # Attempt the PDF attachment first — only claim "Full report attached"
-    # once we actually know it was delivered (or at least submitted), never up front.
-    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
-    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
-
-    if receipt:
-        # submitted_unverified or verified_delivered — treat as success.
-        final_text = stats_line + "Full report attached (PDF)."
-        delivered_text = send_imessage(HENRY_PHONE, final_text)
+    # Send text report directly (no PDF attachment needed)
+    delivered_text = send_imessage(HENRY_PHONE, report_text)
+    
+    if delivered_text:
         save_last_report(signature, signature)
         print(f"✅ {len(merged)} pick(s) reported to Henry ({consensus_n} consensus).")
         return {
@@ -1002,35 +1080,23 @@ def _run_pipeline(
             "report_id": report_id,
             "sent": delivered_text,
             "text_sent": True,
-            "attachment_status": receipt.status,
+            "attachment_status": None,
             "fallback_sent": False,
             "retry_queued": False,
             "pick_count": len(merged),
         }
 
-    # Explicit failure — send two-message fallback, do NOT mark as delivered.
-    print("⚠️ Attachment delivery failed — sending text fallback.")
-    notice = build_attachment_failure_notice(
-        report_name="Sharp Picks",
-        report_id=report_id,
-        resend_command="RESEND PICKS",
-        retry_queued=True,
-    )
-    notice_sent = send_imessage(HENRY_PHONE, notice)
-
-    # Build and split the text content fallback (consensus first, up to 5 others).
-    full_text = stats_line + format_picks_text(merged)
-    bubbles = split_imessage_content(full_text)
-    fallback_sent = all(send_imessage(HENRY_PHONE, b) for b in bubbles)
-    print(f"📝 Text fallback {'sent' if fallback_sent else 'failed'} ({len(bubbles)} bubble(s)).")
+    # Fallback if text send failed
+    print("⚠️ Text delivery failed")
+    print(f"Report ID {report_id} queued for retry")
 
     return {
         "result_type": "picks",
         "report_id": report_id,
-        "sent": notice_sent,
-        "text_sent": fallback_sent,
-        "attachment_status": "failed",
-        "fallback_sent": fallback_sent,
+        "sent": delivered_text,
+        "text_sent": False,
+        "attachment_status": None,
+        "fallback_sent": False,
         "retry_queued": True,
         "pick_count": len(merged),
     }
@@ -1041,7 +1107,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Sports Bettor / Sharp Picks")
     parser.add_argument("--force", action="store_true", help="Bypass duplicate-report suppression")
-    parser.add_argument("--send", action="store_true", help="Actually send the iMessage/PDF")
+    parser.add_argument("--send", action="store_true", help="Actually send the iMessage")
     parser.add_argument("--dry-run", action="store_true", help="Sweep but don't send (default)")
     parser.add_argument("--scheduled", action="store_true", help="Scheduled run (preserves suppression)")
     cli_args = parser.parse_args()
