@@ -72,7 +72,7 @@ def test_sports_bettor_sends_picks_when_available(monkeypatch):
 def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, tmp_path):
     # Create temporary fake PDF file
     fake_pdf = tmp_path / "fake_meal.pdf"
-    fake_pdf.write_text("fake PDF content")
+    fake_pdf.write_bytes(b"fake PDF content")
     
     monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
     monkeypatch.setattr(
@@ -103,7 +103,7 @@ def test_familia_meal_planner_force_bypasses_48h_gate():
 def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch, tmp_path):
     # Create temporary fake PDF file
     fake_pdf = tmp_path / "fake_hh.pdf"
-    fake_pdf.write_text("fake PDF content")
+    fake_pdf.write_bytes(b"fake PDF content")
     
     monkeypatch.setattr(
         happy_hour_scout, "fetch_local_specials",

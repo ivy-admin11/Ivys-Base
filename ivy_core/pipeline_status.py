@@ -128,7 +128,12 @@ class SourceHealth:
 
 
 class PipelineResult:
-    """Comprehensive result of a Sharp Picks run."""
+    """Comprehensive result of a Sharp Picks run.
+    
+    Note: The `attached` field is always False as Sharp Picks uses text-only
+    delivery. This field is included for backward compatibility with older
+    API contracts that expected this field.
+    """
     
     def __init__(self, status: PipelineStatus):
         self.status = status
