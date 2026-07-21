@@ -165,7 +165,7 @@ class PipelineResult:
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
-            "attached": False,  # Always False for text-based reports (backward compat field)
+            "attached": False,  # Sharp Picks uses text-only delivery, not PDF attachment
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
