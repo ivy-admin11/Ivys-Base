@@ -13,6 +13,14 @@ from proactive_agents import Familia_meal_planner, happy_hour_scout, sports_bett
 AGENT_MODULES = [sports_bettor, happy_hour_scout, Familia_meal_planner]
 
 
+@pytest.fixture
+def fake_pdf(tmp_path):
+    """Create a temporary fake PDF file for testing."""
+    pdf_path = tmp_path / "fake.pdf"
+    pdf_path.write_bytes(b"fake PDF content")
+    return str(pdf_path)
+
+
 @pytest.mark.parametrize("module", AGENT_MODULES, ids=[m.__name__ for m in AGENT_MODULES])
 def test_run_has_standardized_keyword_only_signature(module):
     sig = inspect.signature(module.run)
@@ -69,17 +77,13 @@ def test_sports_bettor_sends_picks_when_available(monkeypatch):
 
 
 
-def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, tmp_path):
-    # Create temporary fake PDF file
-    fake_pdf = tmp_path / "fake_meal.pdf"
-    fake_pdf.write_bytes(b"fake PDF content")
-    
+def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, fake_pdf):
     monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
     monkeypatch.setattr(
         Familia_meal_planner, "generate_family_meal_plan",
         lambda: {"status": "success", "recipe_count": 2, "recipes": []},
     )
-    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: str(fake_pdf))
+    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: fake_pdf)
     monkeypatch.setattr(Familia_meal_planner, "load_state", lambda: {"execution_history": []})
     monkeypatch.setattr(Familia_meal_planner, "save_state", lambda state: None)
 
@@ -100,16 +104,12 @@ def test_familia_meal_planner_force_bypasses_48h_gate():
     assert Familia_meal_planner.check_48h_gate(force=True) is True
 
 
-def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch, tmp_path):
-    # Create temporary fake PDF file
-    fake_pdf = tmp_path / "fake_hh.pdf"
-    fake_pdf.write_bytes(b"fake PDF content")
-    
+def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch, fake_pdf):
     monkeypatch.setattr(
         happy_hour_scout, "fetch_local_specials",
         lambda: {"venues": [{"name": "Bar"}], "specials": [{"detail": "half off"}]},
     )
-    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: str(fake_pdf))
+    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: fake_pdf)
 
     attach_calls = []
     monkeypatch.setattr(
