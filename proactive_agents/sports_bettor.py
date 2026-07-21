@@ -3,7 +3,7 @@ import sys
 import os
 
 # Dynamically calculate the project root so the version-controlled ivy_core
-# package (and picks_formatter, below) resolve regardless of CWD.
+# package resolves regardless of CWD.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -38,7 +38,6 @@ returns no usable picks, run() returns a "no_picks" result without sending
 import hashlib
 import json
 import re
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -49,14 +48,11 @@ from filelock import FileLock, Timeout
 
 from ivy_core import require_env, send_imessage, send_imessage_attachment
 from ivy_core import outbox as _outbox
-from ivy_core.picks_tracker import save_picks, format_stats_for_pdf
+from ivy_core.picks_tracker import save_picks
 from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     split_imessage_content,
 )
-
-# PDF formatter for professional reports
-from picks_formatter import PicksReportFormatter
 
 # xAI SDK (recommended) or OpenAI-compatible client
 try:
@@ -675,87 +671,6 @@ def _confidence(e):
     count = int(e.get("consensus_count") or len(e.get("handicappers") or []) or 1)
     grade = "HIGH" if count >= 3 else "MEDIUM" if count == 2 else "LOW"
     return grade, count
-
-
-def format_picks_pdf(merged):
-    """Generate a professional PDF report of sharp picks for email/attachment.
-
-    Converts merged picks into a branded PDF with consensus plays highlighted,
-    full odds, and reasoning. Returns the path to the generated PDF.
-    """
-    formatter = PicksReportFormatter(
-        title="Ivy 48-Hour Betting Report",
-        subtitle=f"Sharp X Picks vs. Live Vegas Odds | {datetime.now():%A, %B %d, %Y}",
-        color_scheme="sports",
-    )
-
-    consensus = [p for p in merged if p["is_consensus"]]
-    others = [p for p in merged if not p["is_consensus"]]
-
-    # Build consensus picks for PDF
-    consensus_picks = []
-    for pick in consensus:
-        enrichment = pick.get("enrichment") or {}
-        handles = pick.get("handicappers") or []
-        credit = ", ".join(f"@{h}" for h in handles)
-        reasoning = enrichment.get("take") or (f"Consensus: {credit}" if credit else "Sharp consensus play")
-        consensus_picks.append({
-            "sport": pick.get("sport", ""),
-            "matchup": pick.get("matchup", ""),
-            "when": _pick_when(pick),
-            "side": pick.get("side", ""),
-            "odds": pick.get("odds", ""),
-            "reasoning": reasoning,
-        })
-
-    # Build other picks for PDF
-    other_picks = []
-    for pick in others:
-        enrichment = pick.get("enrichment") or {}
-        handles = pick.get("handicappers") or []
-        credit = ", ".join(f"@{h}" for h in handles)
-        reasoning = enrichment.get("take") or (
-            f"Backed by {credit}" if credit else f"{pick.get('consensus_count', 1)} sharp backing"
-        )
-        other_picks.append({
-            "sport": pick.get("sport", ""),
-            "matchup": pick.get("matchup", ""),
-            "when": _pick_when(pick),
-            "side": pick.get("side", ""),
-            "odds": pick.get("odds", ""),
-            "reasoning": reasoning,
-        })
-
-    # Summary paragraph
-    stats_section = format_stats_for_pdf(days_back=30)
-    summary = (
-        f"Ivy has surfaced {len(consensus)} consensus play(s) and {len(others)} additional sharp pick(s) "
-        f"across the next 48 hours. Consensus plays are backed by 2+ handicappers. "
-        f"All picks are priced against live Vegas odds and enriched with real-time context from X.\n\n"
-        f"{stats_section}"
-    )
-
-    # Metadata
-    metadata = {
-        "pick_count": f"{len(merged)} pick(s) swept from curated X handicappers",
-        "source": "Sharp X Picks via Grok",
-        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
-    }
-
-    # Generate PDF
-    pdf_path = os.path.join(tempfile.gettempdir(), f"ivy_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf")
-    formatter.generate_pdf(
-        filename=pdf_path,
-        summary=summary,
-        consensus_picks=consensus_picks,
-        other_picks=other_picks,
-        metadata=metadata,
-        headers=["Sport", "Matchup", "Date/Time", "Side", "Odds", "Reasoning"],
-        col_widths=[0.6, 1.5, 1.1, 0.8, 0.6, 2.1],
-        fields=["sport", "matchup", "when", "side", "odds", "reasoning"],
-    )
-
-    return pdf_path
 
 
 def format_picks_text(merged):
