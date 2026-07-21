@@ -6,7 +6,8 @@ Tools:
 
 Security model:
     - chat.db is opened read-only via sqlite3 URI (mode=ro).
-    - Every tool call re-reads favorites.json and rejects any number not present.
+    - Every tool call re-reads the favorites allowlist and rejects any number
+      not present.
     - AppleScript receives the number/text as argv items, not interpolated, so
       message bodies cannot break out into the script.
     - On startup the server verifies the terminal has Full Disk Access; without
@@ -16,6 +17,7 @@ Security model:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -24,7 +26,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 BASE_DIR = Path(__file__).resolve().parent
-FAVORITES_PATH = BASE_DIR / "favorites.json"
+FAVORITES_PATH = Path(os.path.expanduser(os.environ.get("IVY_FAVORITES_FILE", str(BASE_DIR / "favorites.json"))))
 CHAT_DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 CHAT_DB_URI = f"file:{CHAT_DB_PATH}?mode=ro"
 
@@ -58,15 +60,16 @@ def _check_full_disk_access() -> None:
 
 
 def _load_favorites() -> set[str]:
-    """Re-read favorites.json on every request so whitelist edits apply live."""
+    """Re-read the favorites allowlist on every request so whitelist edits apply live."""
     if not FAVORITES_PATH.exists():
         raise FileNotFoundError(
-            f"favorites.json missing at {FAVORITES_PATH}. Create it with a JSON array."
+            f"Favorites allowlist missing at {FAVORITES_PATH}. Create it with a JSON array "
+            "(see favorites.example.json), or set IVY_FAVORITES_FILE."
         )
     with FAVORITES_PATH.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
     if not isinstance(data, list):
-        raise ValueError("favorites.json must be a JSON array of phone numbers/emails.")
+        raise ValueError("Favorites allowlist must be a JSON array of phone numbers/emails.")
     return {str(entry).strip() for entry in data if str(entry).strip()}
 
 
@@ -75,7 +78,7 @@ def _authorize(number: str) -> str:
     if not target:
         raise PermissionError("Unauthorized Contact: empty number.")
     if target not in _load_favorites():
-        raise PermissionError(f"Unauthorized Contact: {target} is not in favorites.json.")
+        raise PermissionError(f"Unauthorized Contact: {target} is not in the favorites allowlist.")
     return target
 
 
@@ -83,8 +86,8 @@ def _authorize(number: str) -> str:
 def get_recent_messages(number: str, limit: int = 20) -> list[dict]:
     """Return the most recent iMessages with `number` (newest first).
 
-    `number` must match an entry in favorites.json exactly (e.g. "+15551234567"
-    or "user@example.com"). `limit` is capped at 200.
+    `number` must match an entry in the favorites allowlist exactly (e.g.
+    "+15551234567" or "user@example.com"). `limit` is capped at 200.
     """
     target = _authorize(number)
     capped = max(1, min(int(limit), 200))

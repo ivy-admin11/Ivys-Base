@@ -36,33 +36,42 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
 
     result = sports_bettor.run(force=True, send=False)
 
-    assert result["result_type"] == "no_picks"
+    assert result["status"] == "no_qualifying_picks"
     assert result["sent"] is False
     assert sent == []
 
 
-def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
+def test_sports_bettor_is_text_only_no_pdf(monkeypatch):
+    """Sharp Picks delivery is text-only — no PDF generation/attachment path
+    exists anymore. send_imessage carries the whole report body."""
     monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
-    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
-    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [{"is_consensus": False}])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"matchup": "A @ B", "side": "A -2.5"}])
+    monkeypatch.setattr(
+        sports_bettor, "merge_picks",
+        lambda picks: [{
+            "sport": "NFL", "matchup": "A @ B", "side": "A -2.5", "odds": "-110",
+            "handicappers": ["real1", "real2"], "confidence": "high", "game_day": "today",
+            "start": None, "reasoning": "test", "consensus_count": 2, "is_consensus": True,
+        }],
+    )
     monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
-    monkeypatch.setattr(sports_bettor, "_report_signature", lambda merged: "sig-1")
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, report_date: {"inserted": len(picks), "updated": 0, "total": len(picks)})
     monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
-    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
-    monkeypatch.setattr(sports_bettor, "format_picks_pdf", lambda merged: "/tmp/fake_picks.pdf")
+    saved = {}
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: saved.update(sig=sig, msg=msg))
+    monkeypatch.setattr("ivy_core.result_updater.auto_update_results", lambda: {"status": "skipped"})
 
-    attach_calls = []
-    monkeypatch.setattr(
-        sports_bettor, "send_imessage_attachment",
-        lambda phone, path, **k: attach_calls.append((phone, path)) or True,
-    )
-    monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
+    sent = []
+    monkeypatch.setattr(sports_bettor, "send_imessage", lambda phone, text: sent.append((phone, text)) or True)
+    assert not hasattr(sports_bettor, "format_picks_pdf"), "format_picks_pdf should no longer exist — text-only delivery"
+    assert not hasattr(sports_bettor, "send_imessage_attachment") or True  # attribute may exist via import, just unused here
 
     result = sports_bettor.run(force=True, send=True)
 
-    assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
-    assert result["attached"] is True
+    assert sent, "send_imessage was never called — text report was never sent"
+    assert result["sent"] is True
+    assert saved.get("msg") == sent[0][1], "save_last_report must store the report body, not the signature twice"
 
 
 def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):

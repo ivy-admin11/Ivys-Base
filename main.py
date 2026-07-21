@@ -14,7 +14,7 @@ Environment-specific secrets go in .env (see .env.example).
 Security:
 - All FastAPI endpoints require X-API-Key header matching ADMIN_SECRET
 - Database reads use SQLite read-only mode to prevent accidental mutations
-- iMessage poller validates sender against favorites.json whitelist
+- iMessage poller validates sender against the IVY_FAVORITES_FILE allowlist
 
 Voice Assistant Features:
 - Session-based conversation management with automatic cleanup
@@ -59,6 +59,7 @@ from config import (
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
     ADMIN_SECRET,
+    IVY_FAVORITES_FILE,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
@@ -1155,7 +1156,7 @@ def background_imessage_worker() -> None:
             if sender.lower() == "me":
                 is_authorized = True
             else:
-                favorites_path = "favorites.json"
+                favorites_path = IVY_FAVORITES_FILE
                 if os.path.exists(favorites_path):
                     try:
                         with open(favorites_path, "r") as f:
@@ -1164,13 +1165,14 @@ def background_imessage_worker() -> None:
                             is_authorized = True
                     except Exception as json_err:
                         logger.warning(
-                            "⚠️ Security Alert: Failed to parse favorites.json: %s",
+                            "⚠️ Security Alert: Failed to parse favorites allowlist: %s",
                             str(json_err),
                         )
                 else:
                     logger.warning(
-                        "⚠️ Security Alert: favorites.json missing! "
+                        "⚠️ Security Alert: favorites allowlist missing at %s! "
                         "Blocking external sender %s.",
+                        favorites_path,
                         sender,
                     )
 

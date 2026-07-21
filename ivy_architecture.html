@@ -45,7 +45,7 @@
 <body>
 <div class="wrap">
   <h1>Ivy — System Architecture &amp; Capabilities</h1>
-  <p class="sub">Local admin AI running on the iMac · dual-brain (Gemini → DeepSeek) · iMessage-driven · as of Jul 2026</p>
+  <p class="sub">Local admin AI running on the iMac · dual-brain (DeepSeek → Gemini) · iMessage-driven · as of Jul 2026</p>
 
   <div class="legend">
     <span><i class="dot" style="background:var(--live)"></i> Live &amp; verified</span>
@@ -83,7 +83,7 @@
     <div class="row">
       <div class="card live"><span class="tag">live</span><h3>🧭 MessageProcessor</h3><p>Authorizes sender (favorites.json) &amp; detects the "ivy" trigger. Fails closed.</p></div>
       <div class="card live"><span class="tag">live</span><h3>🤖 LangChain AgentExecutor</h3><p>Tool-calling agent, max 5 steps, step-by-step reasoning.</p></div>
-      <div class="card live"><span class="tag">live</span><h3>🧠 Gemini 2.5 Flash → DeepSeek</h3><p>Primary brain with automatic failover (verified).</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🧠 DeepSeek → Gemini 2.5 Flash</h3><p>Primary brain with automatic failover (verified).</p></div>
     </div>
   </div>
   <div class="arrow">▼</div>
@@ -107,7 +107,7 @@
     <div class="layer" style="margin:0">
       <span class="lname">5 · Proactive Agents (scheduled)</span>
       <div class="row" style="flex-direction:column">
-        <div class="card live"><span class="tag">live</span><h3>🎯 Sports picks</h3><p>Odds API slate + Grok x_search over curated handicappers → consensus plays → <b>net-new dedup</b> → texts Henry (17×/day). No repeats.</p></div>
+        <div class="card live"><span class="tag">live</span><h3>🎯 Sports picks</h3><p>Odds API slate + Grok x_search over curated handicappers → consensus plays → <b>net-new dedup</b> → texts Henry 3×/day (9am/3pm/9pm CT). No repeats.</p></div>
         <div class="card live"><span class="tag">live</span><h3>🧠 Ivy brain</h3><p><code>com.ivy.brain</code> always-on Gemini agent; secrets load from a symlinked .env (no keys in the plist).</p></div>
         <div class="card plan"><span class="tag">planned</span><h3>🗓️ Automations (stubs)</h3><p>meal planner · monthly/weekly chores · watchlist · happy-hour scout · market analyst — empty scaffolds, not built.</p></div>
       </div>
@@ -115,7 +115,7 @@
     <div class="layer" style="margin:0">
       <span class="lname">6 · External Services &amp; Data</span>
       <div class="row" style="flex-direction:column">
-        <div class="card live"><span class="tag">llms</span><h3>🧠 LLMs</h3><p>Gemini 2.5 Flash (primary) · DeepSeek (failover) · Grok/xAI grok-4.3 (sports).</p></div>
+        <div class="card live"><span class="tag">llms</span><h3>🧠 LLMs</h3><p>DeepSeek (primary) · Gemini 2.5 Flash (failover) · Grok/xAI grok-4.3 (sports).</p></div>
         <div class="card live"><span class="tag">data</span><h3>🍎 Apple / macOS</h3><p>Calendar · Reminders · Messages &amp; chat.db (via AppleScript + SQLite).</p></div>
         <div class="card live"><span class="tag">apis</span><h3>🌐 Web APIs</h3><p>Readwise · The Odds API · X (via Grok) · Google Docs/Slides (config).</p></div>
         <div class="card blocked"><span class="tag">blocked</span><h3>🛒 Grocery sites</h3><p>HEB · Kroger — Akamai bot walls block automation.</p></div>

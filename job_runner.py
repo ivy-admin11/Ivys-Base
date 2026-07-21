@@ -78,7 +78,7 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.sharppicks",  # scheduled cadence — still installed via launchd
         entrypoint="proactive_agents.sports_bettor:run",  # ad-hoc requests bypass launchd entirely
-        schedule="Every 30 min (4 CST windows daily)",
+        schedule="3x daily at 9am / 3pm / 9pm CT",
     ),
     Job(
         name="happy_hour",
@@ -88,11 +88,9 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.happy_hour_scout",
         entrypoint="proactive_agents.happy_hour_scout:run",
-        # NOTE: the actual installed plist's StartCalendarInterval sets
-        # Weekday=1, which is Monday in launchd's convention (0/7=Sunday),
-        # not Sunday as this description previously (incorrectly) claimed.
-        # Preserved as-is pending confirmation of which day was intended.
-        schedule="Mondays 12pm CST",
+        # deploy/launchd/com.ivy.happy_hour_scout.plist.template sets
+        # Weekday=0, which is Sunday in launchd's convention (0/7=Sunday).
+        schedule="Sundays 12pm CST",
     ),
     Job(
         name="bravo_scout",

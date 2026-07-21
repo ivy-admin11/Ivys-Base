@@ -1,12 +1,20 @@
 # Environment & Secrets
 .env
-.env.local
-*.pem
+.env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
 service-account-key.json
 token.json
 google_credentials.json
 discord_backup_codes.txt
+
+# Contact allowlists (real allowlists only — see favorites.example.json)
+favorites.json
+!favorites.example.json
 
 # Python & Dependencies
 __pycache__/
@@ -30,10 +38,25 @@ logs/
 
 # Configuration Files (local overrides)
 .ivy/
+.claude/
 store_configs.json
 
 # Documentation (PDFs)
 *.pdf
+
+# Test / lint / coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
 
 # Runtime State
 proactive_agents/sports_last_report.json

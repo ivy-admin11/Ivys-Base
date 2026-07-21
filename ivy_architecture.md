@@ -1,6 +1,6 @@
 # Ivy — System Architecture & Capabilities
 
-Local admin AI on the iMac · dual-brain (Gemini → DeepSeek) · iMessage-driven.
+Local admin AI on the iMac · dual-brain (DeepSeek → Gemini) · iMessage-driven.
 
 **Legend:** 🟩 live & verified · 🟥 blocked (external bot wall) · ⬜ planned / stub
 
@@ -22,7 +22,7 @@ flowchart TD
   subgraph R["3 · Reasoning — dual-brain agent"]
     R1["🧭 MessageProcessor<br/>authorize + trigger"]:::live
     R2["🤖 LangChain AgentExecutor<br/>max 5 steps"]:::live
-    R3["🧠 Gemini 2.5 Flash → DeepSeek<br/>failover"]:::live
+    R3["🧠 DeepSeek → Gemini 2.5 Flash<br/>failover"]:::live
   end
 
   subgraph S["4 · Skills / Tools"]
