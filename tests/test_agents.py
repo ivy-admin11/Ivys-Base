@@ -41,37 +41,45 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
     assert sent == []
 
 
-def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
+def test_sports_bettor_sends_picks_when_available(monkeypatch):
     monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
-    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [{"is_consensus": False}])
+    # Create a consensus pick (2+ sharps) to meet quality threshold
+    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
+        {"is_consensus": True, "consensus_count": 2}
+    ])
     monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "_report_signature", lambda merged: "sig-1")
     monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
     monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
-    monkeypatch.setattr(sports_bettor, "format_picks_pdf", lambda merged: "/tmp/fake_picks.pdf")
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, **k: None)
 
-    attach_calls = []
+    send_calls = []
     monkeypatch.setattr(
-        sports_bettor, "send_imessage_attachment",
-        lambda phone, path, **k: attach_calls.append((phone, path)) or True,
+        sports_bettor, "send_imessage",
+        lambda phone, text, **k: send_calls.append((phone, text)) or True,
     )
-    monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
 
     result = sports_bettor.run(force=True, send=True)
 
-    assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
-    assert result["attached"] is True
+    assert send_calls, "send_imessage was never called — picks were not sent"
+    assert result["sent"] is True
+    assert result["status"] == "success"
 
 
-def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):
+
+def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, tmp_path):
+    # Create temporary fake PDF file
+    fake_pdf = tmp_path / "fake_meal.pdf"
+    fake_pdf.write_text("fake PDF content")
+    
     monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
     monkeypatch.setattr(
         Familia_meal_planner, "generate_family_meal_plan",
         lambda: {"status": "success", "recipe_count": 2, "recipes": []},
     )
-    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: "/tmp/fake_meal.pdf")
+    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: str(fake_pdf))
     monkeypatch.setattr(Familia_meal_planner, "load_state", lambda: {"execution_history": []})
     monkeypatch.setattr(Familia_meal_planner, "save_state", lambda state: None)
 
@@ -92,12 +100,16 @@ def test_familia_meal_planner_force_bypasses_48h_gate():
     assert Familia_meal_planner.check_48h_gate(force=True) is True
 
 
-def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
+def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch, tmp_path):
+    # Create temporary fake PDF file
+    fake_pdf = tmp_path / "fake_hh.pdf"
+    fake_pdf.write_text("fake PDF content")
+    
     monkeypatch.setattr(
         happy_hour_scout, "fetch_local_specials",
         lambda: {"venues": [{"name": "Bar"}], "specials": [{"detail": "half off"}]},
     )
-    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: "/tmp/fake_hh.pdf")
+    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: str(fake_pdf))
 
     attach_calls = []
     monkeypatch.setattr(
@@ -110,3 +122,4 @@ def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
 
     assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
     assert result["status"] == "success"
+

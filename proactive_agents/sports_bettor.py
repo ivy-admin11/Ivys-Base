@@ -46,13 +46,9 @@ from zoneinfo import ZoneInfo
 import requests
 from filelock import FileLock, Timeout
 
-from ivy_core import require_env, send_imessage, send_imessage_attachment
+from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
-from ivy_core.report_fallback import (
-    build_attachment_failure_notice,
-    split_imessage_content,
-)
 from ivy_core.pipeline_status import (
     PipelineStatus,
     PipelineResult,
@@ -1065,8 +1061,6 @@ def _run_pipeline(
     # A valid pick should have:
     #   - confidence level (not just 55% single-sharp noise)
     #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
-    min_confidence_single = "medium"  # Only accept high-confidence single-sharp picks
-    min_sharps_consensus = 2
     
     filtered_picks = []
     for p in merged:
@@ -1115,9 +1109,6 @@ def _run_pipeline(
     # Assign a report ID
     report_id = _outbox.make_report_id("sharp_picks")
     result.report_id = report_id
-    content_summary = (
-        f"{len(filtered_picks)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
-    )
     print(f"📦 Report ID: {report_id}")
 
     if not send:
