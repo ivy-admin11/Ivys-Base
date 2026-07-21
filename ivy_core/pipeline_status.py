@@ -165,7 +165,7 @@ class PipelineResult:
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
-            "attached": False,  # Will be set to True when PDF is attached
+            "attached": False,  # Always False for text-based reports (backward compat field)
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
