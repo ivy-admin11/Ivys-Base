@@ -53,6 +53,13 @@ from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     split_imessage_content,
 )
+from ivy_core.pipeline_status import (
+    PipelineStatus,
+    PipelineResult,
+    ProviderAuthenticationError,
+    RetryableProviderError,
+    ProviderUnavailableError,
+)
 
 # xAI SDK (recommended) or OpenAI-compatible client
 try:
@@ -148,9 +155,16 @@ def _summarize_book(bookmaker):
 
 
 def fetch_live_odds(window_hours=WINDOW_HOURS):
-    """Pull scheduled games + live lines across all leagues for the next N hours."""
+    """Pull scheduled games + live lines across all leagues for the next N hours.
+    
+    Raises:
+        ProviderAuthenticationError: If Odds API returns 401/403
+        RetryableProviderError: If API returns 429 or 5xx
+        ProviderUnavailableError: On network/timeout errors
+    """
     if not ODDS_API_KEY:
-        print("⚠️ ODDS_API_KEY missing — skipping live odds; picks will show no lines.")
+        # Odds API is optional for X-sweep fallback, so log and continue
+        print("⚠️  ODDS_API_KEY not set — skipping live odds (X sweep will continue)")
         return []
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -174,10 +188,60 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
                 },
                 timeout=12,
             )
+            
+            # Handle authentication/authorization failures
+            if r.status_code in (401, 403):
+                raise ProviderAuthenticationError(
+                    provider="odds_api",
+                    status_code=r.status_code,
+                    message=f"Odds API credentials were rejected (HTTP {r.status_code})",
+                    endpoint=r.url,
+                )
+            
+            # Handle rate limiting and server errors (retryable)
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("Retry-After", 60))
+                raise RetryableProviderError(
+                    provider="odds_api",
+                    status_code=429,
+                    message="Odds API rate limited",
+                    retry_after=retry_after,
+                )
+            
+            if 500 <= r.status_code < 600:
+                raise RetryableProviderError(
+                    provider="odds_api",
+                    status_code=r.status_code,
+                    message=f"Odds API server error (HTTP {r.status_code})",
+                )
+            
+            # Generic HTTP error handling
             r.raise_for_status()
             data = r.json() or []
+        
+        except ProviderAuthenticationError:
+            # Re-raise auth errors (caller must handle)
+            raise
+        
+        except RetryableProviderError:
+            # Re-raise retryable errors (caller must handle)
+            raise
+        
+        except requests.exceptions.Timeout:
+            raise ProviderUnavailableError(
+                provider="odds_api",
+                message=f"Odds API timeout (league: {league})",
+            )
+        
+        except requests.exceptions.ConnectionError as e:
+            raise ProviderUnavailableError(
+                provider="odds_api",
+                message=f"Odds API connection failed (league: {league})",
+                cause=e,
+            )
+        
         except Exception as e:
-            print(f"⚠️ Odds fetch failed for {league}: {e}")
+            print(f"⚠️  Odds fetch failed for {league}: {e}")
             continue
 
         for g in data:
@@ -923,16 +987,65 @@ def _run_pipeline(
     requester: Optional[str] = None,
     request_id: Optional[str] = None,
 ) -> dict:
-    """Internal pipeline — called only when the run() filelock is held."""
+    """Internal pipeline — called only when the run() filelock is held.
+    
+    Tracks source health and pipeline status explicitly. Only marks a run as
+    SUCCESS when all required sources are healthy and minimum pick thresholds
+    are met. Otherwise, reports the true status (AUTH_FAILURE, DEGRADED, etc.).
+    """
     print("🚀 Starting 48-Hour X-Sourced Sports Picks Loop...")
-
-    games = fetch_live_odds()
-    picks = sweep_with_retry(games)
+    
+    result = PipelineResult(status=PipelineStatus.SUCCESS)
+    odds_source = result.add_source("The Odds API", is_required=False)
+    grok_source = result.add_source("Grok X Search", is_required=True)
+    
+    # Fetch live odds (handle auth/upstream errors explicitly)
+    try:
+        games = fetch_live_odds()
+        odds_source.mark_success(pick_count=len(games))
+    except ProviderAuthenticationError as e:
+        print(f"🔴 {e}")
+        odds_source.mark_failure(e, status_code=e.status_code)
+        result.status = PipelineStatus.AUTH_FAILURE
+        result.admin_message = (
+            f"Sharp Picks halted: Odds API authentication failed.\n"
+            f"Status: HTTP {e.status_code}\n"
+            f"Message: {e.message}\n"
+            f"Admin action required: Verify ODDS_API_KEY is current and authorized."
+        )
+        print(result.admin_message)
+        return result.to_dict()
+    except RetryableProviderError as e:
+        print(f"⚠️  {e} — will retry on next scheduled run")
+        odds_source.mark_failure(e, status_code=e.status_code)
+        result.status = PipelineStatus.DEGRADED
+        games = []
+    except ProviderUnavailableError as e:
+        print(f"⚠️  {e} — temporarily unavailable")
+        odds_source.mark_failure(e)
+        result.status = PipelineStatus.DEGRADED
+        games = []
+    except Exception as e:
+        print(f"🔴 Unexpected error fetching odds: {e}")
+        odds_source.mark_failure(e)
+        result.status = PipelineStatus.INTERNAL_ERROR
+        return result.to_dict()
+    
+    # Sweep for picks (Grok/X search)
+    try:
+        picks = sweep_with_retry(games)
+        grok_source.mark_success(pick_count=len(picks))
+    except Exception as e:
+        print(f"⚠️  Grok X Search failed: {e}")
+        grok_source.mark_failure(e)
+        picks = []
+        # Grok is required, so downgrade status
+        if result.status == PipelineStatus.SUCCESS:
+            result.status = PipelineStatus.UPSTREAM_UNAVAILABLE
 
     if not picks:
         print("📭 No active picks pulled from X sweep.")
-        # On an ad-hoc (forced) request, never fail silently — Ivy already told
-        # Henry "picks on the way", so close the loop with an honest note.
+        # On an ad-hoc (forced) request, never fail silently
         if force and send:
             send_imessage(
                 HENRY_PHONE,
@@ -941,80 +1054,96 @@ def _run_pipeline(
                 "watching and send them the moment there's a play.",
             )
             print("📨 Sent 'no picks' notice to Henry (ad-hoc run).")
-        return {"result_type": "no_picks", "sent": False, "attached": False}
+        result.status = PipelineStatus.NO_QUALIFYING_PICKS
+        return result.to_dict()
 
     merged = merge_picks(picks)
     attach_odds(merged, games)
-    enrich_picks(merged, games)  # Grok enrichment for every surfaced pick
-    consensus_n = sum(1 for p in merged if p["is_consensus"])
-    print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique ({consensus_n} consensus).")
+    enrich_picks(merged, games)
     
-    # Track picks in the database for historical win/loss/push analysis
-    save_picks(merged, report_date=datetime.now().strftime("%Y-%m-%d"))
+    # Filter picks by minimum quality threshold
+    # A valid pick should have:
+    #   - confidence level (not just 55% single-sharp noise)
+    #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
+    min_confidence_single = "medium"  # Only accept high-confidence single-sharp picks
+    min_sharps_consensus = 2
+    
+    filtered_picks = []
+    for p in merged:
+        confidence = (p.get("enrichment", {}).get("confidence") or "").lower()
+        is_consensus = p.get("is_consensus", False)
+        sharp_count = p.get("consensus_count", 1)
+        
+        # Accept if: consensus (2+ sharps) OR single-sharp with medium/high confidence
+        if is_consensus or (sharp_count == 1 and confidence in ("medium", "high")):
+            filtered_picks.append(p)
+    
+    if not filtered_picks:
+        print(f"⚠️  {len(merged)} pick(s) found but none meet minimum quality threshold.")
+        print("   (Require: 2+ sharps for consensus OR 1 sharp with medium/high confidence)")
+        result.picks_count = 0
+        result.consensus_count = 0
+        result.status = PipelineStatus.NO_QUALIFYING_PICKS
+        return result.to_dict()
+    
+    consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
+    print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique → {len(filtered_picks)} qualifying ({consensus_n} consensus).")
+    
+    result.picks_count = len(filtered_picks)
+    result.consensus_count = consensus_n
+    
+    # Only now save picks that passed validation
+    save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
 
     # Build the outbound body and its content fingerprint.
-    signature = _report_signature(merged)
+    signature = _report_signature(filtered_picks)
 
-    # Duplicate suppression: only text Henry net-new information. Skip if the
-    # picks fingerprint matches the last report (same slate, unchanged lines).
+    # Duplicate suppression: only text Henry net-new information.
     if force:
         print("⚡ force=True — bypassing duplicate suppression (ad-hoc run).")
     last = load_last_report()
     if not force and last.get("signature") == signature:
         print("🔁 Picks unchanged since last report (same fingerprint) — skipping duplicate report.")
-        return {"result_type": "duplicate", "sent": False, "attached": False}
+        result.status = PipelineStatus.SUCCESS
+        return result.to_dict()
 
-    # Generate text-only report (no PDF needed)
+    # Generate text-only report
     print("📝 Generating text-only picks report...")
-    report_text = format_picks_by_sport(merged)
-    print(f"✅ Report formatted ({len(merged)} picks)")
+    report_text = format_picks_by_sport(filtered_picks)
+    print(f"✅ Report formatted ({len(filtered_picks)} picks)")
 
-    # Assign a report ID 
+    # Assign a report ID
     report_id = _outbox.make_report_id("sharp_picks")
+    result.report_id = report_id
     content_summary = (
-        f"{len(merged)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
+        f"{len(filtered_picks)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
     )
     print(f"📦 Report ID: {report_id}")
 
     if not send:
         print("🧪 send=False — dry run, not sending.")
-        return {
-            "result_type": "picks", "report_id": report_id,
-            "sent": False, "text_sent": False,
-            "pick_count": len(merged),
-        }
+        result.sent = False
+        result.status = PipelineStatus.SUCCESS
+        return result.to_dict()
 
-    # Send text report directly (no PDF attachment needed)
+    # Send text report directly
     delivered_text = send_imessage(HENRY_PHONE, report_text)
     
     if delivered_text:
         save_last_report(signature, signature)
-        print(f"✅ {len(merged)} pick(s) reported to Henry ({consensus_n} consensus).")
-        return {
-            "result_type": "picks",
-            "report_id": report_id,
-            "sent": delivered_text,
-            "text_sent": True,
-            "attachment_status": None,
-            "fallback_sent": False,
-            "retry_queued": False,
-            "pick_count": len(merged),
-        }
+        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
+        result.sent = True
+        result.status = PipelineStatus.SUCCESS
+        result.message = f"Report {report_id} sent successfully."
+        return result.to_dict()
 
     # Fallback if text send failed
-    print("⚠️ Text delivery failed")
+    print("⚠️  Text delivery failed")
     print(f"Report ID {report_id} queued for retry")
-
-    return {
-        "result_type": "picks",
-        "report_id": report_id,
-        "sent": delivered_text,
-        "text_sent": False,
-        "attachment_status": None,
-        "fallback_sent": False,
-        "retry_queued": True,
-        "pick_count": len(merged),
-    }
+    result.sent = False
+    result.status = PipelineStatus.INTERNAL_ERROR
+    result.message = f"Report {report_id} failed to send — queued for retry"
+    return result.to_dict()
 
 
 if __name__ == "__main__":
