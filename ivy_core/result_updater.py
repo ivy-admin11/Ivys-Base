@@ -6,9 +6,11 @@ determines outcomes (W/L/P), and updates the database + Google Sheets.
 
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple
+from decimal import Decimal, InvalidOperation
 
 import requests
 
@@ -25,6 +27,28 @@ def _get_odds_api_key():
     """Get The Odds API key from environment."""
     import os
     return os.environ.get("ODDS_API_KEY", "")
+
+
+def parse_score(value: Any) -> Optional[Decimal]:
+    """Safely parse scores to Decimal for type safety and precision.
+    
+    Handles int, float, string, and None values gracefully.
+    Returns None if parsing fails.
+    
+    Args:
+        value: Raw score value from API (int, float, string, or None)
+    
+    Returns:
+        Decimal or None if unparseable
+    """
+    if value is None:
+        return None
+    
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        logger.debug(f"Failed to parse score: {value!r}")
+        return None
 
 
 def get_completed_games(sport_key: str = None, hours_back: int = 48) -> list:
@@ -100,6 +124,29 @@ def _normalize_team(name: str) -> str:
     return name.replace("'", "").replace(" ", "").lower()
 
 
+def _match_teams_in_matchup(matchup: str, home: str, away: str) -> bool:
+    """Verify both teams appear in matchup string.
+    
+    Ensures we match the correct game, not just any game with one matching team.
+    
+    Args:
+        matchup: Matchup description (e.g., "Miami @ Texas")
+        home: Home team name
+        away: Away team name
+    
+    Returns:
+        True if both teams are found in matchup
+    """
+    norm_matchup = matchup.lower()
+    home_norm = _normalize_team(home)
+    away_norm = _normalize_team(away)
+    
+    has_home = home_norm in norm_matchup if home_norm else False
+    has_away = away_norm in norm_matchup if away_norm else False
+    
+    return has_home and has_away
+
+
 def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
     """Determine W/L/P from a moneyline game and pick side."""
     home_team = game.get("home_team", "")
@@ -109,8 +156,8 @@ def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
     if not scores or len(scores) < 2:
         return None
     
-    home_score = scores[0].get("score")
-    away_score = scores[1].get("score")
+    home_score = parse_score(scores[0].get("score"))
+    away_score = parse_score(scores[1].get("score"))
     
     if home_score is None or away_score is None:
         return None
@@ -148,21 +195,21 @@ def _extract_spread_result(game: dict, pick_side: str) -> Optional[str]:
     if not scores or len(scores) < 2:
         return None
     
-    home_score = scores[0].get("score")
-    away_score = scores[1].get("score")
+    home_score = parse_score(scores[0].get("score"))
+    away_score = parse_score(scores[1].get("score"))
     
     if home_score is None or away_score is None:
         return None
     
-    # Extract spread from pick_side (e.g., "Team -2.5")
-    import re
-    match = re.search(r'([+-]?\d+(?:\.\d+)?)', pick_side)
+    # Extract spread from pick_side (e.g., "Team -2.5" or "Team +3")
+    # More specific: must have +/- immediately before the number
+    match = re.search(r'([+-]\d+(?:\.\d+)?)', pick_side)
     if not match:
         return None
     
     try:
-        spread = float(match.group(1))
-    except ValueError:
+        spread = Decimal(match.group(1))
+    except (ValueError, InvalidOperation):
         return None
     
     home_norm = _normalize_team(home_team)
@@ -200,23 +247,23 @@ def _extract_over_under_result(game: dict, pick_side: str) -> Optional[str]:
     if not scores or len(scores) < 2:
         return None
     
-    home_score = scores[0].get("score")
-    away_score = scores[1].get("score")
+    home_score = parse_score(scores[0].get("score"))
+    away_score = parse_score(scores[1].get("score"))
     
     if home_score is None or away_score is None:
         return None
     
     total_points = home_score + away_score
     
-    # Extract the total from pick_side (e.g., "Over 9.5")
-    import re
-    match = re.search(r'(\d+(?:\.\d+)?)', pick_side)
+    # Extract the total from pick_side (e.g., "Over 9.5" or "Under 45.5")
+    # More specific: look for "over"/"under" keyword first, then the number
+    match = re.search(r'(?:over|under)\s*(\d+(?:\.\d+)?)', pick_side, re.IGNORECASE)
     if not match:
         return None
     
     try:
-        ou_line = float(match.group(1))
-    except ValueError:
+        ou_line = Decimal(match.group(1))
+    except (ValueError, InvalidOperation):
         return None
     
     pick_lower = pick_side.lower()
@@ -227,6 +274,7 @@ def _extract_over_under_result(game: dict, pick_side: str) -> Optional[str]:
         elif total_points < ou_line:
             return "L"
         else:
+            # Exact match treated as PUSH (betting lines are typically X.5, so exact match is rare)
             return "P"
     elif "under" in pick_lower:
         if total_points < ou_line:
@@ -272,30 +320,32 @@ def match_pick_to_game(pick: Dict, completed_games: list) -> Tuple[Optional[str]
         home_team = game.get("home_team", "").lower()
         away_team = game.get("away_team", "").lower()
         
-        # Check if matchup matches
-        matchup_normalized = matchup.replace(" @ ", " vs ").replace(" v ", " vs ")
+        # Require BOTH teams to be in matchup (more strict matching)
+        if not _match_teams_in_matchup(matchup, home_team, away_team):
+            continue
         
-        if (away_team in matchup_normalized or home_team in matchup_normalized) or \
-           (home_team in matchup and away_team in matchup):
-            # Found matching game
-            scores = game.get("scores", [])
-            if scores and len(scores) >= 2:
-                home_score = scores[0].get("score")
-                away_score = scores[1].get("score")
+        # Found matching game
+        scores = game.get("scores", [])
+        if scores and len(scores) >= 2:
+            home_score = parse_score(scores[0].get("score"))
+            away_score = parse_score(scores[1].get("score"))
+            if home_score is not None and away_score is not None:
                 final_score = f"{away_team} {away_score} vs {home_team} {home_score}"
             else:
                 final_score = None
-            
-            # Determine result based on pick type
-            result = None
-            if "moneyline" in side or " ml" in side:
-                result = _extract_moneyline_result(game, side)
-            elif " " in side and ("-" in side or "+" in side):
-                result = _extract_spread_result(game, side)
-            elif "over" in side or "under" in side:
-                result = _extract_over_under_result(game, side)
-            
-            return result, final_score
+        else:
+            final_score = None
+        
+        # Determine result based on pick type
+        result = None
+        if "moneyline" in side or " ml" in side:
+            result = _extract_moneyline_result(game, side)
+        elif " " in side and ("-" in side or "+" in side):
+            result = _extract_spread_result(game, side)
+        elif "over" in side or "under" in side:
+            result = _extract_over_under_result(game, side)
+        
+        return result, final_score
     
     return None, None
 
@@ -320,7 +370,7 @@ def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = N
     # Update database
     cursor.execute(
         "UPDATE results SET result = ?, final_score = ?, resolved_at = ? WHERE pick_id = ?",
-        (result, final_score, datetime.utcnow().isoformat(), pick_id)
+        (result, final_score, datetime.now(timezone.utc).isoformat(), pick_id)
     )
     conn.commit()
     conn.close()
