@@ -27,6 +27,14 @@ os.environ.setdefault("ENABLE_IMESSAGE_POLLER", "false")
 import pytest  # noqa: E402
 
 
+def pytest_configure(config):
+    """Configure pytest with custom markers and skip rules."""
+    # macOS integration tests require explicit opt-in via PYTEST_MACOS_INTEGRATION=1
+    # They are skipped by default in CI and local development.
+    if os.environ.get("PYTEST_MACOS_INTEGRATION") != "1":
+        config.option.markexpr = "not macos_integration"
+
+
 @pytest.fixture(autouse=True)
 def isolated_receipts_db(tmp_path, monkeypatch):
     """Every test gets its own scratch SQLite file — never the real
