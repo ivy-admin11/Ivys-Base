@@ -140,6 +140,8 @@ class PipelineResult:
         self.error: Optional[Exception] = None
         self.sent = False
         self.report_id: Optional[str] = None
+        self.attached = False  # Backward compatibility: whether a PDF was attached
+        self.result_type: Optional[str] = None  # Backward compatibility: old result type
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
         """Register a data source."""
@@ -147,9 +149,29 @@ class PipelineResult:
         self.sources[name] = source
         return source
     
+    def _infer_result_type(self) -> str:
+        """Infer the old-style result_type from status and outcome."""
+        if self.result_type:
+            return self.result_type
+        
+        # Map new status to old result_type for backward compatibility
+        if self.status == PipelineStatus.NO_QUALIFYING_PICKS:
+            return "no_picks"
+        elif self.status == PipelineStatus.SUCCESS:
+            # If sent, it was a picks report; otherwise could be a duplicate
+            return "duplicate" if not self.sent else "picks"
+        else:
+            # Other statuses map to their string value
+            return self.status.value
+    
     def to_dict(self) -> dict:
-        """Convert to JSON-serializable dict for logging/API response."""
+        """Convert to JSON-serializable dict for logging/API response.
+        
+        Includes both new keys (status, picks, consensus) and old keys
+        (result_type, attached) for backward compatibility with existing tests/callers.
+        """
         return {
+            # New-style keys
             "status": self.status.value,
             "picks": self.picks_count,
             "consensus": self.consensus_count,
@@ -166,4 +188,7 @@ class PipelineResult:
                 }
                 for name, source in self.sources.items()
             },
+            # Backward-compatible keys for existing tests/callers
+            "result_type": self._infer_result_type(),
+            "attached": self.attached,
         }
