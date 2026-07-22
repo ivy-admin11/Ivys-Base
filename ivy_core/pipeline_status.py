@@ -150,7 +150,15 @@ class PipelineResult:
         return source
     
     def _infer_result_type(self) -> str:
-        """Infer the old-style result_type from status and outcome."""
+        """Infer the old-style result_type from status and outcome.
+        
+        This method maintains backward compatibility with the old return format.
+        Note: When status is SUCCESS but sent=False, we cannot definitively
+        distinguish between a dry-run and a duplicate suppression without
+        additional context. We return "duplicate" as a reasonable default for
+        backward compatibility, but callers should prefer using the new
+        "status" and "sent" fields for precise semantics.
+        """
         if self.result_type:
             return self.result_type
         
@@ -158,7 +166,8 @@ class PipelineResult:
         if self.status == PipelineStatus.NO_QUALIFYING_PICKS:
             return "no_picks"
         elif self.status == PipelineStatus.SUCCESS:
-            # If sent, it was a picks report; otherwise could be a duplicate
+            # If sent=False, assume it was a duplicate (conservative choice for backward compat)
+            # New code should check "sent" and "status" fields directly
             return "duplicate" if not self.sent else "picks"
         else:
             # Other statuses map to their string value

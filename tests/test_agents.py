@@ -46,25 +46,22 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
 def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
     # Note: Sports Bettor is text-only and doesn't attach PDFs
     # This test verifies the proper return format when send=True
+    # Mock pick data that passes quality filters (high confidence single-sharp)
+    mock_pick = {
+        "account": "@real",
+        "matchup": "A vs B",
+        "enrichment": {"confidence": "high"},
+        "sport": "NFL",
+        "line": "+3",
+    }
+    
     monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
-    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [
-        {
-            "account": "@real",
-            "matchup": "A vs B",
-            "enrichment": {"confidence": "high"},
-            "sport": "NFL",
-            "line": "+3",
-        }
-    ])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [mock_pick])
     monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
         {
+            **mock_pick,
             "is_consensus": False,
             "consensus_count": 1,
-            "enrichment": {"confidence": "high"},
-            "sport": "NFL",
-            "line": "+3",
-            "account": "@real",
-            "matchup": "A vs B",
         }
     ])
     monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
