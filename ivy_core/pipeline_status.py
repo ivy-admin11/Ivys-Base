@@ -158,6 +158,12 @@ class PipelineResult:
         additional context. We return "duplicate" as a reasonable default for
         backward compatibility, but callers should prefer using the new
         "status" and "sent" fields for precise semantics.
+        
+        The mapping is:
+        - NO_QUALIFYING_PICKS → "no_picks"
+        - SUCCESS (sent=True) → "picks"
+        - SUCCESS (sent=False) → "duplicate" (conservative fallback)
+        - Other statuses → status.value (e.g., "auth_failure", "degraded")
         """
         if self.result_type:
             return self.result_type
@@ -166,8 +172,10 @@ class PipelineResult:
         if self.status == PipelineStatus.NO_QUALIFYING_PICKS:
             return "no_picks"
         elif self.status == PipelineStatus.SUCCESS:
-            # If sent=False, assume it was a duplicate (conservative choice for backward compat)
-            # New code should check "sent" and "status" fields directly
+            # sent=True means report was delivered; sent=False could mean either
+            # dry-run (send=False arg) or duplicate suppression. We conservatively
+            # return "duplicate" for the not-sent case, but new code should check
+            # the "status" and "sent" fields directly for precise semantics.
             return "duplicate" if not self.sent else "picks"
         else:
             # Other statuses map to their string value

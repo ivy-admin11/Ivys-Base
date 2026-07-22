@@ -43,9 +43,9 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
     assert sent == []
 
 
-def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
-    # Note: Sports Bettor is text-only and doesn't attach PDFs
-    # This test verifies the proper return format when send=True
+def test_sports_bettor_sends_text_report_when_send_true(monkeypatch):
+    # Verify that Sports Bettor returns proper format for text-only reports
+    # (not PDF attachments, contrary to the old test name)
     # Mock pick data that passes quality filters (high confidence single-sharp)
     mock_pick = {
         "account": "@real",
@@ -79,7 +79,7 @@ def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
 
     result = sports_bettor.run(force=True, send=True)
 
-    # Sports bettor sends text-only reports, not PDFs
+    # Verify text report was sent
     assert sent_messages, "send_imessage was never called"
     assert result["sent"] is True
     # Verify backward-compatible keys are present
