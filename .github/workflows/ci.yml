@@ -50,3 +50,6 @@ jobs:
 
       - name: pytest
         run: pytest -v
+        env:
+          # Skip macOS integration tests in CI — they require Messages.app and osascript on macOS
+          PYTEST_MACOS_INTEGRATION: "0"

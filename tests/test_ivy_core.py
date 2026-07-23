@@ -24,6 +24,7 @@ def test_escape_applescript_string_escapes_backslash_before_quote():
     assert unescaped == raw
 
 
+@pytest.mark.macos_integration
 @pytest.mark.skipif(sys.platform != "darwin", reason="osascript only exists on macOS")
 def test_argv_round_trip_with_tricky_characters_real_osascript():
     """Real, non-mocked osascript call — proves argv passing is immune to
