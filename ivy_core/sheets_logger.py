@@ -4,12 +4,10 @@ Integrates with Google Sheets API to append pick records and update results
 in a shared spreadsheet for easy viewing and analysis.
 """
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
 
-from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
 from google.auth import default
 from googleapiclient.discovery import build

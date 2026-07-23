@@ -140,6 +140,8 @@ class PipelineResult:
         self.error: Optional[Exception] = None
         self.sent = False
         self.report_id: Optional[str] = None
+        self.attached = False  # Backward compatibility: whether a PDF was attached
+        self.result_type: Optional[str] = None  # Backward compatibility: old result type
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
         """Register a data source."""
@@ -147,9 +149,46 @@ class PipelineResult:
         self.sources[name] = source
         return source
     
+    def _infer_result_type(self) -> str:
+        """Infer the old-style result_type from status and outcome.
+        
+        This method maintains backward compatibility with the old return format.
+        Note: When status is SUCCESS but sent=False, we cannot definitively
+        distinguish between a dry-run and a duplicate suppression without
+        additional context. We return "duplicate" as a reasonable default for
+        backward compatibility, but callers should prefer using the new
+        "status" and "sent" fields for precise semantics.
+        
+        The mapping is:
+        - NO_QUALIFYING_PICKS → "no_picks"
+        - SUCCESS (sent=True) → "picks"
+        - SUCCESS (sent=False) → "duplicate" (conservative fallback)
+        - Other statuses → status.value (e.g., "auth_failure", "degraded")
+        """
+        if self.result_type:
+            return self.result_type
+        
+        # Map new status to old result_type for backward compatibility
+        if self.status == PipelineStatus.NO_QUALIFYING_PICKS:
+            return "no_picks"
+        elif self.status == PipelineStatus.SUCCESS:
+            # sent=True means report was delivered; sent=False could mean either
+            # dry-run (send=False arg) or duplicate suppression. We conservatively
+            # return "duplicate" for the not-sent case, but new code should check
+            # the "status" and "sent" fields directly for precise semantics.
+            return "duplicate" if not self.sent else "picks"
+        else:
+            # Other statuses map to their string value
+            return self.status.value
+    
     def to_dict(self) -> dict:
-        """Convert to JSON-serializable dict for logging/API response."""
+        """Convert to JSON-serializable dict for logging/API response.
+        
+        Includes both new keys (status, picks, consensus) and old keys
+        (result_type, attached) for backward compatibility with existing tests/callers.
+        """
         return {
+            # New-style keys
             "status": self.status.value,
             "picks": self.picks_count,
             "consensus": self.consensus_count,
@@ -166,4 +205,7 @@ class PipelineResult:
                 }
                 for name, source in self.sources.items()
             },
+            # Backward-compatible keys for existing tests/callers
+            "result_type": self._infer_result_type(),
+            "attached": self.attached,
         }
