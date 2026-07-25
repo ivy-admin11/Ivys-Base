@@ -39,6 +39,7 @@ import hashlib
 import json
 import re
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple, Dict, Any
@@ -129,6 +130,105 @@ X_ACCOUNT_CHUNK_SIZE = 8
 # Henry only ever gets net-new information.
 LAST_REPORT_PATH = os.path.join(PROJECT_ROOT, "proactive_agents", "sports_last_report.json")
 
+# ===================== ODDS API DIAGNOSTICS =====================
+# Thread-safe internal diagnostics snapshot for the last odds fetch run.
+
+_ODDS_DIAGNOSTICS_LOCK = threading.Lock()
+_ODDS_DIAGNOSTICS = {
+    "configured_leagues": 0,
+    "successful_leagues": [],
+    "failed_leagues": [],
+    "error_categories": [],
+    "success_count": 0,
+    "failure_count": 0,
+    "is_partial": False,
+}
+
+
+def _update_odds_diagnostics(**updates) -> None:
+    """Thread-safe update to diagnostics snapshot."""
+    with _ODDS_DIAGNOSTICS_LOCK:
+        _ODDS_DIAGNOSTICS.update(updates)
+
+
+def get_last_odds_fetch_diagnostics() -> Dict[str, Any]:
+    """Return immutable copy of last odds fetch diagnostics.
+    
+    Returns a dict with:
+    - configured_leagues: count of leagues in ODDS_SPORT_KEYS
+    - successful_leagues: list of league names that succeeded
+    - failed_leagues: list of league names that failed
+    - error_categories: list of error type strings (e.g., "ProviderAuthenticationError")
+    - success_count: number of successful leagues
+    - failure_count: number of failed leagues
+    - is_partial: True if partial success (some succeeded, some failed)
+    
+    Does NOT contain API keys, URLs, raw responses, or mutable state.
+    """
+    with _ODDS_DIAGNOSTICS_LOCK:
+        return dict(_ODDS_DIAGNOSTICS)
+
+
+# ===================== ODDS API UTILITIES =====================
+
+def _parse_retry_after(retry_after_header: Optional[str]) -> int:
+    """Parse HTTP Retry-After header as integer seconds.
+    
+    Handles:
+    1. Integer seconds (e.g., "60")
+    2. HTTP date (RFC 7231, e.g., "Wed, 21 Oct 2026 07:28:00 GMT")
+    
+    Returns:
+        Integer seconds, clamped to [1, 3600] range.
+        Defaults to 60 if header is None, empty, or malformed.
+    """
+    if not retry_after_header:
+        return 60
+    
+    retry_after_header = retry_after_header.strip()
+    
+    # Try to parse as integer seconds
+    try:
+        seconds = int(retry_after_header)
+        return max(1, min(seconds, 3600))  # Clamp to [1, 3600]
+    except ValueError:
+        pass
+    
+    # Try to parse as HTTP date (RFC 7231)
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(retry_after_header)
+        now = datetime.now(timezone.utc)
+        delta = dt - now
+        seconds = int(delta.total_seconds())
+        return max(1, min(max(seconds, 1), 3600))  # Clamp to [1, 3600]
+    except (TypeError, ValueError):
+        pass
+    
+    # Fallback to 60 seconds
+    return 60
+
+
+def _sanitize_endpoint(url: str) -> str:
+    """Return only scheme, host, and path (no query string with API key).
+    
+    Input: https://api.the-odds-api.com/v4/sports/basketball_nba/odds?apiKey=SECRET&regions=us
+    Output: https://api.the-odds-api.com/v4/sports/basketball_nba/odds
+    """
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    except Exception:
+        # Fallback to just the base domain
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            return "https://api.the-odds-api.com"
+
+
 # ===================== LIVE ODDS (The Odds API) =====================
 def _summarize_book(bookmaker):
     """Condense one bookmaker's markets into Moneyline/Spread/Total strings."""
@@ -159,145 +259,301 @@ def _fetch_league_odds_task(league: str, sport_key: str, frm: str, to: str) -> T
     Raises:
         ProviderAuthenticationError: If API returns 401/403
         RetryableProviderError: If API returns 429 or 5xx
-        ProviderUnavailableError: On network/timeout errors
+        ProviderUnavailableError: On network/timeout errors or malformed responses
+    
+    Returns:
+        (league, games_list) tuple where games_list is always a list (possibly empty).
     """
-    r = requests.get(
-        f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-        params={
-            "apiKey":           ODDS_API_KEY,
-            "regions":          "us",
-            "markets":          "h2h,spreads,totals",
-            "oddsFormat":       "american",
-            "dateFormat":       "iso",
-            "commenceTimeFrom": frm,
-            "commenceTimeTo":   to,
-        },
-        timeout=12,
-    )
+    try:
+        r = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+            params={
+                "apiKey":           ODDS_API_KEY,
+                "regions":          "us",
+                "markets":          "h2h,spreads,totals",
+                "oddsFormat":       "american",
+                "dateFormat":       "iso",
+                "commenceTimeFrom": frm,
+                "commenceTimeTo":   to,
+            },
+            timeout=12,
+        )
+        
+        # Handle authentication/authorization failures
+        if r.status_code in (401, 403):
+            raise ProviderAuthenticationError(
+                provider="odds_api",
+                status_code=r.status_code,
+                message=f"Odds API credentials rejected (HTTP {r.status_code})",
+                endpoint=_sanitize_endpoint(r.url),
+            )
+        
+        # Handle rate limiting (retryable)
+        if r.status_code == 429:
+            retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+            raise RetryableProviderError(
+                provider="odds_api",
+                status_code=429,
+                message="Odds API rate limited",
+                retry_after=retry_after,
+            )
+        
+        # Handle server errors (retryable)
+        if 500 <= r.status_code < 600:
+            raise RetryableProviderError(
+                provider="odds_api",
+                status_code=r.status_code,
+                message=f"Odds API server error (HTTP {r.status_code})",
+            )
+        
+        # Handle other unsuccessful HTTP statuses
+        r.raise_for_status()
+        
+        # Parse and validate response JSON
+        try:
+            data = r.json()
+        except (ValueError, json.JSONDecodeError) as e:
+            raise ProviderUnavailableError(
+                provider="odds_api",
+                message=f"Odds API returned malformed JSON: {type(e).__name__}",
+                cause=e,
+            )
+        
+        # Validate response is a list
+        if not isinstance(data, list):
+            raise ProviderUnavailableError(
+                provider="odds_api",
+                message=f"Odds API response root is not a list: {type(data).__name__}",
+            )
+        
+        return (league, data)
     
-    # Handle authentication/authorization failures
-    if r.status_code in (401, 403):
-        raise ProviderAuthenticationError(
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectTimeout) as e:
+        raise ProviderUnavailableError(
             provider="odds_api",
-            status_code=r.status_code,
-            message=f"Odds API credentials were rejected (HTTP {r.status_code})",
-            endpoint=r.url,
+            message=f"Odds API timeout (league: {league})",
+            cause=e,
         )
     
-    # Handle rate limiting and server errors (retryable)
-    if r.status_code == 429:
-        retry_after = int(r.headers.get("Retry-After", 60))
-        raise RetryableProviderError(
+    except requests.exceptions.ConnectionError as e:
+        raise ProviderUnavailableError(
             provider="odds_api",
-            status_code=429,
-            message="Odds API rate limited",
-            retry_after=retry_after,
+            message=f"Odds API connection failed (league: {league})",
+            cause=e,
         )
-    
-    if 500 <= r.status_code < 600:
-        raise RetryableProviderError(
-            provider="odds_api",
-            status_code=r.status_code,
-            message=f"Odds API server error (HTTP {r.status_code})",
-        )
-    
-    # Generic HTTP error handling
-    r.raise_for_status()
-    return (league, r.json() or [])
 
 
-def fetch_live_odds(window_hours=WINDOW_HOURS):
+def fetch_live_odds(window_hours=WINDOW_HOURS) -> List[Dict[str, Any]]:
     """Pull scheduled games + live lines across all leagues for the next N hours.
     
     🚀 Now runs all league fetches in parallel (3-4x faster than sequential)
     
+    Failure Policy:
+    - Authentication failure: raises immediately, cancels pending futures
+    - Complete provider failure: raises the strongest exception
+    - Partial success: returns successful games, records diagnostics
+    - All failures: raises appropriate exception or returns []
+    
+    Returns:
+        List of normalized game dicts. Flat list with deterministic ordering
+        (sorted by league, then by commence time, then by matchup).
+        
+        Returns [] if ODDS_API_KEY is not set.
+    
     Raises:
-        ProviderAuthenticationError: If Odds API returns 401/403
-        RetryableProviderError: If API returns 429 or 5xx
-        ProviderUnavailableError: On network/timeout errors
+        ProviderAuthenticationError: If any league returns 401/403
+        RetryableProviderError: If all leagues fail with retryable errors
+        ProviderUnavailableError: If all leagues timeout or have connection errors
     """
     if not ODDS_API_KEY:
-        # Odds API is optional for X-sweep fallback, so log and continue
+        # Odds API is optional for X-sweep fallback
         print("⚠️  ODDS_API_KEY not set — skipping live odds (X sweep will continue)")
+        _update_odds_diagnostics(
+            configured_leagues=0,
+            successful_leagues=[],
+            failed_leagues=[],
+            error_categories=[],
+            success_count=0,
+            failure_count=0,
+            is_partial=False,
+        )
         return []
-
+    
+    if not ODDS_SPORT_KEYS:
+        # No leagues configured
+        return []
+    
     now = datetime.now(timezone.utc).replace(microsecond=0)
     frm = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     to = (now + timedelta(hours=window_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
     print(f"📊 Pulling live odds for the next {window_hours}h (parallel across {len(ODDS_SPORT_KEYS)} leagues)...")
-
-    games = []
-    auth_error = None
-    retryable_errors = []
-
-    # Fetch all leagues in parallel (max 4 concurrent requests)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(_fetch_league_odds_task, league, sport_key, frm, to): league
-            for league, sport_key in ODDS_SPORT_KEYS.items()
-        }
+    
+    # Determine worker count (parallel degree)
+    max_configured_workers = 4  # Named constant for configured limit
+    max_workers = max(1, min(max_configured_workers, len(ODDS_SPORT_KEYS)))
+    
+    # Collect results by league in insertion order (for deterministic output)
+    games_by_league: Dict[str, List[Dict[str, Any]]] = {}
+    successful_leagues: List[str] = []
+    failed_leagues_with_errors: List[Tuple[str, Exception]] = []
+    auth_error: Optional[ProviderAuthenticationError] = None
+    
+    # Submit all tasks and collect futures
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for league, sport_key in ODDS_SPORT_KEYS.items():
+            future = executor.submit(_fetch_league_odds_task, league, sport_key, frm, to)
+            futures[future] = league
         
+        # Process completions as they arrive, but DON'T append to games directly
+        # (to preserve insertion order from ODDS_SPORT_KEYS)
         for future in as_completed(futures):
             league = futures[future]
+            
             try:
                 league_name, data = future.result()
-                
-                # Process games from this league
-                for g in data:
-                    books = g.get("bookmakers", [])
-                    # Prefer the first US book carrying all three markets, else the first.
-                    book = books[0] if books else None
-                    for b in books:
-                        keys = {m["key"] for m in b.get("markets", [])}
-                        if {"h2h", "spreads", "totals"}.issubset(keys):
-                            book = b
-                            break
-                    summary = _summarize_book(book)
-                    games.append({
-                        "sport": league_name,
-                        "home": g.get("home_team"),
-                        "away": g.get("away_team"),
-                        "commence": g.get("commence_time", ""),
-                        "moneyline": summary.get("moneyline", ""),
-                        "spread": summary.get("spread", ""),
-                        "total": summary.get("total", ""),
-                    })
-                    
+                games_by_league[league_name] = data
+                successful_leagues.append(league_name)
+                print(f"✅ {league}: {len(data)} game(s)")
+            
             except ProviderAuthenticationError as e:
-                # Auth errors stop the entire pipeline
+                # Auth error stops the entire pipeline
                 auth_error = e
+                print(f"❌ {league}: Authentication error")
+                # Cancel remaining futures
+                for f in futures.keys():
+                    f.cancel()
                 break
+            
             except RetryableProviderError as e:
-                # Retryable errors accumulate (caller decides if run should continue)
-                retryable_errors.append((league, e))
-                print(f"⚠️  {league} fetch retryable error: {e.message}")
-            except requests.exceptions.Timeout:
-                retryable_errors.append((league, ProviderUnavailableError(
-                    provider="odds_api",
-                    message=f"Odds API timeout (league: {league})",
-                )))
-                print(f"⚠️  {league} fetch timed out")
-            except requests.exceptions.ConnectionError as e:
-                retryable_errors.append((league, ProviderUnavailableError(
-                    provider="odds_api",
-                    message=f"Odds API connection failed (league: {league})",
-                    cause=e,
-                )))
-                print(f"⚠️  {league} connection failed")
+                failed_leagues_with_errors.append((league, e))
+                print(f"⚠️  {league}: Retryable error ({e.message})")
+            
+            except ProviderUnavailableError as e:
+                failed_leagues_with_errors.append((league, e))
+                print(f"⚠️  {league}: Unavailable ({e.message})")
+            
             except Exception as e:
-                print(f"⚠️  Odds fetch failed for {league}: {e}")
-                retryable_errors.append((league, e))
-
+                # Unexpected error; treat as provider unavailable
+                unavail_error = ProviderUnavailableError(
+                    provider="odds_api",
+                    message=f"Unexpected error: {type(e).__name__}",
+                    cause=e,
+                )
+                failed_leagues_with_errors.append((league, unavail_error))
+                print(f"⚠️  {league}: Unexpected error")
+    
     # If auth error occurred, raise immediately
     if auth_error:
+        _update_odds_diagnostics(
+            configured_leagues=len(ODDS_SPORT_KEYS),
+            successful_leagues=successful_leagues,
+            failed_leagues=list(dict.fromkeys([l for l, _ in failed_leagues_with_errors])),
+            error_categories=["ProviderAuthenticationError"],
+            success_count=len(successful_leagues),
+            failure_count=len(failed_leagues_with_errors),
+            is_partial=False,
+        )
         raise auth_error
     
-    # If retryable errors occurred on required operations, raise the first one
-    if retryable_errors and any(isinstance(e, RetryableProviderError) for _, e in retryable_errors):
-        raise retryable_errors[0][1]
-
-    print(f"📊 Odds feed: {len(games)} scheduled game(s) across {len(ODDS_SPORT_KEYS)} leagues.")
-    return games
+    # Normalize games from successful leagues in ODDS_SPORT_KEYS order
+    all_games = []
+    for league in ODDS_SPORT_KEYS.keys():
+        if league not in games_by_league:
+            continue
+        
+        for g in games_by_league[league]:
+            books = g.get("bookmakers", [])
+            # Prefer the first US book carrying all three markets, else the first.
+            book = books[0] if books else None
+            for b in books:
+                keys = {m["key"] for m in b.get("markets", [])}
+                if {"h2h", "spreads", "totals"}.issubset(keys):
+                    book = b
+                    break
+            
+            summary = _summarize_book(book)
+            game_dict = {
+                "sport": league,
+                "home": g.get("home_team"),
+                "away": g.get("away_team"),
+                "commence": g.get("commence_time", ""),
+                "moneyline": summary.get("moneyline", ""),
+                "spread": summary.get("spread", ""),
+                "total": summary.get("total", ""),
+            }
+            all_games.append(game_dict)
+        
+        # Sort games within each league by (commence, home, away)
+        league_start_idx = len(all_games) - len(games_by_league[league])
+        league_end_idx = len(all_games)
+        all_games[league_start_idx:league_end_idx] = sorted(
+            all_games[league_start_idx:league_end_idx],
+            key=lambda g: (
+                g.get("commence", ""),
+                g.get("home") or "",
+                g.get("away") or "",
+            ),
+        )
+    
+    # Determine if this is partial failure
+    is_partial = len(successful_leagues) > 0 and len(failed_leagues_with_errors) > 0
+    
+    # Update diagnostics
+    error_categories = []
+    for _, error in failed_leagues_with_errors:
+        error_type = type(error).__name__
+        if error_type not in error_categories:
+            error_categories.append(error_type)
+    
+    _update_odds_diagnostics(
+        configured_leagues=len(ODDS_SPORT_KEYS),
+        successful_leagues=successful_leagues,
+        failed_leagues=list(dict.fromkeys([l for l, _ in failed_leagues_with_errors])),
+        error_categories=error_categories,
+        success_count=len(successful_leagues),
+        failure_count=len(failed_leagues_with_errors),
+        is_partial=is_partial,
+    )
+    
+    # Failure policy
+    if len(successful_leagues) > 0:
+        # Partial or complete success
+        print(f"📊 Odds feed: {len(all_games)} scheduled game(s) across {len(successful_leagues)} league(s).")
+        return all_games
+    
+    # Complete failure: raise the strongest exception in configured league order
+    if not failed_leagues_with_errors:
+        # Shouldn't happen, but handle gracefully
+        print("⚠️  Odds API: No results collected")
+        return []
+    
+    # Select strongest exception deterministically by league order
+    strongest_error = None
+    priority_order = {
+        "ProviderAuthenticationError": 3,
+        "RetryableProviderError": 2,
+        "ProviderUnavailableError": 1,
+    }
+    
+    for league in ODDS_SPORT_KEYS.keys():
+        for failed_league, error in failed_leagues_with_errors:
+            if failed_league == league:
+                if strongest_error is None:
+                    strongest_error = error
+                elif priority_order.get(type(error).__name__, 0) > \
+                     priority_order.get(type(strongest_error).__name__, 0):
+                    strongest_error = error
+    
+    if strongest_error:
+        raise strongest_error
+    
+    # Fallback (shouldn't reach)
+    raise ProviderUnavailableError(
+        provider="odds_api",
+        message="Odds API: No leagues succeeded"
+    )
 
 
 def build_odds_catalog(games):
