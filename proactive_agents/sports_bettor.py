@@ -449,7 +449,7 @@ def fetch_live_odds(window_hours=WINDOW_HOURS) -> List[Dict[str, Any]]:
         _update_odds_diagnostics(
             configured_leagues=len(ODDS_SPORT_KEYS),
             successful_leagues=successful_leagues,
-            failed_leagues=list(dict.fromkeys([l for l, _ in failed_leagues_with_errors])),
+            failed_leagues=list(dict.fromkeys([league for league, _ in failed_leagues_with_errors])),
             error_categories=["ProviderAuthenticationError"],
             success_count=len(successful_leagues),
             failure_count=len(failed_leagues_with_errors),
@@ -510,7 +510,7 @@ def fetch_live_odds(window_hours=WINDOW_HOURS) -> List[Dict[str, Any]]:
     _update_odds_diagnostics(
         configured_leagues=len(ODDS_SPORT_KEYS),
         successful_leagues=successful_leagues,
-        failed_leagues=list(dict.fromkeys([l for l, _ in failed_leagues_with_errors])),
+        failed_leagues=list(dict.fromkeys([league for league, _ in failed_leagues_with_errors])),
         error_categories=error_categories,
         success_count=len(successful_leagues),
         failure_count=len(failed_leagues_with_errors),
