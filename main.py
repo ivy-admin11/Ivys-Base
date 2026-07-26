@@ -78,6 +78,7 @@ from ivy_core import receipts
 from ivy_core import outbox as _outbox
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import build_attachment_failure_notice
+from utils.applescript import AppleScriptRunner, escape_applescript_string
 
 # Import prompt caching manager
 try:
@@ -120,6 +121,10 @@ logging.basicConfig(
     format=LOG_FORMAT,
 )
 logger = logging.getLogger("ivy.gateway")
+
+# Reusable AppleScript runner — centralizes all osascript invocation so
+# timeouts, error handling, and string escaping live in one place.
+applescript_runner = AppleScriptRunner()
 
 # 🛡️ Guarded Playwright import (grocery staging removed)
 try:
@@ -557,8 +562,7 @@ def check_apple_calendar(timeframe: str) -> str:
         "return totalEvents",
     ]
     script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
+    raw_output = applescript_runner.run(script)
 
     if "Error:" in raw_output:
         return f"❌ AppleScript Database Error: {raw_output}"
@@ -619,10 +623,12 @@ def check_apple_calendar(timeframe: str) -> str:
 
 def fetch_apple_reminders(list_name: str = "Household") -> str:
     """Read uncompleted tasks from Apple Reminders."""
+    safe_list_name = escape_applescript_string(list_name)
+
     script = f'''
     tell application "Reminders"
         try
-            tell list "{list_name}"
+            tell list "{safe_list_name}"
                 set remNames to name of every reminder whose completed is false
                 set AppleScript's text item delimiters to ", "
                 return remNames as text
@@ -632,8 +638,13 @@ def fetch_apple_reminders(list_name: str = "Household") -> str:
         end try
     end tell
     '''
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip() if res.stdout.strip() else "No active reminders found."
+
+    raw_output = applescript_runner.run(script)
+
+    if raw_output.startswith("ERROR:"):
+        return f"❌ Reminders Integration Error: {raw_output}"
+
+    return raw_output or "No active reminders found."
 
 
 def add_apple_reminder(title: str, list_name: str = "Household") -> str:
@@ -644,28 +655,31 @@ def add_apple_reminder(title: str, list_name: str = "Household") -> str:
     elif any(word in list_name.lower() for word in ["house", "chore", "clean", "task"]):
         list_name = "Household"
 
+    safe_title = escape_applescript_string(title)
+    safe_list_name = escape_applescript_string(list_name)
+
     script_lines = [
         'tell application "Reminders"',
         "    try",
-        f'        if not (exists list "{list_name}") then',
-        f'            make new list with properties {{name:"{list_name}"}}',
+        f'        if not (exists list "{safe_list_name}") then',
+        f'            make new list with properties {{name:"{safe_list_name}"}}',
         "        end if",
-        f'        set targetList to list "{list_name}"',
+        f'        set targetList to list "{safe_list_name}"',
         "        tell targetList",
-        f'            make new reminder with properties {{name:"{title}"}}',
+        f'            make new reminder with properties {{name:"{safe_title}"}}',
         "        end tell",
         '        return "SUCCESS"',
-        "    on error err",
-        '        return "Error: " & err',
+        "    on error errMsg",
+        '        return "ERROR: " & errMsg',
         "    end try",
         "end tell",
     ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
 
-    if "SUCCESS" in raw_output:
+    raw_output = applescript_runner.run("\n".join(script_lines))
+
+    if raw_output == "SUCCESS":
         return f"✅ Added to your '{list_name}' list: {title}"
+
     return f"❌ Reminders Integration Error: {raw_output}"
 
 
@@ -727,23 +741,8 @@ def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
 
 
 def run_local_applescript_send(target: str, body: str) -> str:
-    """Send iMessage via AppleScript."""
-    recipient = "me" if target.lower() == "me" else target
-    script_lines = [
-        'tell application "Messages"',
-        "    try",
-        '        set targetService to first service whose service type is iMessage',
-        f'        set targetBuddy to buddy "{recipient}" of targetService',
-        f'        send "{body}" to targetBuddy',
-        '        return "SUCCESS"',
-        "    on error errMsg",
-        '        return "ERROR: " & errMsg',
-        "    end try",
-        "end tell",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip()
+    """Send an iMessage using argv-safe AppleScript execution."""
+    return applescript_runner.send_imessage_argv(target, body)
 
 
 # ============================================================================
