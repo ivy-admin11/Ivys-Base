@@ -926,7 +926,7 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {
-        "Authorization": f"******",
+        "Authorization": "Bearer " + active_key,
         "Content-Type": "application/json"
     }
 
@@ -1610,7 +1610,7 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
     
     except Exception as e:
         logger.error(f"Error executing job command '{canonical_job_name}': {e}")
-        return f"❌ An error occurred while starting that job. Please try again."
+        return "❌ An error occurred while starting that job. Please try again."
 
 
 # ============================================================================
