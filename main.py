@@ -1034,7 +1034,7 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
 
     try:
        logger.info("📡 OpenAI API request: %s", url)
-       response = requests.post(url, json=payload, headers=headers, timeout=30)
+       response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
         
        if response.status_code != 200:
            detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
