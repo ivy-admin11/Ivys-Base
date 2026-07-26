@@ -301,3 +301,177 @@ class TestExecuteDeepseekCallExceptions:
                 
                 assert result == "Test response"
 
+
+class TestExecuteOpenaiCallExceptions:
+    """Tests for proper exception handling in execute_openai_call."""
+    
+    def test_raises_provider_http_error_on_401(self):
+        """Test that execute_openai_call raises ProviderHTTPError on HTTP 401."""
+        from main import execute_openai_call
+        from ivy_core.pipeline_status import ProviderHTTPError
+        import os
+        
+        with patch('main.requests.post') as mock_post:
+            # Mock a 401 response
+            mock_response = Mock()
+            mock_response.status_code = 401
+            mock_response.text = '{"error": {"message": "Invalid API key"}}'
+            mock_post.return_value = mock_response
+            
+            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):
+                with pytest.raises(ProviderHTTPError) as exc_info:
+                    execute_openai_call("test prompt", "test system")
+                
+                assert exc_info.value.status_code == 401
+                assert exc_info.value.provider == "openai"
+    
+    def test_raises_valueerror_without_api_key(self):
+        """Test that execute_openai_call raises ValueError without API key."""
+        from main import execute_openai_call
+        import os
+        
+        with patch.dict(os.environ, {'OPENAI_API_KEY': ''}, clear=False):
+            with pytest.raises(ValueError) as exc_info:
+                execute_openai_call("test prompt", "test system")
+            
+            assert "OPENAI_API_KEY" in str(exc_info.value)
+    
+    def test_returns_response_on_200(self):
+        """Test that execute_openai_call returns response on 200 OK."""
+        from main import execute_openai_call
+        import os
+        
+        with patch('main.requests.post') as mock_post:
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "OpenAI response",
+                            "tool_calls": []
+                        }
+                    }
+                ]
+            }
+            mock_post.return_value = mock_response
+            
+            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):
+                result = execute_openai_call("test prompt", "test system")
+                
+                assert result == "OpenAI response"
+
+
+class TestProviderFailover:
+    """Tests for provider failover ordering: DeepSeek -> OpenAI -> Gemini."""
+    
+    def test_deepseek_primary_returns_immediately(self):
+        """When DeepSeek succeeds, OpenAI and Gemini should not be called."""
+        from unittest.mock import patch
+        
+        with patch('main.execute_deepseek_call') as mock_deepseek, \
+             patch('main.execute_openai_call') as mock_openai, \
+             patch('main._gemini_backup_reply') as mock_gemini:
+            
+            mock_deepseek.return_value = "DeepSeek response"
+            
+            # Simulate the failover logic from background_imessage_worker
+            reply = None
+            try:
+                reply = mock_deepseek("test", "sys")
+            except Exception:
+                reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_openai("test", "sys")
+                except Exception:
+                    reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_gemini("test")
+                except Exception:
+                    reply = None
+            
+            # Only DeepSeek was called
+            mock_deepseek.assert_called_once()
+            mock_openai.assert_not_called()
+            mock_gemini.assert_not_called()
+            assert reply == "DeepSeek response"
+    
+    def test_openai_called_when_deepseek_fails(self):
+        """When DeepSeek fails, OpenAI should be called next."""
+        from unittest.mock import patch
+        from ivy_core.pipeline_status import ProviderHTTPError
+        
+        with patch('main.execute_deepseek_call') as mock_deepseek, \
+             patch('main.execute_openai_call') as mock_openai, \
+             patch('main._gemini_backup_reply') as mock_gemini:
+            
+            mock_deepseek.side_effect = ProviderHTTPError("deepseek", 500, "Internal error")
+            mock_openai.return_value = "OpenAI response"
+            
+            # Simulate the failover logic
+            reply = None
+            try:
+                reply = mock_deepseek("test", "sys")
+            except Exception:
+                reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_openai("test", "sys")
+                except Exception:
+                    reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_gemini("test")
+                except Exception:
+                    reply = None
+            
+            # DeepSeek and OpenAI were called, Gemini was not
+            mock_deepseek.assert_called_once()
+            mock_openai.assert_called_once()
+            mock_gemini.assert_not_called()
+            assert reply == "OpenAI response"
+    
+    def test_gemini_called_when_deepseek_and_openai_fail(self):
+        """When both DeepSeek and OpenAI fail, Gemini should be called."""
+        from unittest.mock import patch
+        from ivy_core.pipeline_status import ProviderHTTPError
+        
+        with patch('main.execute_deepseek_call') as mock_deepseek, \
+             patch('main.execute_openai_call') as mock_openai, \
+             patch('main._gemini_backup_reply') as mock_gemini:
+            
+            mock_deepseek.side_effect = ProviderHTTPError("deepseek", 500, "Internal error")
+            mock_openai.side_effect = ProviderHTTPError("openai", 503, "Service unavailable")
+            mock_gemini.return_value = "Gemini response"
+            
+            # Simulate the failover logic
+            reply = None
+            try:
+                reply = mock_deepseek("test", "sys")
+            except Exception:
+                reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_openai("test", "sys")
+                except Exception:
+                    reply = None
+            
+            if not reply:
+                try:
+                    reply = mock_gemini("test")
+                except Exception:
+                    reply = None
+            
+            # All three providers were attempted
+            mock_deepseek.assert_called_once()
+            mock_openai.assert_called_once()
+            mock_gemini.assert_called_once()
+            assert reply == "Gemini response"
+

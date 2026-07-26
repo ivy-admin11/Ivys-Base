@@ -993,7 +993,93 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
 
 # ============================================================================
-# GEMINI BACKUP ENGINE (only reached when DeepSeek is unavailable/empty)
+# OPENAI FALLBACK ENGINE (reached when DeepSeek is unavailable)
+# ============================================================================
+
+
+def execute_openai_call(text_content: str, system_instruction: str) -> str:
+    """Execute call via OpenAI API with tool calling support.
+    
+    Raises:
+       ValueError: If OPENAI_API_KEY is not configured
+       ProviderHTTPError: If the API returns a non-200 status code
+       Exception: For other runtime errors
+    
+    Returns:
+       The response text from OpenAI, or a tool execution result.
+    """
+    from ivy_core.pipeline_status import ProviderHTTPError
+    
+    active_key = os.environ.get("OPENAI_API_KEY", "")
+    if not active_key:
+       raise ValueError("OpenAI is not configured. Set OPENAI_API_KEY environment variable.")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+       "Authorization": "Bearer " + active_key,
+       "Content-Type": "application/json"
+    }
+
+    payload = {
+       "model": "gpt-4o-mini",  # or "gpt-4o" for higher quality
+       "messages": [
+           {"role": "system", "content": system_instruction},
+           {"role": "user", "content": text_content},
+       ],
+       "tools": DEEPSEEK_TOOL_SCHEMA,  # OpenAI uses same format as DeepSeek
+       "temperature": 0.1,
+       "max_tokens": 2000,
+    }
+
+    try:
+       logger.info("📡 OpenAI API request: %s", url)
+       response = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+       if response.status_code != 200:
+           detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+           logger.error("OpenAI API error (status %d): %s", response.status_code, detail)
+           raise ProviderHTTPError(
+               provider="openai",
+               status_code=response.status_code,
+               detail=detail,
+           )
+        
+       response_json = response.json()
+        
+       # Check if tool was called
+       choice = response_json.get("choices", [{}])[0]
+       message = choice.get("message", {})
+       tool_calls = message.get("tool_calls", [])
+        
+       if tool_calls:
+           logger.info("🔧 OpenAI tool execution triggered")
+           call = tool_calls[0]
+           func_name = call.get("function", {}).get("name", "")
+           args = (
+               json.loads(call.get("function", {}).get("arguments", "{}"))
+               if call.get("function", {}).get("arguments")
+               else {}
+           )
+            
+           logger.info(
+               "OpenAI triggered tool: %s with arguments: %s",
+               func_name,
+               args,
+           )
+            
+           return _execute_tool_call(func_name, args)
+        
+       # Return text response if no tool was called
+       text_response = message.get("content", "")
+       return text_response if text_response else "No response from OpenAI."
+        
+    except Exception as e:
+       logger.error("OpenAI execution error: %s", str(e))
+       raise
+
+
+# ============================================================================
+# GEMINI BACKUP ENGINE (only reached when DeepSeek and OpenAI are unavailable)
 # ============================================================================
 
 
@@ -1705,10 +1791,22 @@ def background_imessage_worker() -> None:
                 )
                 reply = None
 
-            # ========== PHASE 2: GEMINI BACKUP (WITH CACHING) ==========
+            # ========== PHASE 2: OPENAI FALLBACK ==========
             if not reply:
                 try:
-                    logger.info("🛡️ Primary Engine Offline. Engaging Backup Core (Gemini SDK)...")
+                    logger.info("🛡️ Primary Engine Offline. Engaging OpenAI Fallback...")
+                    reply = execute_openai_call(text, deepseek_sys_instruction)
+                except Exception as openai_err:
+                    logger.error(
+                        "❌ OpenAI Fallback Layer Fault: %s. Engaging Secondary Backup (Gemini)...",
+                        str(openai_err),
+                    )
+                    reply = None
+
+            # ========== PHASE 3: GEMINI BACKUP (WITH CACHING) ==========
+            if not reply:
+                try:
+                    logger.info("🛡️ Primary and Secondary Engines Offline. Engaging Gemini Backup Core...")
                     reply = _gemini_backup_reply(text)
                 except Exception as gemini_err:
                     logger.error(
