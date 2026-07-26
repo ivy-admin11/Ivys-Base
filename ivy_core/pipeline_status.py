@@ -39,6 +39,23 @@ class PipelineStatus(str, Enum):
         )
 
 
+class ProviderHTTPError(Exception):
+    """Raised when an API returns a non-200 HTTP status (generic catch-all)."""
+    
+    def __init__(
+        self,
+        provider: str,
+        status_code: int,
+        detail: Optional[str] = None,
+    ):
+        self.provider = provider
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(
+            f"[{provider}] HTTP {status_code}" + (f": {detail}" if detail else "")
+        )
+
+
 class ProviderAuthenticationError(Exception):
     """Raised when an API returns 401 or 403 (credentials rejected)."""
     

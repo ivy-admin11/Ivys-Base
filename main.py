@@ -908,16 +908,27 @@ def run_local_applescript_send(target: str, body: str) -> str:
 
 
 def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
-    """Execute call via DeepSeek API with tool calling support."""
+    """Execute call via DeepSeek API with tool calling support.
+    
+    Raises:
+        ValueError: If DEEPSEEK_API_KEY is not configured
+        ProviderHTTPError: If the API returns a non-200 status code
+        Exception: For other runtime errors
+    
+    Returns:
+        The response text from DeepSeek, or a tool execution result.
+    """
+    from ivy_core.pipeline_status import ProviderHTTPError
+    
     active_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not active_key:
-        logger.warning("DeepSeek call attempted with no DEEPSEEK_API_KEY configured.")
-        return (
-            "DeepSeek is not configured. Please set the DEEPSEEK_API_KEY environment variable."
-        )
+        raise ValueError("DeepSeek is not configured. Set DEEPSEEK_API_KEY environment variable.")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"******",
+        "Content-Type": "application/json"
+    }
 
     payload = {
         "model": "deepseek-chat",
@@ -931,8 +942,20 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        
         if response.status_code != 200:
-            return f"❌ DeepSeek Engine Communication Fault. Status: {response.status_code}"
+            # Sanitize and truncate response body for logging (never include secrets)
+            detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+            logger.error(
+                "DeepSeek API returned %s: %s",
+                response.status_code,
+                detail,
+            )
+            raise ProviderHTTPError(
+                provider="deepseek",
+                status_code=response.status_code,
+                detail=detail,
+            )
 
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
@@ -959,8 +982,14 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
             return _execute_tool_call(func_name, args)
 
         return message_node.get("content", "").strip()
+    except ProviderHTTPError:
+        raise
+    except requests.RequestException as e:
+        logger.error("DeepSeek request failed: %s", str(e))
+        raise
     except Exception as e:
-        return f"❌ DeepSeek Execution Layer Exception: {str(e)}"
+        logger.error("DeepSeek execution error: %s", str(e))
+        raise
 
 
 # ============================================================================
@@ -1462,6 +1491,129 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 
 
 # ============================================================================
+# JOB COMMAND ROUTING (deterministic, no LLM)
+# ============================================================================
+
+import re as _re
+
+# Pattern for operational job commands (e.g., "run sharp picks", "send me happy hour")
+_JOB_COMMAND_PATTERN = _re.compile(
+    r"^\s*(?:run|send|launch|start|dispatch)\s+"
+    r"(?:me\s+)?(?:the\s+)?"
+    r"([a-z0-9\s_\-]+?)\s*$",
+    _re.IGNORECASE,
+)
+
+_JOB_ALIASES: Dict[str, str] = {
+    # Sharp Picks aliases
+    "picks": "sharp_picks",
+    "sharp picks": "sharp_picks",
+    "sharppicks": "sharp_picks",
+    "daily picks": "sharp_picks",
+    "sports picks": "sharp_picks",
+    "sports bettor": "sharp_picks",
+    "sports_bettor": "sharp_picks",
+    "my sports picks": "sharp_picks",
+    "run picks": "sharp_picks",
+    "send me sharp picks": "sharp_picks",
+    
+    # Happy Hour Scout aliases
+    "happy hour": "happy_hour",
+    "happy hour scout": "happy_hour",
+    "happy_hour_scout": "happy_hour",
+    "happy_hour scout": "happy_hour",
+    "hh scout": "happy_hour",
+    "scout": "happy_hour",
+    
+    # Familia Meal Planner aliases
+    "meals": "familia_meal_planner",
+    "meal plan": "familia_meal_planner",
+    "meal planner": "familia_meal_planner",
+    "meal planning": "familia_meal_planner",
+    "planner": "familia_meal_planner",
+    "weekly planner": "familia_meal_planner",
+    "familia": "familia_meal_planner",
+    "familia meal planner": "familia_meal_planner",
+    "familia_meal_planner": "familia_meal_planner",
+    "household meal plan": "familia_meal_planner",
+    "household meal planner": "familia_meal_planner",
+}
+
+
+def handle_job_command(text: str, sender: str) -> Optional[str]:
+    """Deterministic JOB COMMAND handler — never calls an LLM.
+
+    Returns a user-facing reply string if the text is a job command
+    (e.g., "Run sharp picks"), or None if the text is not a job command
+    (caller should proceed to LLM).
+
+    Supported commands:
+      RUN / SEND / LAUNCH / START / DISPATCH <JOB_NAME>
+      where JOB_NAME can be:
+        - picks, sharp picks, sports picks
+        - happy hour, hh scout
+        - meals, meal plan, planner, familia meal planner
+    """
+    m = _JOB_COMMAND_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    job_query = m.group(1).strip().lower()
+    
+    # Try exact alias match first
+    canonical_job_name = _JOB_ALIASES.get(job_query)
+    
+    # If no exact match, try to find a job by substring
+    if not canonical_job_name:
+        # Check if any alias contains this as a substring
+        for alias, job_name in _JOB_ALIASES.items():
+            if job_query in alias or alias in job_query:
+                canonical_job_name = job_name
+                break
+    
+    if not canonical_job_name:
+        # Not a recognized job command
+        return None
+    
+    # Dispatch the job using job_runner
+    try:
+        from job_runner import job_runner
+        status, message = job_runner.run_job(
+            canonical_job_name,
+            force=True,
+            send=True,
+            requester=sender,
+        )
+        
+        # Return a user-facing message based on the status
+        if status.name == "SUCCESS":
+            # Extract the canonical job display name
+            job_display = {
+                "sharp_picks": "Sharp Picks",
+                "happy_hour": "Happy Hour Scout",
+                "familia_meal_planner": "Familia Meal Planner",
+            }.get(canonical_job_name, canonical_job_name)
+            
+            return f"✅ {job_display} was dispatched. I'll send the report when generation and delivery complete."
+        
+        elif status.name == "ALREADY_RUNNING":
+            return "⏳ That job is already running. Please wait for it to complete."
+        
+        elif status.name == "NOT_FOUND":
+            return f"❌ Job '{canonical_job_name}' not found. Try: Run Sharp Picks, Run Happy Hour, or Run Meal Planner."
+        
+        elif status.name == "UNAVAILABLE":
+            return f"⚠️ {canonical_job_name} is currently unavailable. Please try again later."
+        
+        else:  # ERROR or other status
+            return f"❌ Could not start {canonical_job_name}. Please try again."
+    
+    except Exception as e:
+        logger.error(f"Error executing job command '{canonical_job_name}': {e}")
+        return f"❌ An error occurred while starting that job. Please try again."
+
+
+# ============================================================================
 # BACKGROUND IMESSAGE WORKER: DeepSeek Primary + Gemini Backup with CACHING
 # ============================================================================
 
@@ -1535,6 +1687,13 @@ def background_imessage_worker() -> None:
                 consecutive_failures = 0
                 continue
 
+            # ========== JOB COMMAND ROUTING (deterministic, no LLM) ==========
+            job_reply = handle_job_command(text, sender)
+            if job_reply is not None:
+                run_local_applescript_send(sender, job_reply)
+                consecutive_failures = 0
+                continue
+
             # ========== PHASE 1: DEEPSEEK PRIMARY ==========
             try:
                 logger.info("🧠 Querying Primary Engine (DeepSeek)...")
@@ -1565,7 +1724,13 @@ def background_imessage_worker() -> None:
                 logger.info("📤 Clean prose payload dispatched back via local AppleScript link.")
                 run_local_applescript_send(sender, str(reply))
             else:
-                logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
+                # All providers failed — send a friendly message instead of exposing internal errors
+                fallback_msg = (
+                    "Ivy's conversation engines are temporarily unavailable. "
+                    "Local commands such as 'Run Sharp Picks' still work."
+                )
+                logger.warning("❌ Both Primary and Backup layers produced no usable reply. Sending fallback.")
+                run_local_applescript_send(sender, fallback_msg)
 
             consecutive_failures = 0
 
