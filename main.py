@@ -778,7 +778,8 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"DeepSeek Engine Communication Fault: {e}") from e
+        logger.error("DeepSeek Engine Communication Fault: network error: %s", e)
+        raise RuntimeError("DeepSeek Engine Communication Fault: network error") from e
 
     if response.status_code != 200:
         logger.error(
@@ -792,7 +793,8 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
     except (ValueError, KeyError, IndexError) as e:
-        raise RuntimeError(f"DeepSeek Engine Communication Fault: malformed response ({e})") from e
+        logger.error("DeepSeek Engine Communication Fault: malformed response: %s", e)
+        raise RuntimeError("DeepSeek Engine Communication Fault: malformed response") from e
 
     # Check if DeepSeek triggered tool execution — dispatched through the
     # same TOOL_HANDLERS registry Gemini uses, so DeepSeek can execute

@@ -678,7 +678,7 @@ class TestDeepSeekPrimaryRouting:
         assert reply == "gemini backup"
         assert call_order == ["deepseek_fail", "gemini"]
 
-    def test_non_200_status_raises_instead_of_returning_error_string(self, monkeypatch):
+    def test_deepseek_non_200_raises_runtime_error(self, monkeypatch):
         """A DeepSeek HTTP failure (e.g. 400) must raise so callers' try/except
         failover to Gemini engages, instead of returning a truthy error
         string ("❌ DeepSeek Engine Communication Fault...") that used to get
