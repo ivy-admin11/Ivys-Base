@@ -36,6 +36,7 @@ import sqlite3
 import threading
 import logging
 import json
+import re
 import requests
 import subprocess
 import atexit
@@ -1021,7 +1022,7 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
     }
 
     payload = {
-       "model": "gpt-4o-mini",  # or "gpt-4o" for higher quality
+       "model": "gpt-4o-mini",
        "messages": [
            {"role": "system", "content": system_instruction},
            {"role": "user", "content": text_content},
@@ -1484,12 +1485,10 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 # RESEND COMMAND HANDLER
 # ============================================================================
 
-import re as _re
-
-_RESEND_PATTERN = _re.compile(
+_RESEND_PATTERN = re.compile(
     r"^\s*resend\s+"
     r"(picks|sharp\s+picks|happy\s+hour|meal\s+plan|[A-Z]{2}-\d{8}-\d{4}(?::\d{2})?)\s*$",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 _RESEND_ALIASES: Dict[str, str] = {
@@ -1533,7 +1532,7 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
     report_id: Optional[str] = None
 
     # Is this an explicit report ID (e.g. SP-20260719-1430)?
-    if _re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, _re.IGNORECASE):
+    if re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, re.IGNORECASE):
         report_id = target.upper()
         job_name = _outbox.job_name_for_report_id(report_id)
         if not job_name:
@@ -1580,14 +1579,12 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 # JOB COMMAND ROUTING (deterministic, no LLM)
 # ============================================================================
 
-import re as _re
-
 # Pattern for operational job commands (e.g., "run sharp picks", "send me happy hour")
-_JOB_COMMAND_PATTERN = _re.compile(
+_JOB_COMMAND_PATTERN = re.compile(
     r"^\s*(?:run|send|launch|start|dispatch)\s+"
     r"(?:me\s+)?(?:the\s+)?"
     r"([a-z0-9\s_\-]+?)\s*$",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 _JOB_ALIASES: Dict[str, str] = {
@@ -1695,7 +1692,7 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
             return f"❌ Could not start {canonical_job_name}. Please try again."
     
     except Exception as e:
-        logger.error(f"Error executing job command '{canonical_job_name}': {e}")
+        logger.error("Error executing job command '%s': %s", canonical_job_name, e)
         return "❌ An error occurred while starting that job. Please try again."
 
 
