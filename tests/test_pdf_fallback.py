@@ -677,3 +677,30 @@ class TestDeepSeekPrimaryRouting:
 
         assert reply == "gemini backup"
         assert call_order == ["deepseek_fail", "gemini"]
+
+    def test_non_200_status_raises_instead_of_returning_error_string(self, monkeypatch):
+        """A DeepSeek HTTP failure (e.g. 400) must raise so callers' try/except
+        failover to Gemini engages, instead of returning a truthy error
+        string ("❌ DeepSeek Engine Communication Fault...") that used to get
+        forwarded straight to the user as if it were a real reply."""
+        import main
+
+        fake_response = MagicMock()
+        fake_response.status_code = 400
+        fake_response.text = '{"error": "bad request"}'
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key-not-real")
+        monkeypatch.setattr(main.requests, "post", lambda *a, **k: fake_response)
+
+        with pytest.raises(RuntimeError, match="400"):
+            main.execute_deepseek_call("hi", "sys")
+
+    def test_missing_api_key_raises(self, monkeypatch):
+        """Missing DEEPSEEK_API_KEY must also raise (not return a string) so
+        the Gemini failover path engages."""
+        import main
+
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+        with pytest.raises(RuntimeError):
+            main.execute_deepseek_call("hi", "sys")
