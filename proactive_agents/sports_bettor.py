@@ -1,6 +1,7 @@
 #!/Users/lexi/openclaw-admin/.venv/bin/python
 import sys
 import os
+from pathlib import Path
 
 # Dynamically calculate the project root so the version-controlled ivy_core
 # package resolves regardless of CWD.
@@ -8,16 +9,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Native .env auto-loader (mirrors main.py) so this agent works standalone —
-# anchored to PROJECT_ROOT, not the CWD, and never clobbers vars already
-# exported in the shell. Lets require_env() see XAI_API_KEY without `source`.
-_ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
-if os.path.exists(_ENV_PATH):
-    with open(_ENV_PATH, "r") as _f:
-        for _line in _f:
-            if "=" in _line and not _line.strip().startswith("#"):
-                _k, _v = _line.strip().split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+# Load .env file using dotenv (if it exists) before any env-dependent imports.
+# Use override=False so variables already exported by the shell or launchd win.
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(PROJECT_ROOT) / ".env", override=False)
 """
 Sports bettor — sharp picks sourced from X, priced against live Vegas odds.
 
