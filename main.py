@@ -49,8 +49,6 @@ from pydantic import BaseModel
 from config import (
     POLLING_INTERVAL,
     DB_TIMEOUT,
-    DB_RETRY_ATTEMPTS,
-    DB_RETRY_BACKOFF,
     CHAT_DB_PATH,
     EXTERNAL_API_TIMEOUT,
     ENABLE_IMESSAGE_POLLER,
@@ -751,13 +749,18 @@ def run_local_applescript_send(target: str, body: str) -> str:
 
 
 def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
-    """Execute call via DeepSeek API with tool calling support."""
+    """Execute call via DeepSeek API with tool calling support.
+
+    Raises on any provider failure (missing key, non-200 status, network
+    error, malformed response) instead of returning an error string. Every
+    caller wraps this in try/except and falls back to Gemini on exception —
+    swallowing failures into a truthy string here (as this used to do)
+    silently defeated that failover and forwarded the raw
+    "DeepSeek Engine Communication Fault" text straight to the user.
+    """
     active_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not active_key:
-        logger.warning("DeepSeek call attempted with no DEEPSEEK_API_KEY configured.")
-        return (
-            "DeepSeek is not configured. Please set the DEEPSEEK_API_KEY environment variable."
-        )
+        raise RuntimeError("DeepSeek is not configured: DEEPSEEK_API_KEY missing from environment.")
 
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
@@ -774,36 +777,47 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
-        if response.status_code != 200:
-            return f"❌ DeepSeek Engine Communication Fault. Status: {response.status_code}"
+    except requests.exceptions.RequestException as e:
+        logger.error("DeepSeek Engine Communication Fault: network error: %s", e)
+        raise RuntimeError("DeepSeek Engine Communication Fault: network error") from e
 
+    if response.status_code != 200:
+        logger.error(
+            "DeepSeek Engine Communication Fault. Status: %s. Body: %s",
+            response.status_code,
+            response.text[:500],
+        )
+        raise RuntimeError(f"DeepSeek Engine Communication Fault. Status: {response.status_code}")
+
+    try:
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
+    except (ValueError, KeyError, IndexError) as e:
+        logger.error("DeepSeek Engine Communication Fault: malformed response: %s", e)
+        raise RuntimeError("DeepSeek Engine Communication Fault: malformed response") from e
 
-        # Check if DeepSeek triggered tool execution — dispatched through the
-        # same TOOL_HANDLERS registry Gemini uses, so DeepSeek can execute
-        # every registered tool (including run_job, which it previously
-        # could request via its schema but never actually got dispatched).
-        if "tool_calls" in message_node and message_node["tool_calls"]:
-            call = message_node["tool_calls"][0]
-            func_name = call["function"]["name"]
-            args = (
-                json.loads(call["function"].get("arguments", "{}"))
-                if call["function"].get("arguments")
-                else {}
-            )
+    # Check if DeepSeek triggered tool execution — dispatched through the
+    # same TOOL_HANDLERS registry Gemini uses, so DeepSeek can execute
+    # every registered tool (including run_job, which it previously
+    # could request via its schema but never actually got dispatched).
+    if "tool_calls" in message_node and message_node["tool_calls"]:
+        call = message_node["tool_calls"][0]
+        func_name = call["function"]["name"]
+        args = (
+            json.loads(call["function"].get("arguments", "{}"))
+            if call["function"].get("arguments")
+            else {}
+        )
 
-            logger.info(
-                "DeepSeek Core triggered native tool: %s with arguments: %s",
-                func_name,
-                args,
-            )
+        logger.info(
+            "DeepSeek Core triggered native tool: %s with arguments: %s",
+            func_name,
+            args,
+        )
 
-            return _execute_tool_call(func_name, args)
+        return _execute_tool_call(func_name, args)
 
-        return message_node.get("content", "").strip()
-    except Exception as e:
-        return f"❌ DeepSeek Execution Layer Exception: {str(e)}"
+    return message_node.get("content", "").strip()
 
 
 # ============================================================================
