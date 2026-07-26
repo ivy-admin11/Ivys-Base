@@ -946,16 +946,16 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         
         if response.status_code != 200:
             # Sanitize and truncate response body for logging (never include secrets)
-            detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
+            sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
             logger.error(
                 "DeepSeek API returned %s: %s",
                 response.status_code,
-                detail,
+                sanitized_response,
             )
             raise ProviderHTTPError(
                 provider="deepseek",
                 status_code=response.status_code,
-                detail=detail,
+                detail=sanitized_response,
             )
 
         res_data = response.json()
@@ -1037,12 +1037,12 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
        response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
         
        if response.status_code != 200:
-           detail = response.text[:500] if response.text else f"HTTP {response.status_code}"
-           logger.error("OpenAI API error (status %d): %s", response.status_code, detail)
+           sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
+           logger.error("OpenAI API error (status %d): %s", response.status_code, sanitized_response)
            raise ProviderHTTPError(
                provider="openai",
                status_code=response.status_code,
-               detail=detail,
+               detail=sanitized_response,
            )
         
        response_json = response.json()
@@ -1660,7 +1660,7 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
     
     # Dispatch the job using job_runner
     try:
-        from job_runner import job_runner
+        from job_runner import job_runner, JobStatus
         status, message = job_runner.run_job(
             canonical_job_name,
             force=True,
@@ -1669,7 +1669,7 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
         )
         
         # Return a user-facing message based on the status
-        if status.name == "SUCCESS":
+        if status == JobStatus.SUCCESS:
             # Extract the canonical job display name
             job_display = {
                 "sharp_picks": "Sharp Picks",
@@ -1679,13 +1679,13 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
             
             return f"✅ {job_display} was dispatched. I'll send the report when generation and delivery complete."
         
-        elif status.name == "ALREADY_RUNNING":
+        elif status == JobStatus.ALREADY_RUNNING:
             return "⏳ That job is already running. Please wait for it to complete."
         
-        elif status.name == "NOT_FOUND":
+        elif status == JobStatus.NOT_FOUND:
             return f"❌ Job '{canonical_job_name}' not found. Try: Run Sharp Picks, Run Happy Hour, or Run Meal Planner."
         
-        elif status.name == "UNAVAILABLE":
+        elif status == JobStatus.UNAVAILABLE:
             return f"⚠️ {canonical_job_name} is currently unavailable. Please try again later."
         
         else:  # ERROR or other status
