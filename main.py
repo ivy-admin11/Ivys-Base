@@ -763,7 +763,7 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         raise RuntimeError("DeepSeek is not configured: DEEPSEEK_API_KEY missing from environment.")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {"Authorization": "Bearer " + active_key, "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
 
     payload = {
         "model": "deepseek-chat",
