@@ -201,7 +201,8 @@ class TestHandleJobCommandVariants:
             
             # Most variants should be recognized, but some might not match the pattern
             if result is not None:
-                assert "Started" in str(mock_runner.run_job.return_value) or result
+                # Verify that the result contains expected status message elements
+                assert "dispatched" in result.lower() or "running" in result.lower() or "failed" in result.lower()
     
     @pytest.mark.parametrize("command", [
         "run happy hour",
@@ -214,12 +215,13 @@ class TestHandleJobCommandVariants:
         """Test various aliases and formulations for Happy Hour Scout."""
         with patch('job_runner.job_runner') as mock_runner:
             mock_runner.run_job.return_value = (JobStatus.SUCCESS, "Started")
-            
+             
             result = handle_job_command(command, "+15551234567")
-            
+             
             # Some variants should be recognized
             if result is not None:
-                assert "Started" in str(mock_runner.run_job.return_value) or result
+                # Verify that the result contains expected status message elements
+                assert "dispatched" in result.lower() or "running" in result.lower() or "failed" in result.lower()
     
     @pytest.mark.parametrize("command", [
         "run meals",
@@ -234,12 +236,13 @@ class TestHandleJobCommandVariants:
         """Test various aliases and formulations for Familia Meal Planner."""
         with patch('job_runner.job_runner') as mock_runner:
             mock_runner.run_job.return_value = (JobStatus.SUCCESS, "Started")
-            
+             
             result = handle_job_command(command, "+15551234567")
-            
+             
             # Some variants should be recognized
             if result is not None:
-                assert "Started" in str(mock_runner.run_job.return_value) or result
+                # Verify that the result contains expected status message elements
+                assert "dispatched" in result.lower() or "running" in result.lower() or "failed" in result.lower()
 
 
 class TestExecuteDeepseekCallExceptions:

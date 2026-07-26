@@ -1017,8 +1017,8 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
-       "Authorization": "Bearer " + active_key,
-       "Content-Type": "application/json"
+        "Authorization": "Bearer " + active_key,
+        "Content-Type": "application/json"
     }
 
     payload = {
