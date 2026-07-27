@@ -119,7 +119,7 @@ def test_fetch_live_odds_raises_retryable_error_when_mixed_failures(monkeypatch)
         def __enter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, tb):
+        def __exit__(self, exc_type, exc, traceback):
             return False
 
         def submit(self, _fn, *_args, **_kwargs):

@@ -1024,7 +1024,6 @@ def init_chat_db():
             logger.info("✅ Persistent chat.db connection established")
             return _CHAT_DB_CONN
         except Exception as e:
-            _CHAT_DB_CONN = None
             logger.error("Failed to initialize chat.db connection: %s", e)
             return None
 
