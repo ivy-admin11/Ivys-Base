@@ -49,7 +49,6 @@ from ivy_core.report_fallback import (
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
 from picks_formatter import PicksReportFormatter
-from config import HENRY_PHONE, LEXI_PHONE  # required env vars — raise at startup if unset
 
 logger = logging.getLogger("ivy.familia_meal_planner")
 
@@ -82,10 +81,10 @@ MEAL_PLAN_CONFIG = {
     ],
 }
 
-# Alert recipients — values come from required env vars
+# Alert recipients
 ALERT_RECIPIENTS = {
-    "henry": HENRY_PHONE,
-    "lexi": LEXI_PHONE,
+    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
+    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
 }
 
 # Initialize state threshold: July 15, 2026 8am America/Chicago (handles DST

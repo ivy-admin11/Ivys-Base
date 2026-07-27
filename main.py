@@ -49,6 +49,8 @@ from pydantic import BaseModel
 from config import (
     POLLING_INTERVAL,
     DB_TIMEOUT,
+    DB_RETRY_ATTEMPTS,
+    DB_RETRY_BACKOFF,
     CHAT_DB_PATH,
     EXTERNAL_API_TIMEOUT,
     ENABLE_IMESSAGE_POLLER,

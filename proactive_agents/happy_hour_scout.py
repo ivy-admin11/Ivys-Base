@@ -47,7 +47,6 @@ from ivy_core.report_fallback import (
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
 from picks_formatter import PicksReportFormatter
-from config import HENRY_PHONE, LEXI_PHONE  # required env vars — raise at startup if unset
 
 logger = logging.getLogger("ivy.happy_hour_scout")
 
@@ -75,10 +74,10 @@ SCOUT_TARGET = {
     ],
 }
 
-# Alert recipients — values come from required env vars
+# Default alert recipients (pulled from environment or fallback)
 ALERT_RECIPIENTS = {
-    "henry": HENRY_PHONE,
-    "lexi": LEXI_PHONE,
+    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
+    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
 }
 
 # ============================================================================
