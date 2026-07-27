@@ -104,7 +104,7 @@ def send_alert(alert_text: str) -> bool:
         logger.error("❌ send_imessage not available")
         return False
 
-    henry_phone = HENRY_PHONE or os.environ.get("HENRY_PHONE", "+12147334061")
+    henry_phone = HENRY_PHONE
 
     logger.info(f"📱 Sending capabilities alert to Henry ({henry_phone})...")
 
