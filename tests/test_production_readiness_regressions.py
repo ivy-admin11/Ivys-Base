@@ -10,7 +10,7 @@ from proactive_agents import sports_bettor
 
 def _reset_favorites_cache() -> None:
     main._FAVORITES_CACHE["contacts"] = []
-    main._FAVORITES_CACHE["mtime"] = 0.0
+    main._FAVORITES_CACHE["mtime_ns"] = None
 
 
 def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatch):
@@ -128,7 +128,7 @@ def test_fetch_live_odds_raises_retryable_error_when_mixed_failures(monkeypatch)
     monkeypatch.setattr(sports_bettor, "ODDS_API_KEY", "test-key")
     monkeypatch.setattr(sports_bettor, "ODDS_SPORT_KEYS", {"NFL": "nfl", "MLB": "mlb"})
     monkeypatch.setattr(sports_bettor, "ThreadPoolExecutor", FakeExecutor)
-    monkeypatch.setattr(sports_bettor, "as_completed", lambda futures: list(futures.keys()))
+    monkeypatch.setattr(sports_bettor, "as_completed", lambda futures: list(futures))
 
     with pytest.raises(RetryableProviderError):
         sports_bettor.fetch_live_odds()

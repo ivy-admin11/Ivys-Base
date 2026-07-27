@@ -277,7 +277,7 @@ _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health po
 # Favorites list cache — reload only when file changes
 _FAVORITES_CACHE = {
     "contacts": [],
-    "mtime": 0.0,
+    "mtime_ns": None,
 }
 _FAVORITES_CACHE_LOCK = threading.RLock()
 
@@ -963,15 +963,15 @@ def load_favorites_cached() -> List[str]:
     with _FAVORITES_CACHE_LOCK:
         try:
             stat = os.stat(favorites_path)
-            current_mtime = stat.st_mtime
+            current_mtime_ns = stat.st_mtime_ns
         except OSError:
             # File doesn't exist or is unreadable
             _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["mtime_ns"] = None
             return []
 
         # If file hasn't changed since last load, return cached
-        if current_mtime == _FAVORITES_CACHE["mtime"]:
+        if current_mtime_ns == _FAVORITES_CACHE["mtime_ns"]:
             return _cached_favorites_contacts()
 
         # File is new or modified; reload
@@ -979,13 +979,13 @@ def load_favorites_cached() -> List[str]:
             with open(favorites_path, "r") as f:
                 contacts = json.load(f)
             _FAVORITES_CACHE["contacts"] = contacts if isinstance(contacts, list) else []
-            _FAVORITES_CACHE["mtime"] = current_mtime
+            _FAVORITES_CACHE["mtime_ns"] = current_mtime_ns
             logger.debug("Reloaded favorites.json (%d contacts)", len(_FAVORITES_CACHE["contacts"]))
             return _cached_favorites_contacts()
         except Exception as e:
             logger.warning("Failed to parse favorites.json: %s", e)
             _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["mtime_ns"] = None
             return []
 
 
