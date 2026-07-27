@@ -181,7 +181,7 @@ def _fetch_league_odds_task(league: str, sport_key: str, frm: str, to: str) -> T
             provider="odds_api",
             status_code=r.status_code,
             message=f"Odds API credentials were rejected (HTTP {r.status_code})",
-            endpoint=r.url,
+            endpoint=f"/v4/sports/{sport_key}/odds",
         )
     
     # Handle rate limiting and server errors (retryable)
@@ -285,8 +285,15 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
                 )))
                 print(f"⚠️  {league} connection failed")
             except Exception as e:
-                print(f"⚠️  Odds fetch failed for {league}: {e}")
-                retryable_errors.append((league, e))
+                print(f"⚠️  Odds fetch failed for {league} ({type(e).__name__})")
+                retryable_errors.append((
+                    league,
+                    ProviderUnavailableError(
+                        provider="odds_api",
+                        message=f"Odds API unexpected failure for {league}",
+                        cause=e,
+                    ),
+                ))
 
     # If auth error occurred, raise immediately
     if auth_error:
