@@ -291,6 +291,12 @@ def _cached_favorites_contacts() -> List[str]:
     return list(_FAVORITES_CACHE["contacts"])
 
 
+def _clear_favorites_cache() -> None:
+    """Reset the favorites cache to an uninitialized state."""
+    _FAVORITES_CACHE["contacts"] = []
+    _FAVORITES_CACHE["mtime_ns"] = -1
+
+
 def _db_retry_backoff(attempt: int) -> float:
     """Return the exponential backoff delay for chat.db retries."""
     return DB_RETRY_BACKOFF * (2 ** attempt)
@@ -971,8 +977,7 @@ def load_favorites_cached() -> List[str]:
             current_mtime_ns = stat.st_mtime_ns
         except OSError:
             # File doesn't exist or is unreadable
-            _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime_ns"] = -1
+            _clear_favorites_cache()
             return []
 
         # If file hasn't changed since last load, return cached
@@ -989,8 +994,7 @@ def load_favorites_cached() -> List[str]:
             return _cached_favorites_contacts()
         except Exception as e:
             logger.warning("Failed to parse favorites.json: %s", e)
-            _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime_ns"] = -1
+            _clear_favorites_cache()
             return []
 
 
@@ -999,10 +1003,10 @@ def close_chat_db_connection() -> None:
     global _CHAT_DB_CONN
 
     with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN is None:
+            return
         conn = _CHAT_DB_CONN
         _CHAT_DB_CONN = None
-        if conn is None:
-            return
         try:
             conn.close()
             logger.info("Closed cached chat.db connection")
