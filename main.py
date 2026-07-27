@@ -49,6 +49,8 @@ from pydantic import BaseModel
 from config import (
     POLLING_INTERVAL,
     DB_TIMEOUT,
+    DB_RETRY_ATTEMPTS,
+    DB_RETRY_BACKOFF,
     CHAT_DB_PATH,
     EXTERNAL_API_TIMEOUT,
     ENABLE_IMESSAGE_POLLER,
@@ -276,7 +278,9 @@ _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health po
 _FAVORITES_CACHE = {
     "contacts": [],
     "mtime": 0.0,
+    "loaded": False,
 }
+_FAVORITES_CACHE_LOCK = threading.RLock()
 
 # Persistent chat.db connection — reuse for all polls
 _CHAT_DB_CONN = None
@@ -956,24 +960,48 @@ def load_favorites_cached() -> List[str]:
         current_mtime = stat.st_mtime
     except OSError:
         # File doesn't exist or is unreadable
+        with _FAVORITES_CACHE_LOCK:
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["loaded"] = False
         return []
-    
-    # If file hasn't changed since last load, return cached
-    if (current_mtime == _FAVORITES_CACHE["mtime"] and 
-        _FAVORITES_CACHE["contacts"]):
-        return _FAVORITES_CACHE["contacts"]
-    
-    # File is new or modified; reload
-    try:
-        with open(favorites_path, "r") as f:
-            contacts = json.load(f)
-        _FAVORITES_CACHE["contacts"] = contacts if isinstance(contacts, list) else []
-        _FAVORITES_CACHE["mtime"] = current_mtime
-        logger.debug("Reloaded favorites.json (%d contacts)", len(_FAVORITES_CACHE["contacts"]))
-        return _FAVORITES_CACHE["contacts"]
-    except Exception as e:
-        logger.warning("Failed to parse favorites.json: %s", e)
-        return []
+
+    with _FAVORITES_CACHE_LOCK:
+        # If file hasn't changed since last load, return a defensive copy.
+        if current_mtime == _FAVORITES_CACHE["mtime"] and _FAVORITES_CACHE["loaded"]:
+            return list(_FAVORITES_CACHE["contacts"])
+
+        # File is new or modified; reload and normalize.
+        try:
+            with open(favorites_path, "r", encoding="utf-8") as f:
+                contacts = json.load(f)
+            if isinstance(contacts, list):
+                normalized = []
+                skipped = 0
+                for contact in contacts:
+                    if isinstance(contact, str):
+                        stripped = contact.strip()
+                        if stripped:
+                            normalized.append(stripped)
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+                if skipped:
+                    logger.debug("Skipped %d invalid/empty entries in favorites.json", skipped)
+            else:
+                normalized = []
+            _FAVORITES_CACHE["contacts"] = normalized
+            _FAVORITES_CACHE["mtime"] = current_mtime
+            _FAVORITES_CACHE["loaded"] = True
+            logger.debug("Reloaded favorites.json (%d contacts)", len(normalized))
+            return list(normalized)
+        except Exception as e:
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["loaded"] = False
+            logger.warning("Failed to parse favorites.json: %s", e)
+            return []
 
 
 def init_chat_db():
@@ -982,61 +1010,107 @@ def init_chat_db():
     🚀 Performance: Reuses connection across polls (80-150ms saved per poll)
     """
     global _CHAT_DB_CONN
-    if _CHAT_DB_CONN:
-        return _CHAT_DB_CONN
-    try:
-        _CHAT_DB_CONN = sqlite3.connect(
-            f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
-            uri=True,
-            timeout=DB_TIMEOUT,
-            check_same_thread=False,  # Safe with RLock
-        )
-        logger.info("✅ Persistent chat.db connection established")
-        return _CHAT_DB_CONN
-    except Exception as e:
-        logger.error("Failed to initialize chat.db connection: %s", e)
-        return None
+    with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN:
+            return _CHAT_DB_CONN
+        try:
+            _CHAT_DB_CONN = sqlite3.connect(
+                f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
+                uri=True,
+                timeout=DB_TIMEOUT,
+                check_same_thread=False,  # Safe with RLock
+            )
+            logger.info("✅ Persistent chat.db connection established")
+            return _CHAT_DB_CONN
+        except Exception as e:
+            logger.error("Failed to initialize chat.db connection: %s", e)
+            return None
+
+
+def _reset_chat_db_connection() -> None:
+    """Reset stale chat.db connection so the next read can reopen it."""
+    global _CHAT_DB_CONN
+    with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN:
+            try:
+                _CHAT_DB_CONN.close()
+            except Exception:
+                pass
+            _CHAT_DB_CONN = None
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Return exponential backoff delay for sqlite retries (zero-indexed attempt)."""
+    return DB_RETRY_BACKOFF * (2 ** attempt)
 
 
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
     """Fetch next message from chat.db with persistent connection (optimized)."""
-    conn = init_chat_db()
-    if not conn:
-        return None
-    
-    try:
-        with _CHAT_DB_LOCK:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
-                FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-                WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
-                ORDER BY m.ROWID ASC LIMIT 1
-                """,
-                (last_id,),
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        conn = init_chat_db()
+        if not conn:
+            return None
+
+        try:
+            with _CHAT_DB_LOCK:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
+                    FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
+                    WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
+                    ORDER BY m.ROWID ASC LIMIT 1
+                    """,
+                    (last_id,),
+                )
+                return cursor.fetchone()
+        except sqlite3.OperationalError as e:
+            backoff = _retry_backoff_seconds(attempt)
+            logger.warning(
+                "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
+                attempt + 1,
+                e,
+                backoff,
             )
-            return cursor.fetchone()
-    except sqlite3.OperationalError as e:
-        logger.warning("Database query failed: %s", e)
-        return None
+            _reset_chat_db_connection()
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                time.sleep(backoff)
+        except sqlite3.Error as e:
+            logger.warning("Database read failed with sqlite error: %s", e)
+            _reset_chat_db_connection()
+            return None
+    return None
 
 
 def get_last_message_id() -> Optional[int]:
     """Get the highest ROWID from the message table (optimized with persistent connection)."""
-    conn = init_chat_db()
-    if not conn:
-        return None
-    
-    try:
-        with _CHAT_DB_LOCK:
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(ROWID) FROM message")
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else 0
-    except Exception as e:
-        logger.warning("Failed to get last message ID: %s", e)
-        return None
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        conn = init_chat_db()
+        if not conn:
+            return None
+
+        try:
+            with _CHAT_DB_LOCK:
+                cursor = conn.cursor()
+                cursor.execute("SELECT MAX(ROWID) FROM message")
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else 0
+        except sqlite3.OperationalError as e:
+            backoff = _retry_backoff_seconds(attempt)
+            logger.warning(
+                "Last message ID read attempt %d failed: %s. Retrying in %.1f seconds...",
+                attempt + 1,
+                e,
+                backoff,
+            )
+            _reset_chat_db_connection()
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                time.sleep(backoff)
+        except sqlite3.Error as e:
+            logger.warning("Failed to get last message ID: %s", e)
+            _reset_chat_db_connection()
+            return None
+    return None
 
 
 
