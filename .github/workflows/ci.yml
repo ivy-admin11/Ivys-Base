@@ -42,6 +42,13 @@ jobs:
           fi
           echo "No tracked secret files found."
 
+      - name: detect-secrets (diff scan against baseline)
+        run: |
+          pip install detect-secrets -q
+          # Fail if any secret-shaped string appears in the PR diff that is NOT in the audited baseline.
+          detect-secrets scan --baseline .secrets.baseline --all-files
+          echo "detect-secrets: no new secrets found."
+
       - name: Ruff
         run: ruff check .
 
