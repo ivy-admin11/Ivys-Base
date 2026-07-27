@@ -296,6 +296,8 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
     # retryable error rather than whichever failure happened to land first.
     # Keep the per-league tuples for logging/debugging above; only the actual
     # retryable exception object matters when surfacing a retry signal here.
+    # This avoids the original bug where a non-retryable first error could mask
+    # a retryable failure that arrived later in the parallel sweep.
     retryable_only = [error for _league, error in retryable_errors if isinstance(error, RetryableProviderError)]
     if retryable_only:
         raise retryable_only[0]

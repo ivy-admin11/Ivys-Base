@@ -466,6 +466,7 @@ app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", life
 
 PROCESS_STARTED_AT = datetime.now()
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+FAVORITES_FILENAME = "favorites.json"
 
 # ============================================================================
 # SECURITY: Authentication Middleware
@@ -969,7 +970,7 @@ def load_favorites_cached() -> List[str]:
     
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
-    favorites_path = os.path.join(PROJECT_ROOT_DIR, "favorites.json")
+    favorites_path = os.path.join(PROJECT_ROOT_DIR, FAVORITES_FILENAME)
 
     with _FAVORITES_CACHE_LOCK:
         try:
