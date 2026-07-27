@@ -35,7 +35,12 @@ def test_admin_secret_fails_closed_when_unset(tmp_path):
 
 def test_admin_secret_escape_hatch_allows_import(tmp_path):
     isolated_dir = _isolated_config_dir(tmp_path)
-    env = {"PATH": os.environ.get("PATH", ""), "ALLOW_INSECURE_ADMIN_SECRET": "true"}
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ALLOW_INSECURE_ADMIN_SECRET": "true",
+        "HENRY_PHONE": "+15555550100",
+        "LEXI_PHONE": "+15555550101",
+    }
     result = subprocess.run(
         [sys.executable, "-c", "import config; print(config.ADMIN_SECRET)"],
         cwd=str(isolated_dir),
@@ -67,6 +72,8 @@ def test_optional_keys_do_not_raise_when_missing():
     env = {
         "PATH": os.environ.get("PATH", ""),
         "ADMIN_SECRET": "x",
+        "HENRY_PHONE": "+15555550100",
+        "LEXI_PHONE": "+15555550101",
         "GEMINI_API_KEY": "",
         "DEEPSEEK_API_KEY": "",
         "XAI_API_KEY": "",
