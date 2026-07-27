@@ -26,13 +26,13 @@ def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatc
     open_calls = 0
     original_open = builtins.open
 
-    def counted_open(path, *args, **kwargs):
+    def track_favorites_open(path, *args, **kwargs):
         nonlocal open_calls
         if str(path) == str(favorites_path):
             open_calls += 1
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "open", counted_open)
+    monkeypatch.setattr(builtins, "open", track_favorites_open)
 
     assert main.load_favorites_cached() == ["+15555550123"]
     assert main.load_favorites_cached() == ["+15555550123"]

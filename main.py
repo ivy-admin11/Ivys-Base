@@ -286,6 +286,11 @@ _CHAT_DB_CONN = None
 _CHAT_DB_LOCK = threading.RLock()
 
 
+def _cached_favorites_contacts() -> List[str]:
+    """Return a defensive copy of the cached favorites list."""
+    return list(_FAVORITES_CACHE["contacts"])
+
+
 def _probe_deepseek() -> Dict[str, Any]:
     """Make a minimal (~1-token) HTTP call to DeepSeek and map the result to
     {configured, authenticated, reachable, role, status, reason}."""
@@ -967,7 +972,7 @@ def load_favorites_cached() -> List[str]:
 
         # If file hasn't changed since last load, return cached
         if current_mtime == _FAVORITES_CACHE["mtime"]:
-            return list(_FAVORITES_CACHE["contacts"])
+            return _cached_favorites_contacts()
 
         # File is new or modified; reload
         try:
@@ -976,7 +981,7 @@ def load_favorites_cached() -> List[str]:
             _FAVORITES_CACHE["contacts"] = contacts if isinstance(contacts, list) else []
             _FAVORITES_CACHE["mtime"] = current_mtime
             logger.debug("Reloaded favorites.json (%d contacts)", len(_FAVORITES_CACHE["contacts"]))
-            return list(_FAVORITES_CACHE["contacts"])
+            return _cached_favorites_contacts()
         except Exception as e:
             logger.warning("Failed to parse favorites.json: %s", e)
             _FAVORITES_CACHE["contacts"] = []
@@ -991,15 +996,13 @@ def close_chat_db_connection() -> None:
     with _CHAT_DB_LOCK:
         conn = _CHAT_DB_CONN
         _CHAT_DB_CONN = None
-
-    if conn is None:
-        return
-
-    try:
-        conn.close()
-        logger.info("Closed cached chat.db connection")
-    except Exception as e:
-        logger.warning("Failed to close cached chat.db connection: %s", e)
+        if conn is None:
+            return
+        try:
+            conn.close()
+            logger.info("Closed cached chat.db connection")
+        except Exception as e:
+            logger.warning("Failed to close cached chat.db connection: %s", e)
 
 
 def init_chat_db():
