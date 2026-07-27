@@ -66,45 +66,42 @@ def _init_db():
 def save_picks(picks: List[Dict], report_date: str):
     """Save a batch of picks from a report to SQLite and Google Sheets."""
     _init_db()
-    conn = sqlite3.connect(PICKS_DB)
-    cursor = conn.cursor()
-    
-    for pick in picks:
-        # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
-        start_time = pick.get("start_time") or pick.get("start")
-        handicappers = pick.get("handicappers") or pick.get("handicapper")
-        
-        # Count the number of sharps backing this pick
-        if isinstance(handicappers, list):
-            sharp_count = len(handicappers)
-            handicapper = ", ".join(handicappers) if handicappers else None
-        else:
-            sharp_count = 1 if handicappers else 0
-            handicapper = handicappers
-        
-        cursor.execute("""
-            INSERT INTO picks (
-                sport, matchup, side, odds, handicapper, confidence,
-                game_day, start_time, reasoning, report_date, sharp_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            pick.get("sport"),
-            pick.get("matchup"),
-            pick.get("side"),
-            pick.get("odds"),
-            handicapper,
-            pick.get("confidence"),
-            pick.get("game_day"),
-            start_time,
-            pick.get("reasoning"),
-            report_date,
-            sharp_count,
-        ))
-        pick_id = cursor.lastrowid
-        cursor.execute("INSERT INTO results (pick_id) VALUES (?)", (pick_id,))
-    
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(PICKS_DB) as conn:
+        cursor = conn.cursor()
+
+        for pick in picks:
+            # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
+            start_time = pick.get("start_time") or pick.get("start")
+            handicappers = pick.get("handicappers") or pick.get("handicapper")
+
+            # Count the number of sharps backing this pick
+            if isinstance(handicappers, list):
+                sharp_count = len(handicappers)
+                handicapper = ", ".join(handicappers) if handicappers else None
+            else:
+                sharp_count = 1 if handicappers else 0
+                handicapper = handicappers
+
+            cursor.execute("""
+                INSERT INTO picks (
+                    sport, matchup, side, odds, handicapper, confidence,
+                    game_day, start_time, reasoning, report_date, sharp_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pick.get("sport"),
+                pick.get("matchup"),
+                pick.get("side"),
+                pick.get("odds"),
+                handicapper,
+                pick.get("confidence"),
+                pick.get("game_day"),
+                start_time,
+                pick.get("reasoning"),
+                report_date,
+                sharp_count,
+            ))
+            pick_id = cursor.lastrowid
+            cursor.execute("INSERT INTO results (pick_id) VALUES (?)", (pick_id,))
     logger.info(f"Saved {len(picks)} picks to database")
     
     # Also log to Google Sheets for shared visibility
