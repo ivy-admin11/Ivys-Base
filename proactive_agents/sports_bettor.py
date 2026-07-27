@@ -70,7 +70,7 @@ except ImportError:
 
 
 # ========================= CONFIG =========================
-HENRY_PHONE = "+12147334061"
+from config import HENRY_PHONE  # required env var — raises at startup if unset
 XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
 # The Odds API (https://the-odds-api.com) — live Vegas lines + scheduled games.

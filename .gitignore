@@ -8,6 +8,10 @@ token.json
 google_credentials.json
 discord_backup_codes.txt
 
+# Contact whitelists — contain real phone numbers, never commit
+favorites.json
+mcp-servers/imessage/favorites.json
+
 # Python & Dependencies
 __pycache__/
 *.pyc
