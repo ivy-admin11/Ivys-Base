@@ -10,7 +10,7 @@ from proactive_agents import sports_bettor
 
 def _reset_favorites_cache() -> None:
     main._FAVORITES_CACHE["contacts"] = []
-    main._FAVORITES_CACHE["mtime_ns"] = None
+    main._FAVORITES_CACHE["mtime_ns"] = -1
 
 
 def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatch):
@@ -73,6 +73,17 @@ def test_safe_fetch_last_message_retries_and_recovers(monkeypatch):
 
 
 def test_close_chat_db_connection_closes_and_clears_cached_connection(monkeypatch):
+    class TrackingLock:
+        def __init__(self):
+            self.enter_count = 0
+
+        def __enter__(self):
+            self.enter_count += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
     class Connection:
         def __init__(self):
             self.closed = False
@@ -80,11 +91,14 @@ def test_close_chat_db_connection_closes_and_clears_cached_connection(monkeypatc
         def close(self):
             self.closed = True
 
+    lock = TrackingLock()
     conn = Connection()
+    monkeypatch.setattr(main, "_CHAT_DB_LOCK", lock)
     monkeypatch.setattr(main, "_CHAT_DB_CONN", conn)
 
     main.close_chat_db_connection()
 
+    assert lock.enter_count == 1
     assert conn.closed is True
     assert main._CHAT_DB_CONN is None
 
