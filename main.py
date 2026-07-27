@@ -279,6 +279,7 @@ _FAVORITES_CACHE = {
     "contacts": [],
     "mtime": 0.0,
 }
+_FAVORITES_CACHE_LOCK = threading.RLock()
 
 # Persistent chat.db connection — reuse for all polls
 _CHAT_DB_CONN = None
@@ -441,6 +442,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        close_chat_db_connection()
         logger.info("Gateway shutdown complete.")
 
 
@@ -951,31 +953,53 @@ def load_favorites_cached() -> List[str]:
     
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
-    favorites_path = "favorites.json"
-    
+    favorites_path = os.path.join(PROJECT_ROOT_DIR, "favorites.json")
+
+    with _FAVORITES_CACHE_LOCK:
+        try:
+            stat = os.stat(favorites_path)
+            current_mtime = stat.st_mtime
+        except OSError:
+            # File doesn't exist or is unreadable
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            return []
+
+        # If file hasn't changed since last load, return cached
+        if current_mtime == _FAVORITES_CACHE["mtime"]:
+            return list(_FAVORITES_CACHE["contacts"])
+
+        # File is new or modified; reload
+        try:
+            with open(favorites_path, "r") as f:
+                contacts = json.load(f)
+            _FAVORITES_CACHE["contacts"] = contacts if isinstance(contacts, list) else []
+            _FAVORITES_CACHE["mtime"] = current_mtime
+            logger.debug("Reloaded favorites.json (%d contacts)", len(_FAVORITES_CACHE["contacts"]))
+            return list(_FAVORITES_CACHE["contacts"])
+        except Exception as e:
+            logger.warning("Failed to parse favorites.json: %s", e)
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            return []
+
+
+def close_chat_db_connection() -> None:
+    """Close and clear the cached chat.db connection."""
+    global _CHAT_DB_CONN
+
+    with _CHAT_DB_LOCK:
+        conn = _CHAT_DB_CONN
+        _CHAT_DB_CONN = None
+
+    if conn is None:
+        return
+
     try:
-        stat = os.stat(favorites_path)
-        current_mtime = stat.st_mtime
-    except OSError:
-        # File doesn't exist or is unreadable
-        return []
-    
-    # If file hasn't changed since last load, return cached
-    if (current_mtime == _FAVORITES_CACHE["mtime"] and 
-        _FAVORITES_CACHE["contacts"]):
-        return _FAVORITES_CACHE["contacts"]
-    
-    # File is new or modified; reload
-    try:
-        with open(favorites_path, "r") as f:
-            contacts = json.load(f)
-        _FAVORITES_CACHE["contacts"] = contacts if isinstance(contacts, list) else []
-        _FAVORITES_CACHE["mtime"] = current_mtime
-        logger.debug("Reloaded favorites.json (%d contacts)", len(_FAVORITES_CACHE["contacts"]))
-        return _FAVORITES_CACHE["contacts"]
+        conn.close()
+        logger.info("Closed cached chat.db connection")
     except Exception as e:
-        logger.warning("Failed to parse favorites.json: %s", e)
-        return []
+        logger.warning("Failed to close cached chat.db connection: %s", e)
 
 
 def init_chat_db():
@@ -984,61 +1008,87 @@ def init_chat_db():
     🚀 Performance: Reuses connection across polls (80-150ms saved per poll)
     """
     global _CHAT_DB_CONN
-    if _CHAT_DB_CONN:
-        return _CHAT_DB_CONN
-    try:
-        _CHAT_DB_CONN = sqlite3.connect(
-            f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
-            uri=True,
-            timeout=DB_TIMEOUT,
-            check_same_thread=False,  # Safe with RLock
-        )
-        logger.info("✅ Persistent chat.db connection established")
-        return _CHAT_DB_CONN
-    except Exception as e:
-        logger.error("Failed to initialize chat.db connection: %s", e)
-        return None
+    with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN:
+            return _CHAT_DB_CONN
+        try:
+            _CHAT_DB_CONN = sqlite3.connect(
+                f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
+                uri=True,
+                timeout=DB_TIMEOUT,
+                check_same_thread=False,  # Safe with RLock
+            )
+            logger.info("✅ Persistent chat.db connection established")
+            return _CHAT_DB_CONN
+        except Exception as e:
+            _CHAT_DB_CONN = None
+            logger.error("Failed to initialize chat.db connection: %s", e)
+            return None
 
 
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
-    """Fetch next message from chat.db with persistent connection (optimized)."""
-    conn = init_chat_db()
-    if not conn:
-        return None
-    
-    try:
-        with _CHAT_DB_LOCK:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
-                FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-                WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
-                ORDER BY m.ROWID ASC LIMIT 1
-                """,
-                (last_id,),
+    """Fetch next message from chat.db with retry logic and cached connection."""
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        conn = init_chat_db()
+        if not conn:
+            return None
+
+        try:
+            with _CHAT_DB_LOCK:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
+                    FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
+                    WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
+                    ORDER BY m.ROWID ASC LIMIT 1
+                    """,
+                    (last_id,),
+                )
+                return cursor.fetchone()
+        except sqlite3.OperationalError as e:
+            close_chat_db_connection()
+            if attempt == DB_RETRY_ATTEMPTS - 1:
+                logger.warning("Database query failed after %d attempts: %s", attempt + 1, e)
+                return None
+            backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
+                attempt + 1,
+                e,
+                backoff,
             )
-            return cursor.fetchone()
-    except sqlite3.OperationalError as e:
-        logger.warning("Database query failed: %s", e)
-        return None
+            time.sleep(backoff)
+    return None
 
 
 def get_last_message_id() -> Optional[int]:
-    """Get the highest ROWID from the message table (optimized with persistent connection)."""
-    conn = init_chat_db()
-    if not conn:
-        return None
-    
-    try:
-        with _CHAT_DB_LOCK:
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(ROWID) FROM message")
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else 0
-    except Exception as e:
-        logger.warning("Failed to get last message ID: %s", e)
-        return None
+    """Get the highest ROWID from the message table using the cached connection."""
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        conn = init_chat_db()
+        if not conn:
+            return None
+
+        try:
+            with _CHAT_DB_LOCK:
+                cursor = conn.cursor()
+                cursor.execute("SELECT MAX(ROWID) FROM message")
+                row = cursor.fetchone()
+                return row[0] if row and row[0] else 0
+        except sqlite3.OperationalError as e:
+            close_chat_db_connection()
+            if attempt == DB_RETRY_ATTEMPTS - 1:
+                logger.warning("Failed to get last message ID after %d attempts: %s", attempt + 1, e)
+                return None
+            backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "Last-message lookup attempt %d failed: %s. Retrying in %.1f seconds...",
+                attempt + 1,
+                e,
+                backoff,
+            )
+            time.sleep(backoff)
+    return None
 
 
 

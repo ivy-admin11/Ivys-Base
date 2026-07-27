@@ -292,9 +292,11 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
     if auth_error:
         raise auth_error
     
-    # If retryable errors occurred on required operations, raise the first one
-    if retryable_errors and any(isinstance(e, RetryableProviderError) for _, e in retryable_errors):
-        raise retryable_errors[0][1]
+    # If retryable errors occurred on required operations, raise an actual
+    # retryable error rather than whichever failure happened to land first.
+    retryable_only = [e for _, e in retryable_errors if isinstance(e, RetryableProviderError)]
+    if retryable_only:
+        raise retryable_only[0]
 
     print(f"📊 Odds feed: {len(games)} scheduled game(s) across {len(ODDS_SPORT_KEYS)} leagues.")
     return games
