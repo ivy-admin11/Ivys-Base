@@ -62,8 +62,9 @@ def test_save_picks_rolls_back_when_results_insert_fails(tmp_path, monkeypatch):
         )
 
     with real_connect(db_path) as conn:
-        pick_count = conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
-        result_count = conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+        cursor = conn.cursor()
+        pick_count = cursor.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
+        result_count = cursor.execute("SELECT COUNT(*) FROM results").fetchone()[0]
 
     assert pick_count == 0
     assert result_count == 0
