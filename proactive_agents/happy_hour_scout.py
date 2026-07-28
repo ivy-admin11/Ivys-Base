@@ -401,7 +401,9 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                     # Assign a report ID and persist to durable outbox.
                     report_id = _outbox.make_report_id("happy_hour")
                     local_now = datetime.now(timezone.utc).astimezone()
-                    content_summary = f"{result['discovery_count']} special(s) — {local_now:%b %-d}"
+                    content_summary = (
+                        f"{result['discovery_count']} special(s) — {local_now:%b} {local_now.day}"
+                    )
                     _outbox.save_report(
                         report_id, pdf_path,
                         job_name="happy_hour",

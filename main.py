@@ -161,10 +161,14 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def _make_gemini_config(system_instruction: Optional[str] = None) -> Dict[str, Any]:
-    config: Dict[str, Any] = {
-        "tools": [{"function_declarations": GEMINI_TOOL_DECLARATIONS}],
-    }
+def _make_gemini_config(
+    system_instruction: Optional[str] = None,
+    *,
+    include_tools: bool = True,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if include_tools:
+        config["tools"] = [{"function_declarations": GEMINI_TOOL_DECLARATIONS}]
     if system_instruction:
         config["system_instruction"] = system_instruction
     return config
@@ -177,6 +181,7 @@ def _part_text(part: Any) -> str:
 
 
 def _part_function_call(part: Any) -> Optional[Dict[str, Any]]:
+    # Handles both SDK objects and plain dict parts used in tests/follow-up payloads.
     raw = part.get("function_call") if isinstance(part, dict) else getattr(part, "function_call", None)
     if not raw:
         return None
@@ -222,12 +227,13 @@ def _gemini_generate_content(
     *,
     contents: Any,
     system_instruction: Optional[str] = None,
+    include_tools: bool = True,
 ):
     client = _get_gemini_client()
     return client.models.generate_content(
         model=_GEMINI_MODEL,
         contents=contents,
-        config=_make_gemini_config(system_instruction),
+        config=_make_gemini_config(system_instruction, include_tools=include_tools),
     )
 
 # ============================================================================
@@ -1002,6 +1008,7 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             },
         ],
         system_instruction=None if use_caching else GEMINI_SYSTEM_INSTRUCTION,
+        include_tools=False,
     )
     follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
     return follow_up_text.strip() or None
@@ -1660,6 +1667,7 @@ def voice_query(
                                     ],
                                 },
                             ],
+                            include_tools=False,
                         )
                         follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
                         reply = follow_up_text.strip() or None

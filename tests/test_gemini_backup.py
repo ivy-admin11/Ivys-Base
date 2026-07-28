@@ -69,11 +69,11 @@ def test_gemini_backup_tool_call(monkeypatch):
 
 def test_gemini_provider_failure_raises(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(
-        main,
-        "_gemini_generate_content",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("provider down")),
-    )
+
+    def _raise_provider_down(**_kwargs):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(main, "_gemini_generate_content", _raise_provider_down)
 
     with pytest.raises(RuntimeError, match="provider down"):
         main._gemini_backup_reply("hello")
