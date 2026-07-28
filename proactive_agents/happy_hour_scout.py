@@ -17,7 +17,7 @@ import sys
 import json
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 
 # Add parent directory to path for .ivy module access
@@ -112,7 +112,7 @@ def fetch_local_specials() -> Dict[str, Any]:
     discovery_payload = {
         "venues": [],
         "specials": [],
-        "updates": datetime.utcnow().isoformat(),
+        "updates": datetime.now(timezone.utc).isoformat(),
         "source_confidence": 0.0,
     }
 
@@ -370,7 +370,7 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
         "discovery_count": 0,
         "alert_sent": False,
         "alert_text": "",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
@@ -400,9 +400,8 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                 try:
                     # Assign a report ID and persist to durable outbox.
                     report_id = _outbox.make_report_id("happy_hour")
-                    content_summary = (
-                        f"{result['discovery_count']} special(s) — {datetime.utcnow():%b %-d}"
-                    )
+                    local_now = datetime.now(timezone.utc).astimezone()
+                    content_summary = f"{result['discovery_count']} special(s) — {local_now:%b %-d}"
                     _outbox.save_report(
                         report_id, pdf_path,
                         job_name="happy_hour",
