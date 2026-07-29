@@ -36,7 +36,13 @@ if os.path.exists(_ENV_PATH):
                 _k, _v = _line.strip().split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
 
-from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
+from ivy_core import (
+    AttachmentDeliveryReceipt,
+    send_imessage,
+    send_imessage_attachment,
+    query_llm,
+    strip_json_fence,
+)
 from ivy_core import outbox as _outbox
 from ivy_core.report_fallback import (
     build_attachment_failure_notice,
@@ -397,10 +403,20 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
         elif send_alert:
             send_results = {}
             attach_results = {}
+            attachment_confirmed_results = {}
+            fallback_attempted_results = {}
+            fallback_fully_sent_results = {}
+            notification_text_sent_results = {}
             for recipient_name, phone in ALERT_RECIPIENTS.items():
+                report_id = _outbox.make_report_id("happy_hour")
+                stats_line = (
+                    f"🍹 Happy Hour Scout Report\n\n"
+                    f"{result['discovery_count']} specials across Frisco/Dallas\n"
+                    f"Includes: wine, oysters, martinis, upscale dining\n\n"
+                )
+                receipt = None
                 try:
-                    # Assign a report ID and persist to durable outbox.
-                    report_id = _outbox.make_report_id("happy_hour")
+                    # Persist to durable outbox.
                     content_summary = (
                         f"{result['discovery_count']} special(s) — {datetime.utcnow():%b %-d}"
                     )
@@ -411,51 +427,82 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                         content_summary=content_summary,
                     )
 
-                    stats_line = (
-                        f"🍹 Happy Hour Scout Report\n\n"
-                        f"{result['discovery_count']} specials across Frisco/Dallas\n"
-                        f"Includes: wine, oysters, martinis, upscale dining\n\n"
-                    )
                     receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
-                    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+                except Exception as e:
+                    logger.error("❌ Attachment send raised for %s: %s", recipient_name, e)
+                    receipt = None
 
-                    if receipt:
+                # Explicit status check — never treat a truthy-but-unsuccessful,
+                # malformed, or missing receipt as a confirmed delivery.
+                attachment_confirmed = AttachmentDeliveryReceipt.is_delivery_confirmed(receipt)
+                receipt_status = getattr(receipt, "status", None) or "missing_receipt"
+
+                try:
+                    _outbox.update_report_status(
+                        report_id, receipt_status, attempts=getattr(receipt, "attempts", 0)
+                    )
+                except Exception as e:
+                    logger.error("❌ Failed to update outbox status for %s: %s", recipient_name, e)
+
+                fallback_attempted = False
+                fallback_fully_sent = False
+                notification_text_sent = False
+
+                try:
+                    if attachment_confirmed:
                         final_text = stats_line + "Full report attached (PDF)."
-                        success = send_imessage(phone, final_text)
-                        send_results[recipient_name] = success
-                        attach_results[recipient_name] = receipt.status
+                        notification_text_sent = send_imessage(phone, final_text)
                         logger.info(
                             "✅ Sent to %s: text=%s attachment=%s",
-                            recipient_name, "SUCCESS" if success else "FAILED", receipt.status,
+                            recipient_name, "SUCCESS" if notification_text_sent else "FAILED", receipt_status,
                         )
                     else:
-                        # Explicit failure — two-message fallback.
+                        # Attachment delivery unconfirmed — failure notice +
+                        # full text fallback (never claim the PDF was attached).
+                        fallback_attempted = True
                         notice = build_attachment_failure_notice(
                             report_name="Happy Hour Scout",
                             report_id=report_id,
                             resend_command="RESEND HAPPY HOUR",
                             retry_queued=True,
                         )
-                        notice_sent = send_imessage(phone, notice)
+                        notification_text_sent = send_imessage(phone, notice)
 
                         fallback_text = format_happy_hour_text(discovery_data)
                         bubbles = split_imessage_content(fallback_text)
-                        fallback_sent = all(send_imessage(phone, b) for b in bubbles)
+                        bubble_results = [send_imessage(phone, b) for b in bubbles]
+                        fallback_fully_sent = bool(bubble_results) and all(bubble_results)
 
-                        send_results[recipient_name] = notice_sent
-                        attach_results[recipient_name] = "failed"
                         logger.warning(
-                            "⚠️ Attachment failed for %s — text fallback %s",
-                            recipient_name, "sent" if fallback_sent else "also failed",
+                            "⚠️ Attachment not confirmed for %s (status=%s) — text fallback %s",
+                            recipient_name, receipt_status, "sent" if fallback_fully_sent else "also failed",
                         )
                 except Exception as e:
-                    send_results[recipient_name] = False
-                    attach_results[recipient_name] = False
-                    logger.error("❌ Failed to send to %s: %s", recipient_name, e)
+                    logger.error("❌ Failed to send fallback/notification to %s: %s", recipient_name, e)
+
+                attachment_confirmed_results[recipient_name] = attachment_confirmed
+                fallback_attempted_results[recipient_name] = fallback_attempted
+                fallback_fully_sent_results[recipient_name] = fallback_fully_sent
+                notification_text_sent_results[recipient_name] = notification_text_sent
+                attach_results[recipient_name] = receipt_status
+
+                # A recipient counts as successfully alerted only if either
+                # the attachment was confirmed AND the summary text sent, or
+                # the complete text fallback was fully sent. Sending only the
+                # failure notice (with no successful fallback bubbles) does
+                # NOT count as a successful alert.
+                send_results[recipient_name] = (
+                    (attachment_confirmed and notification_text_sent)
+                    or (fallback_attempted and fallback_fully_sent)
+                )
 
             result["alert_sent"] = any(send_results.values())
             result["recipients_status"] = send_results
             result["attachment_status"] = attach_results
+            result["attachment_confirmed"] = attachment_confirmed_results
+            result["fallback_attempted"] = fallback_attempted_results
+            result["fallback_fully_sent"] = fallback_fully_sent_results
+            result["notification_text_sent"] = notification_text_sent_results
         else:
             logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
             result["alert_sent"] = False

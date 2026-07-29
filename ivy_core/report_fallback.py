@@ -41,7 +41,21 @@ class AttachmentDeliveryReceipt:
     Internal-only fields (must not appear in user-facing messages)
     ---------------------------------------------------------------
     attachment_path, staged_path, applescript_result, error_code, error_detail
+
+    Success-status contract
+    ------------------------
+    ``SUCCESS_STATUSES`` is the single canonical source of truth for which
+    ``status`` values count as a confirmed attachment delivery. Callers
+    MUST NOT rely on truthiness (``if receipt:``) to decide whether to skip
+    the text fallback — a missing/``None`` receipt, an unexpected status
+    string (e.g. ``"queued"``, ``"timed_out"``, ``"rejected"``,
+    ``"unavailable"``, ``"unknown"``), or any status outside this set must
+    all be treated as attachment failure. Use
+    ``AttachmentDeliveryReceipt.is_delivery_confirmed(receipt)`` for the
+    explicit, defensive check.
     """
+
+    SUCCESS_STATUSES = _UNVERIFIED_STATUSES
 
     report_id: str
     status: str
@@ -58,8 +72,30 @@ class AttachmentDeliveryReceipt:
     verified_at: Optional[str] = None
 
     def __bool__(self) -> bool:
-        """True for verified_delivered or submitted_unverified — not for failed."""
+        """True for verified_delivered or submitted_unverified — not for failed.
+
+        Kept for backwards compatibility (and direct ``assert receipt`` /
+        ``assert not receipt`` tests), but callers deciding whether to skip
+        the text fallback must use :meth:`is_delivery_confirmed` instead of
+        relying on truthiness — see the class docstring.
+        """
         return self.status in _UNVERIFIED_STATUSES
+
+    @staticmethod
+    def is_delivery_confirmed(receipt: Optional["AttachmentDeliveryReceipt"]) -> bool:
+        """Explicit, defensive success check for use by callers.
+
+        Returns True only when ``receipt`` is a real receipt object whose
+        ``status`` is in :data:`SUCCESS_STATUSES`. Every other case —
+        ``None``, a malformed/duck-typed object missing ``status``, or any
+        non-success status string (``failed``, ``queued``, ``timed_out``,
+        ``rejected``, ``unavailable``, ``unknown``, or anything else) —
+        returns False.
+        """
+        if receipt is None:
+            return False
+        status = getattr(receipt, "status", None)
+        return status in AttachmentDeliveryReceipt.SUCCESS_STATUSES
 
     @classmethod
     def make_failed(
