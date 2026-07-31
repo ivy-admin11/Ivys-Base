@@ -15,6 +15,7 @@ discord_backup_codes.txt
 # Contact allowlists (real allowlists only — see favorites.example.json)
 favorites.json
 !favorites.example.json
+mcp-servers/imessage/favorites.json
 
 # Python & Dependencies
 __pycache__/

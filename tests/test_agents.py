@@ -5,6 +5,8 @@ real external API.
 """
 
 import inspect
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -72,29 +74,40 @@ def test_sports_bettor_is_text_only_no_pdf(monkeypatch):
     assert sent, "send_imessage was never called — text report was never sent"
     assert result["sent"] is True
     assert saved.get("msg") == sent[0][1], "save_last_report must store the report body, not the signature twice"
+    assert "result_type" in result
+    assert "attached" in result
 
 
 def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):
-    monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
-    monkeypatch.setattr(
-        Familia_meal_planner, "generate_family_meal_plan",
-        lambda: {"status": "success", "recipe_count": 2, "recipes": []},
-    )
-    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: "/tmp/fake_meal.pdf")
-    monkeypatch.setattr(Familia_meal_planner, "load_state", lambda: {"execution_history": []})
-    monkeypatch.setattr(Familia_meal_planner, "save_state", lambda state: None)
+    # Create a temporary PDF file so that send_imessage_attachment can find it
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
+        tmp_pdf.write(b"%PDF-1.4\n%mock pdf content")
+        temp_pdf_path = tmp_pdf.name
 
-    attach_calls = []
-    monkeypatch.setattr(
-        Familia_meal_planner, "send_imessage_attachment",
-        lambda phone, path, **k: attach_calls.append((phone, path)) or True,
-    )
-    monkeypatch.setattr(Familia_meal_planner, "send_imessage", lambda *a, **k: True)
+    try:
+        monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
+        monkeypatch.setattr(
+            Familia_meal_planner, "generate_family_meal_plan",
+            lambda: {"status": "success", "recipe_count": 2, "recipes": []},
+        )
+        monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: temp_pdf_path)
+        monkeypatch.setattr(Familia_meal_planner, "load_state", lambda: {"execution_history": []})
+        monkeypatch.setattr(Familia_meal_planner, "save_state", lambda state: None)
 
-    result = Familia_meal_planner.run(force=True, send=True)
+        attach_calls = []
+        monkeypatch.setattr(
+            Familia_meal_planner, "send_imessage_attachment",
+            lambda phone, path, **k: attach_calls.append((phone, path)) or True,
+        )
+        monkeypatch.setattr(Familia_meal_planner, "send_imessage", lambda *a, **k: True)
 
-    assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
-    assert result["status"] == "success"
+        result = Familia_meal_planner.run(force=True, send=True)
+
+        assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
+        assert result["status"] == "success"
+    finally:
+        # Clean up the temporary file
+        Path(temp_pdf_path).unlink(missing_ok=True)
 
 
 def test_familia_meal_planner_force_bypasses_48h_gate():
@@ -102,20 +115,29 @@ def test_familia_meal_planner_force_bypasses_48h_gate():
 
 
 def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
-    monkeypatch.setattr(
-        happy_hour_scout, "fetch_local_specials",
-        lambda: {"venues": [{"name": "Bar"}], "specials": [{"detail": "half off"}]},
-    )
-    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: "/tmp/fake_hh.pdf")
+    # Create a temporary PDF file so that send_imessage_attachment can find it
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
+        tmp_pdf.write(b"%PDF-1.4\n%mock pdf content")
+        temp_pdf_path = tmp_pdf.name
 
-    attach_calls = []
-    monkeypatch.setattr(
-        happy_hour_scout, "send_imessage_attachment",
-        lambda phone, path, **k: attach_calls.append((phone, path)) or True,
-    )
-    monkeypatch.setattr(happy_hour_scout, "send_imessage", lambda *a, **k: True)
+    try:
+        monkeypatch.setattr(
+            happy_hour_scout, "fetch_local_specials",
+            lambda: {"venues": [{"name": "Bar"}], "specials": [{"detail": "half off"}]},
+        )
+        monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: temp_pdf_path)
 
-    result = happy_hour_scout.run(force=True, send=True)
+        attach_calls = []
+        monkeypatch.setattr(
+            happy_hour_scout, "send_imessage_attachment",
+            lambda phone, path, **k: attach_calls.append((phone, path)) or True,
+        )
+        monkeypatch.setattr(happy_hour_scout, "send_imessage", lambda *a, **k: True)
 
-    assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
-    assert result["status"] == "success"
+        result = happy_hour_scout.run(force=True, send=True)
+
+        assert attach_calls, "send_imessage_attachment was never called — PDF was never actually attached"
+        assert result["status"] == "success"
+    finally:
+        # Clean up the temporary file
+        Path(temp_pdf_path).unlink(missing_ok=True)

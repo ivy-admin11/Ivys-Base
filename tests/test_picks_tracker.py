@@ -7,6 +7,8 @@ isolated_picks_db fixture — never the real data/picks.db.
 
 import sqlite3
 
+import pytest
+
 from ivy_core import picks_tracker as pt
 
 
@@ -226,3 +228,50 @@ def test_get_stats_by_sport_groups_correctly():
     assert set(by_sport.keys()) == {"NFL", "NBA"}
     assert by_sport["NFL"]["pending"] == 1
     assert by_sport["NBA"]["pending"] == 1
+
+
+def test_save_picks_rolls_back_when_results_insert_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "picks.db"
+    monkeypatch.setattr(pt, "PICKS_DB", db_path)
+
+    real_connect = sqlite3.connect
+
+    class FailingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "INSERT INTO results" in sql:
+                raise sqlite3.IntegrityError("forced failure")
+            return self._conn.execute(sql, params)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def close(self):
+            return self._conn.close()
+
+    def failing_connect(*args, **kwargs):
+        return FailingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(pt.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        pt.save_picks(
+            [
+                {
+                    "sport": "NBA",
+                    "matchup": "A @ B",
+                    "side": "A +2.5",
+                    "odds": -110,
+                }
+            ],
+            report_date="2026-07-27",
+        )
+
+    with real_connect(db_path) as conn:
+        pick_count = conn.execute("SELECT COUNT(*) FROM picks").fetchone()[0]
+        result_count = conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+
+    assert pick_count == 0
+    assert result_count == 0

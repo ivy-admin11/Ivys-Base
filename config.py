@@ -95,11 +95,23 @@ if not ADMIN_SECRET:
             "For local/test use only, set ALLOW_INSECURE_ADMIN_SECRET=true instead."
         )
 
-HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "+12147334061")
+HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "")
 """Primary authorized contact for approval workflows"""
 
-LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "+18179138648")
+if not HENRY_PHONE:
+    raise RuntimeError(
+        "HENRY_PHONE is not set. Add HENRY_PHONE=+1XXXXXXXXXX to your .env file "
+        "or export it in the environment before starting Ivy."
+    )
+
+LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "")
 """Secondary authorized contact for approval workflows"""
+
+if not LEXI_PHONE:
+    raise RuntimeError(
+        "LEXI_PHONE is not set. Add LEXI_PHONE=+1XXXXXXXXXX to your .env file "
+        "or export it in the environment before starting Ivy."
+    )
 
 IVY_FAVORITES_FILE: str = os.path.expanduser(
     os.environ.get("IVY_FAVORITES_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json"))
