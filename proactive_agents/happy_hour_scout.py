@@ -403,12 +403,15 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                     content_summary = (
                         f"{result['discovery_count']} special(s) — {datetime.utcnow():%b %-d}"
                     )
-                    _outbox.save_report(
-                        report_id, pdf_path,
-                        job_name="happy_hour",
-                        recipient=phone,
-                        content_summary=content_summary,
-                    )
+                    try:
+                        _outbox.save_report(
+                            report_id, pdf_path,
+                            job_name="happy_hour",
+                            recipient=phone,
+                            content_summary=content_summary,
+                        )
+                    except Exception as _outbox_exc:
+                        logger.warning("Outbox save failed (delivery will proceed): %s", _outbox_exc)
 
                     stats_line = (
                         f"🍹 Happy Hour Scout Report\n\n"
@@ -416,7 +419,10 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                         f"Includes: wine, oysters, martinis, upscale dining\n\n"
                     )
                     receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
-                    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+                    try:
+                        _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+                    except Exception:
+                        pass
 
                     if receipt:
                         final_text = stats_line + "Full report attached (PDF)."

@@ -37,7 +37,9 @@ returns no usable picks, run() returns a "no_picks" result without sending
 
 import hashlib
 import json
+import logging
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -49,10 +51,6 @@ from filelock import FileLock, Timeout
 from ivy_core import require_env, send_imessage, send_imessage_attachment
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
-from ivy_core.report_fallback import (
-    build_attachment_failure_notice,
-    split_imessage_content,
-)
 from ivy_core.pipeline_status import (
     PipelineStatus,
     PipelineResult,
@@ -73,6 +71,10 @@ except ImportError:
 
 
 # ========================= CONFIG =========================
+logger = logging.getLogger("ivy.sports_bettor")
+
+from picks_formatter import PicksReportFormatter  # noqa: E402
+
 HENRY_PHONE = "+12147334061"
 XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
@@ -894,6 +896,59 @@ def format_picks_by_sport(merged):
     return "\n".join(lines)
 
 
+def format_picks_pdf(merged: list) -> str:
+    """Generate a professional PDF report of Sharp Picks and return the file path."""
+    consensus = [p for p in merged if p.get("is_consensus")]
+    others = [p for p in merged if not p.get("is_consensus")]
+
+    formatter = PicksReportFormatter(
+        title="Ivy 48-Hour Betting Report",
+        subtitle=f"Sharp X Picks vs. Live Vegas Odds | {datetime.now():%A, %B %d, %Y}",
+        color_scheme="sports",
+    )
+
+    def _to_row(p):
+        sport = p.get("sport") or ""
+        matchup = p.get("matchup") or ""
+        side = p.get("side") or ""
+        odds = str(p.get("odds") or "")
+        enr = p.get("enrichment") or {}
+        take = (enr.get("take") or "").strip()
+        return {"sport": sport, "matchup": matchup, "side": side, "odds": odds, "reasoning": take}
+
+    consensus_rows = [_to_row(p) for p in consensus]
+    other_rows = [_to_row(p) for p in others]
+
+    n_consensus = len(consensus_rows)
+    n_other = len(other_rows)
+    summary = (
+        f"Ivy surfaced {len(merged)} qualifying sharp pick(s): "
+        f"{n_consensus} consensus play(s) and {n_other} additional pick(s)."
+    )
+
+    metadata = {
+        "pick_count": f"{len(merged)} pick(s) ({n_consensus} consensus)",
+        "source": "Sharp X Picks (Grok x_search)",
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
+    }
+
+    pdf_path = os.path.join(
+        tempfile.gettempdir(), f"sharp_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    )
+    formatter.generate_pdf(
+        filename=pdf_path,
+        summary=summary,
+        consensus_picks=consensus_rows,
+        other_picks=other_rows,
+        metadata=metadata,
+        headers=["Sport", "Matchup", "Side", "Odds", "Take"],
+        col_widths=[0.6, 1.8, 1.0, 0.6, 3.5],
+        consensus_heading="🔥 High-Likelihood Consensus Plays",
+        other_heading="Other Sharp Picks",
+    )
+    return pdf_path
+
+
 # ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
@@ -1060,45 +1115,29 @@ def _run_pipeline(
     merged = merge_picks(picks)
     attach_odds(merged, games)
     enrich_picks(merged, games)
-    
-    # Filter picks by minimum quality threshold
-    # A valid pick should have:
-    #   - confidence level (not just 55% single-sharp noise)
-    #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
-    min_confidence_single = "medium"  # Only accept high-confidence single-sharp picks
-    min_sharps_consensus = 2
-    
-    filtered_picks = []
-    for p in merged:
-        confidence = (p.get("enrichment", {}).get("confidence") or "").lower()
-        is_consensus = p.get("is_consensus", False)
-        sharp_count = p.get("consensus_count", 1)
-        
-        # Accept if: consensus (2+ sharps) OR single-sharp with medium/high confidence
-        if is_consensus or (sharp_count == 1 and confidence in ("medium", "high")):
-            filtered_picks.append(p)
-    
-    if not filtered_picks:
-        print(f"⚠️  {len(merged)} pick(s) found but none meet minimum quality threshold.")
-        print("   (Require: 2+ sharps for consensus OR 1 sharp with medium/high confidence)")
+
+    if not merged:
+        print("⚠️  No picks after merging.")
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
         return result.to_dict()
-    
-    consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
-    print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique → {len(filtered_picks)} qualifying ({consensus_n} consensus).")
-    
-    result.picks_count = len(filtered_picks)
+
+    consensus_n = sum(1 for p in merged if p["is_consensus"])
+    print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique ({consensus_n} consensus).")
+
+    result.picks_count = len(merged)
     result.consensus_count = consensus_n
-    
-    # Only now save picks that passed validation
-    save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+
+    try:
+        save_picks(merged, report_date=datetime.now().strftime("%Y-%m-%d"))
+    except Exception as exc:
+        logger.warning("Failed to save picks to tracker DB (delivery will proceed): %s", exc)
 
     # Build the outbound body and its content fingerprint.
-    signature = _report_signature(filtered_picks)
+    signature = _report_signature(merged)
 
-    # Duplicate suppression: only text Henry net-new information.
+    # Duplicate suppression: only deliver net-new information.
     if force:
         print("⚡ force=True — bypassing duplicate suppression (ad-hoc run).")
     last = load_last_report()
@@ -1107,18 +1146,25 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-    # Generate text-only report
-    print("📝 Generating text-only picks report...")
-    report_text = format_picks_by_sport(filtered_picks)
-    print(f"✅ Report formatted ({len(filtered_picks)} picks)")
+    # Generate PDF report
+    print("📝 Generating PDF picks report...")
+    pdf_path = format_picks_pdf(merged)
+    print(f"✅ PDF generated ({len(merged)} picks)")
 
-    # Assign a report ID
+    # Assign a report ID and persist to durable outbox.
     report_id = _outbox.make_report_id("sharp_picks")
     result.report_id = report_id
-    content_summary = (
-        f"{len(filtered_picks)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}"
-    )
     print(f"📦 Report ID: {report_id}")
+
+    try:
+        _outbox.save_report(
+            report_id, pdf_path,
+            job_name="sharp_picks",
+            recipient=HENRY_PHONE,
+            content_summary=f"{len(merged)} pick(s), {consensus_n} consensus — {datetime.now():%b %-d}",
+        )
+    except Exception as exc:
+        logger.warning("Outbox save failed (delivery will proceed): %s", exc)
 
     if not send:
         print("🧪 send=False — dry run, not sending.")
@@ -1126,23 +1172,39 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-    # Send text report directly
-    delivered_text = send_imessage(HENRY_PHONE, report_text)
-    
-    if delivered_text:
+    # Send PDF attachment
+    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
+    try:
+        _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+    except Exception:
+        pass
+
+    if receipt:
         save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
+        print(f"✅ {len(merged)} pick(s) delivered as PDF ({consensus_n} consensus).")
         result.sent = True
+        result.attached = True
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent successfully."
         return result.to_dict()
 
-    # Fallback if text send failed
-    print("⚠️  Text delivery failed")
-    print(f"Report ID {report_id} queued for retry")
-    result.sent = False
-    result.status = PipelineStatus.INTERNAL_ERROR
-    result.message = f"Report {report_id} failed to send — queued for retry"
+    # Fallback to text report if PDF attachment failed
+    print("⚠️  PDF attachment failed — falling back to text report")
+    report_text = format_picks_by_sport(merged)
+    delivered_text = send_imessage(HENRY_PHONE, report_text)
+    if delivered_text:
+        save_last_report(signature, signature)
+        print(f"✅ {len(merged)} pick(s) reported to Henry as text ({consensus_n} consensus).")
+        result.sent = True
+        result.attached = False
+        result.status = PipelineStatus.SUCCESS
+        result.message = f"Report {report_id} sent as text fallback."
+    else:
+        print(f"⚠️  Text delivery also failed for report {report_id}")
+        result.sent = False
+        result.attached = False
+        result.status = PipelineStatus.INTERNAL_ERROR
+        result.message = f"Report {report_id} failed to send"
     return result.to_dict()
 
 
