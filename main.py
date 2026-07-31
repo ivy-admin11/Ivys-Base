@@ -14,7 +14,7 @@ Environment-specific secrets go in .env (see .env.example).
 Security:
 - All FastAPI endpoints require X-API-Key header matching ADMIN_SECRET
 - Database reads use SQLite read-only mode to prevent accidental mutations
-- iMessage poller validates sender against favorites.json whitelist
+- iMessage poller validates sender against the IVY_FAVORITES_FILE allowlist
 
 Voice Assistant Features:
 - Session-based conversation management with automatic cleanup
@@ -59,6 +59,7 @@ from config import (
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
     ADMIN_SECRET,
+    IVY_FAVORITES_FILE,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
@@ -376,7 +377,12 @@ _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health po
 # Favorites list cache — reload only when file changes
 _FAVORITES_CACHE = {
     "contacts": [],
+<<<<<<< HEAD
     "mtime_ns": -1,  # -1 means the favorites cache is uninitialized/unavailable.
+=======
+    "mtime": 0.0,
+    "loaded": False,
+>>>>>>> origin/main
 }
 _FAVORITES_CACHE_LOCK = threading.RLock()
 
@@ -1049,9 +1055,10 @@ def query_llm_with_tools(prompt_text: str) -> str:
 
 def load_favorites_cached() -> List[str]:
     """Load favorites.json once, cache in memory. Reload only if file changes.
-    
+
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
+<<<<<<< HEAD
     favorites_path = os.path.join(PROJECT_ROOT_DIR, FAVORITES_FILENAME)
 
     with _FAVORITES_CACHE_LOCK:
@@ -1095,11 +1102,62 @@ def close_chat_db_connection() -> None:
             logger.info("Closed cached chat.db connection")
         except Exception as e:
             logger.warning("Failed to close cached chat.db connection: %s", e)
+=======
+    favorites_path = IVY_FAVORITES_FILE
+
+    try:
+        stat = os.stat(favorites_path)
+        current_mtime = stat.st_mtime
+    except OSError:
+        # File doesn't exist or is unreadable
+        with _FAVORITES_CACHE_LOCK:
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["loaded"] = False
+        return []
+
+    with _FAVORITES_CACHE_LOCK:
+        # If file hasn't changed since last load, return a defensive copy.
+        if current_mtime == _FAVORITES_CACHE["mtime"] and _FAVORITES_CACHE["loaded"]:
+            return list(_FAVORITES_CACHE["contacts"])
+
+        # File is new or modified; reload and normalize.
+        try:
+            with open(favorites_path, "r", encoding="utf-8") as f:
+                contacts = json.load(f)
+            if isinstance(contacts, list):
+                normalized = []
+                skipped = 0
+                for contact in contacts:
+                    if isinstance(contact, str):
+                        stripped = contact.strip()
+                        if stripped:
+                            normalized.append(stripped)
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+                if skipped:
+                    logger.debug("Skipped %d invalid/empty entries in favorites allowlist", skipped)
+            else:
+                normalized = []
+            _FAVORITES_CACHE["contacts"] = normalized
+            _FAVORITES_CACHE["mtime"] = current_mtime
+            _FAVORITES_CACHE["loaded"] = True
+            logger.debug("Reloaded favorites allowlist from %s (%d contacts)", favorites_path, len(normalized))
+            return list(normalized)
+        except Exception as e:
+            _FAVORITES_CACHE["contacts"] = []
+            _FAVORITES_CACHE["mtime"] = 0.0
+            _FAVORITES_CACHE["loaded"] = False
+            logger.warning("Failed to parse favorites allowlist at %s: %s", favorites_path, e)
+            return []
+>>>>>>> origin/main
 
 
 def init_chat_db():
     """Initialize persistent read-only connection to chat.db.
-    
+
     🚀 Performance: Reuses connection across polls (80-150ms saved per poll)
     """
     global _CHAT_DB_CONN
@@ -1118,10 +1176,34 @@ def init_chat_db():
         except Exception as e:
             logger.error("Failed to initialize chat.db connection: %s", e)
             return None
+<<<<<<< HEAD
 
 
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
     """Fetch next message from chat.db with retry logic and cached connection."""
+=======
+
+
+def _reset_chat_db_connection() -> None:
+    """Reset stale chat.db connection so the next read can reopen it."""
+    global _CHAT_DB_CONN
+    with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN:
+            try:
+                _CHAT_DB_CONN.close()
+            except Exception:
+                pass
+            _CHAT_DB_CONN = None
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Return exponential backoff delay for sqlite retries (zero-indexed attempt)."""
+    return DB_RETRY_BACKOFF * (2 ** attempt)
+
+
+def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
+    """Fetch next message from chat.db with persistent connection (optimized)."""
+>>>>>>> origin/main
     for attempt in range(DB_RETRY_ATTEMPTS):
         conn = init_chat_db()
         if not conn:
@@ -1141,23 +1223,41 @@ def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
                 )
                 return cursor.fetchone()
         except sqlite3.OperationalError as e:
+<<<<<<< HEAD
             close_chat_db_connection()
             if attempt == DB_RETRY_ATTEMPTS - 1:
                 logger.warning("Database query failed after %d attempts: %s", attempt + 1, e)
                 return None
             backoff = _db_retry_backoff(attempt)
+=======
+            backoff = _retry_backoff_seconds(attempt)
+>>>>>>> origin/main
             logger.warning(
                 "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
                 attempt + 1,
                 e,
                 backoff,
             )
+<<<<<<< HEAD
             time.sleep(backoff)
+=======
+            _reset_chat_db_connection()
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                time.sleep(backoff)
+        except sqlite3.Error as e:
+            logger.warning("Database read failed with sqlite error: %s", e)
+            _reset_chat_db_connection()
+            return None
+>>>>>>> origin/main
     return None
 
 
 def get_last_message_id() -> Optional[int]:
+<<<<<<< HEAD
     """Get the highest ROWID from the message table using the cached connection."""
+=======
+    """Get the highest ROWID from the message table (optimized with persistent connection)."""
+>>>>>>> origin/main
     for attempt in range(DB_RETRY_ATTEMPTS):
         conn = init_chat_db()
         if not conn:
@@ -1170,6 +1270,7 @@ def get_last_message_id() -> Optional[int]:
                 row = cursor.fetchone()
                 return row[0] if row and row[0] else 0
         except sqlite3.OperationalError as e:
+<<<<<<< HEAD
             close_chat_db_connection()
             if attempt == DB_RETRY_ATTEMPTS - 1:
                 logger.warning("Failed to get last message ID after %d attempts: %s", attempt + 1, e)
@@ -1177,11 +1278,26 @@ def get_last_message_id() -> Optional[int]:
             backoff = _db_retry_backoff(attempt)
             logger.warning(
                 "Last-message lookup attempt %d failed: %s. Retrying in %.1f seconds...",
+=======
+            backoff = _retry_backoff_seconds(attempt)
+            logger.warning(
+                "Last message ID read attempt %d failed: %s. Retrying in %.1f seconds...",
+>>>>>>> origin/main
                 attempt + 1,
                 e,
                 backoff,
             )
+<<<<<<< HEAD
             time.sleep(backoff)
+=======
+            _reset_chat_db_connection()
+            if attempt < DB_RETRY_ATTEMPTS - 1:
+                time.sleep(backoff)
+        except sqlite3.Error as e:
+            logger.warning("Failed to get last message ID: %s", e)
+            _reset_chat_db_connection()
+            return None
+>>>>>>> origin/main
     return None
 
 
@@ -1318,12 +1434,12 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 
 def background_imessage_worker() -> None:
     """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
-    
+
     🆕 Now with prompt caching enabled for 80-90% token savings!
     """
     logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
     logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
-    
+
     last_id = get_last_message_id()
     if last_id is None:
         logger.error(
@@ -1356,14 +1472,16 @@ def background_imessage_worker() -> None:
             if sender.lower() == "me":
                 is_authorized = True
             else:
+                favorites_path = IVY_FAVORITES_FILE
                 # 🚀 Use cached favorites (reloads only if file changes)
                 allowed_contacts = load_favorites_cached()
                 if sender in allowed_contacts:
                     is_authorized = True
                 elif not allowed_contacts:
                     logger.warning(
-                        "⚠️ Security Alert: No contacts loaded from favorites.json! "
+                        "⚠️ Security Alert: No contacts loaded from favorites allowlist at %s! "
                         "Blocking external sender %s.",
+                        favorites_path,
                         sender,
                     )
 
@@ -1569,7 +1687,7 @@ def get_cache_stats(authenticated: bool = Depends(verify_api_key)):
     """🆕 View prompt caching performance and cost savings."""
     if not CACHING_AVAILABLE:
         return {"error": "Caching not available", "caching_enabled": False}
-    
+
     stats = cache_manager.get_cache_statistics()
     return {
         "caching_enabled": ENABLE_PROMPT_CACHING,
