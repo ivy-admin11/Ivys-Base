@@ -127,6 +127,11 @@ class SourceHealth:
         return f"{status} {self.name}{req}"
 
 
+_STATUS_TO_RESULT_TYPE: dict = {
+    "no_qualifying_picks": "no_picks",
+}
+
+
 class PipelineResult:
     """Comprehensive result of a Sharp Picks run."""
     
@@ -139,6 +144,7 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
+        self.attached = False
         self.report_id: Optional[str] = None
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
@@ -149,11 +155,15 @@ class PipelineResult:
     
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict for logging/API response."""
+        status_val = self.status.value
+        result_type = _STATUS_TO_RESULT_TYPE.get(status_val, status_val)
         return {
-            "status": self.status.value,
+            "status": status_val,
+            "result_type": result_type,
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
+            "attached": self.attached,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,

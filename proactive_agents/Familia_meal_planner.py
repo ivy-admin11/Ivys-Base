@@ -447,15 +447,21 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
                 content_summary = (
                     f"{result['recipe_count']} recipe(s) — {datetime.utcnow():%b %-d}"
                 )
-                _outbox.save_report(
-                    report_id, pdf_path,
-                    job_name="familia_meal_planner",
-                    recipient=phone,
-                    content_summary=content_summary,
-                )
+                try:
+                    _outbox.save_report(
+                        report_id, pdf_path,
+                        job_name="familia_meal_planner",
+                        recipient=phone,
+                        content_summary=content_summary,
+                    )
+                except Exception as _outbox_exc:
+                    logger.warning("Outbox save failed (delivery will proceed): %s", _outbox_exc)
 
                 receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
-                _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+                try:
+                    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
+                except Exception:
+                    pass
 
                 if receipt:
                     final_text = stats_line + "Full plan attached (PDF)."
