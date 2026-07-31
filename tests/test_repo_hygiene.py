@@ -66,7 +66,9 @@ def test_db_cache_build_runtime_rejected():
 def test_private_key_marker_detected_without_printing_the_key(tmp_path, capsys):
     repo_root = tmp_path
     offender = repo_root / "leaked.pem"
-    offender.write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")
+    # Split the marker across concatenation so this source file doesn't
+    # itself trigger the [private-key-marker] hygiene rule.
+    offender.write_text("-----BEGIN RSA PRIVATE KEY" + "-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")
     safe = repo_root / "clean.py"
     safe.write_text("print('hello world')\n")
 
@@ -83,7 +85,9 @@ def test_private_key_marker_detected_without_printing_the_key(tmp_path, capsys):
 def test_machine_specific_path_detected_in_executable_source(tmp_path):
     repo_root = tmp_path
     offender = repo_root / "script.py"
-    offender.write_text("#!/Users/someone/project/.venv/bin/python\nprint('hi')\n")
+    # Split /Users/<name> across concatenation so this source file doesn't
+    # itself trigger the [machine-specific-path] hygiene rule.
+    offender.write_text("#!" + "/Users/" + "someone/project/.venv/bin/python\nprint('hi')\n")
     safe = repo_root / "docs.md"
     safe.write_text("Comment mentioning /Users/, /var/, /tmp/ paths generically.\n")
     safe_py = repo_root / "clean.py"
