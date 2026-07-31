@@ -8,12 +8,7 @@ batch — never a sync per pick plus another append-all pass.
 
 import logging
 import re
-<<<<<<< HEAD
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional, Dict, Tuple
-=======
->>>>>>> origin/main
+
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 

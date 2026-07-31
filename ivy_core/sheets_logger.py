@@ -8,13 +8,7 @@ module only knows how to authenticate and write/clear ranges.
 import logging
 from typing import Dict, List, Optional
 
-<<<<<<< HEAD
-from google.oauth2.service_account import Credentials
-from google.auth import default
-from googleapiclient.discovery import build
-=======
 import config
->>>>>>> origin/main
 
 logger = logging.getLogger("ivy.sheets_logger")
 

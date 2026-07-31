@@ -8,10 +8,7 @@ performs Google API calls or Sheets I/O.
 
 import logging
 import sqlite3
-<<<<<<< HEAD
-=======
 from datetime import datetime, timezone
->>>>>>> origin/main
 from pathlib import Path
 from typing import Dict, List, Optional
 
