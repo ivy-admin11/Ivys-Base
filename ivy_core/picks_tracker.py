@@ -211,13 +211,16 @@ def _mark_duplicates_and_carry_results(conn: sqlite3.Connection) -> None:
                     (outcome_result, outcome_score, canonical_id),
                 )
         elif len(distinct_outcomes) > 1:
+            detail = (
+                f"{len(distinct_outcomes)} conflicting resolved outcomes "
+                f"({sorted(distinct_outcomes)}) across a {len(ids)}-row duplicate group"
+            )
             conn.execute(
-                "INSERT INTO pick_conflicts (pick_key, canonical_id, detail) VALUES (?, ?, ?)",
-                (
-                    pick_key, canonical_id,
-                    f"{len(distinct_outcomes)} conflicting resolved outcomes "
-                    f"({sorted(distinct_outcomes)}) across a {len(ids)}-row duplicate group",
-                ),
+                "INSERT INTO pick_conflicts (pick_key, canonical_id, detail) "
+                "SELECT ?, ?, ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM pick_conflicts WHERE pick_key = ? AND canonical_id = ? AND detail = ?"
+                ")",
+                (pick_key, canonical_id, detail, pick_key, canonical_id, detail),
             )
             logger.warning(
                 "picks_tracker migration: conflicting outcomes for pick_key=%s "

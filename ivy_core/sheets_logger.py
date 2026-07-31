@@ -19,6 +19,14 @@ def _not_configured(reason: str) -> Dict:
     return {"status": "not_configured", "reason": reason}
 
 
+def _column_letter(column_number: int) -> str:
+    letters = []
+    while column_number > 0:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
 def get_sheets_service():
     """Authenticated Sheets API client, or None if unavailable.
 
@@ -76,7 +84,7 @@ def write_snapshot(header: List[str], rows: List[List], tab_name: Optional[str] 
         return _not_configured(f"tab {tab!r} not found in configured spreadsheet")
 
     n_cols = len(header)
-    last_col = chr(ord("A") + n_cols - 1) if n_cols <= 26 else "Z"
+    last_col = _column_letter(n_cols)
     all_values = [header] + rows
 
     try:
@@ -115,7 +123,7 @@ def write_summary(header: List[str], rows: List[List], tab_name: Optional[str] =
         return _not_configured(f"tab {tab!r} not found in configured spreadsheet")
 
     n_cols = len(header)
-    last_col = chr(ord("A") + n_cols - 1) if n_cols <= 26 else "Z"
+    last_col = _column_letter(n_cols)
     all_values = [header] + rows
 
     try:

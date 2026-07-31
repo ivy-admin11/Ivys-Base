@@ -886,7 +886,11 @@ def format_picks_by_sport(merged):
     # Footer with summary
     lines.append("—")
     lines.append(f"Total: {len(merged)} picks ({len(consensus_picks)} consensus)")
-    lines.append("Check the dashboard: https://docs.google.com/spreadsheets/d/1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ/")
+    if config.GOOGLE_SHEETS_SPREADSHEET_ID:
+        lines.append(
+            "Check the dashboard: "
+            f"https://docs.google.com/spreadsheets/d/{config.GOOGLE_SHEETS_SPREADSHEET_ID}/"
+        )
     
     return "\n".join(lines)
 
@@ -1079,7 +1083,7 @@ def _run_pipeline(
     #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
     filtered_picks = []
     for p in merged:
-        confidence = (p.get("enrichment", {}).get("confidence") or "").lower()
+        confidence = (p.get("confidence") or p.get("enrichment", {}).get("confidence") or "").lower()
         is_consensus = p.get("is_consensus", False)
         sharp_count = p.get("consensus_count", 1)
         
