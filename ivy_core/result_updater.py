@@ -7,7 +7,7 @@ determines outcomes (W/L/P), and updates the database + Google Sheets.
 import sqlite3
 import logging
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Dict, Tuple
 from decimal import Decimal, InvalidOperation

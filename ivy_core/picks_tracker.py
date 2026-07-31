@@ -7,10 +7,8 @@ Stores picks with their outcomes in a SQLite database, enabling:
 - Google Sheets logging for shared visibility
 """
 
-import json
 import logging
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
