@@ -17,7 +17,7 @@ import sys
 import json
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 
 # Add parent directory to path for .ivy module access
@@ -47,6 +47,7 @@ from ivy_core.report_fallback import (
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
 from picks_formatter import PicksReportFormatter
+from config import HENRY_PHONE, LEXI_PHONE  # required env vars — raise at startup if unset
 
 logger = logging.getLogger("ivy.happy_hour_scout")
 
@@ -74,10 +75,10 @@ SCOUT_TARGET = {
     ],
 }
 
-# Default alert recipients (pulled from environment or fallback)
+# Alert recipients — values come from required env vars
 ALERT_RECIPIENTS = {
-    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
-    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
+    "henry": HENRY_PHONE,
+    "lexi": LEXI_PHONE,
 }
 
 # ============================================================================
@@ -112,7 +113,7 @@ def fetch_local_specials() -> Dict[str, Any]:
     discovery_payload = {
         "venues": [],
         "specials": [],
-        "updates": datetime.utcnow().isoformat(),
+        "updates": datetime.now(timezone.utc).isoformat(),
         "source_confidence": 0.0,
     }
 
@@ -370,7 +371,7 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
         "discovery_count": 0,
         "alert_sent": False,
         "alert_text": "",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
@@ -400,8 +401,9 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                 try:
                     # Assign a report ID and persist to durable outbox.
                     report_id = _outbox.make_report_id("happy_hour")
+                    local_now = datetime.now(timezone.utc).astimezone()
                     content_summary = (
-                        f"{result['discovery_count']} special(s) — {datetime.utcnow():%b %-d}"
+                        f"{result['discovery_count']} special(s) — {local_now:%b} {local_now.day}"
                     )
                     _outbox.save_report(
                         report_id, pdf_path,

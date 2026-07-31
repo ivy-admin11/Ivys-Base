@@ -37,6 +37,16 @@ def isolated_receipts_db(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def isolated_picks_db(tmp_path, monkeypatch):
+    """Every test gets its own scratch SQLite file — never the real
+    data/picks.db."""
+    from ivy_core import picks_tracker
+
+    monkeypatch.setattr(picks_tracker, "PICKS_DB", tmp_path / "test_picks.db")
+    yield
+
+
 @pytest.fixture
 def admin_api_key():
     return os.environ["ADMIN_SECRET"]

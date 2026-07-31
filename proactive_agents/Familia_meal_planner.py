@@ -49,6 +49,7 @@ from ivy_core.report_fallback import (
 # PDF formatter for professional reports
 sys.path.insert(0, parent_dir)
 from picks_formatter import PicksReportFormatter
+from config import HENRY_PHONE, LEXI_PHONE  # required env vars — raise at startup if unset
 
 logger = logging.getLogger("ivy.familia_meal_planner")
 
@@ -81,10 +82,10 @@ MEAL_PLAN_CONFIG = {
     ],
 }
 
-# Alert recipients
+# Alert recipients — values come from required env vars
 ALERT_RECIPIENTS = {
-    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
-    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
+    "henry": HENRY_PHONE,
+    "lexi": LEXI_PHONE,
 }
 
 # Initialize state threshold: July 15, 2026 8am America/Chicago (handles DST
@@ -232,7 +233,7 @@ def generate_family_meal_plan() -> Dict[str, Any]:
             "status": "success",
             "recipe_count": len(recipes),
             "recipes": recipes,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     except Exception as e:
@@ -395,7 +396,7 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
         "recipe_count": 0,
         "alert_sent": False,
         "alert_text": "",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     # Step 1: Check 48-hour gate
@@ -444,8 +445,9 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
             try:
                 # Assign a report ID and persist to durable outbox.
                 report_id = _outbox.make_report_id("familia_meal_planner")
+                local_now = datetime.now(timezone.utc).astimezone()
                 content_summary = (
-                    f"{result['recipe_count']} recipe(s) — {datetime.utcnow():%b %-d}"
+                    f"{result['recipe_count']} recipe(s) — {local_now:%b} {local_now.day}"
                 )
                 _outbox.save_report(
                     report_id, pdf_path,
