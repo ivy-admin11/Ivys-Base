@@ -113,6 +113,11 @@ if not LEXI_PHONE:
         "or export it in the environment before starting Ivy."
     )
 
+IVY_FAVORITES_FILE: str = os.path.expanduser(
+    os.environ.get("IVY_FAVORITES_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json"))
+)
+"""Local contact allowlist path (real allowlists are gitignored; see favorites.example.json)"""
+
 # ============================================================================
 # PROVIDER & EXTERNAL SERVICE API KEYS (optional — missing keys disable only
 # the dependent capability, they must never raise at import time)
@@ -132,6 +137,24 @@ ODDS_API_KEY: str = os.environ.get("ODDS_API_KEY", "")
 
 READWISE_API_KEY: str = os.environ.get("READWISE_API_KEY", "")
 """Readwise API key"""
+
+# ============================================================================
+# GOOGLE SHEETS — SHARP PICKS SNAPSHOT SYNC
+# ============================================================================
+
+GOOGLE_SERVICE_ACCOUNT_KEY: str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
+"""Path to a Google service-account JSON key file. Empty means Sheets sync
+falls back to Application Default Credentials (or reports not_configured
+if ADC is also unavailable)."""
+
+GOOGLE_SHEETS_SPREADSHEET_ID: str = os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+"""Target spreadsheet ID for the Sharp Picks canonical snapshot sync."""
+
+GOOGLE_SHEETS_PICKS_TAB: str = os.environ.get("GOOGLE_SHEETS_PICKS_TAB", "Sharp Picks")
+"""Sheet tab name for the canonical picks snapshot."""
+
+GOOGLE_SHEETS_SUMMARY_TAB: str = os.environ.get("GOOGLE_SHEETS_SUMMARY_TAB", "Summary")
+"""Sheet tab name for the W/L/P statistics summary."""
 
 # ============================================================================
 # PROMPT CACHING (Token Cost Optimization)

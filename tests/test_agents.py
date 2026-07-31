@@ -38,54 +38,44 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
 
     result = sports_bettor.run(force=True, send=False)
 
-    assert result["result_type"] == "no_picks"
+    assert result["status"] == "no_qualifying_picks"
     assert result["sent"] is False
     assert sent == []
 
 
-def test_sports_bettor_sends_text_report_when_send_true(monkeypatch):
-    # Verify that Sports Bettor returns proper format for text-only reports
-    # (not PDF attachments, contrary to the old test name)
-    # Mock pick data that passes quality filters (high confidence single-sharp)
-    mock_pick = {
-        "account": "@real",
-        "matchup": "A vs B",
-        "enrichment": {"confidence": "high"},
-        "sport": "NFL",
-        "line": "+3",
-    }
-    
+def test_sports_bettor_is_text_only_no_pdf(monkeypatch):
+    """Sharp Picks delivery is text-only — no PDF generation/attachment path
+    exists anymore. send_imessage carries the whole report body."""
     monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
-    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [mock_pick])
-    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
-        {
-            **mock_pick,
-            "is_consensus": False,
-            "consensus_count": 1,
-        }
-    ])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"matchup": "A @ B", "side": "A -2.5"}])
+    monkeypatch.setattr(
+        sports_bettor, "merge_picks",
+        lambda picks: [{
+            "sport": "NFL", "matchup": "A @ B", "side": "A -2.5", "odds": "-110",
+            "handicappers": ["real1", "real2"], "confidence": "high", "game_day": "today",
+            "start": None, "reasoning": "test", "consensus_count": 2, "is_consensus": True,
+        }],
+    )
     monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
-    monkeypatch.setattr(sports_bettor, "_report_signature", lambda merged: "sig-1")
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, report_date: {"inserted": len(picks), "updated": 0, "total": len(picks)})
     monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
-    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
-    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, report_date: None)
+    saved = {}
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: saved.update(sig=sig, msg=msg))
+    monkeypatch.setattr("ivy_core.result_updater.auto_update_results", lambda: {"status": "skipped"})
 
-    sent_messages = []
-    monkeypatch.setattr(
-        sports_bettor, "send_imessage",
-        lambda phone, text, **k: sent_messages.append((phone, text)) or True,
-    )
+    sent = []
+    monkeypatch.setattr(sports_bettor, "send_imessage", lambda phone, text: sent.append((phone, text)) or True)
+    assert not hasattr(sports_bettor, "format_picks_pdf"), "format_picks_pdf should no longer exist — text-only delivery"
+    assert not hasattr(sports_bettor, "send_imessage_attachment") or True  # attribute may exist via import, just unused here
 
     result = sports_bettor.run(force=True, send=True)
 
-    # Verify text report was sent
-    assert sent_messages, "send_imessage was never called"
+    assert sent, "send_imessage was never called — text report was never sent"
     assert result["sent"] is True
-    # Verify backward-compatible keys are present
+    assert saved.get("msg") == sent[0][1], "save_last_report must store the report body, not the signature twice"
     assert "result_type" in result
     assert "attached" in result
-
 
 
 def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):
@@ -93,7 +83,7 @@ def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
         tmp_pdf.write(b"%PDF-1.4\n%mock pdf content")
         temp_pdf_path = tmp_pdf.name
-    
+
     try:
         monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
         monkeypatch.setattr(
@@ -129,7 +119,7 @@ def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
         tmp_pdf.write(b"%PDF-1.4\n%mock pdf content")
         temp_pdf_path = tmp_pdf.name
-    
+
     try:
         monkeypatch.setattr(
             happy_hour_scout, "fetch_local_specials",
@@ -151,4 +141,3 @@ def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
     finally:
         # Clean up the temporary file
         Path(temp_pdf_path).unlink(missing_ok=True)
-

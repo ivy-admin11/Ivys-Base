@@ -14,7 +14,7 @@ Environment-specific secrets go in .env (see .env.example).
 Security:
 - All FastAPI endpoints require X-API-Key header matching ADMIN_SECRET
 - Database reads use SQLite read-only mode to prevent accidental mutations
-- iMessage poller validates sender against favorites.json whitelist
+- iMessage poller validates sender against the IVY_FAVORITES_FILE allowlist
 
 Voice Assistant Features:
 - Session-based conversation management with automatic cleanup
@@ -59,6 +59,7 @@ from config import (
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
     ADMIN_SECRET,
+    IVY_FAVORITES_FILE,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
@@ -950,11 +951,11 @@ def query_llm_with_tools(prompt_text: str) -> str:
 
 def load_favorites_cached() -> List[str]:
     """Load favorites.json once, cache in memory. Reload only if file changes.
-    
+
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
-    favorites_path = "favorites.json"
-    
+    favorites_path = IVY_FAVORITES_FILE
+
     try:
         stat = os.stat(favorites_path)
         current_mtime = stat.st_mtime
@@ -988,25 +989,25 @@ def load_favorites_cached() -> List[str]:
                     else:
                         skipped += 1
                 if skipped:
-                    logger.debug("Skipped %d invalid/empty entries in favorites.json", skipped)
+                    logger.debug("Skipped %d invalid/empty entries in favorites allowlist", skipped)
             else:
                 normalized = []
             _FAVORITES_CACHE["contacts"] = normalized
             _FAVORITES_CACHE["mtime"] = current_mtime
             _FAVORITES_CACHE["loaded"] = True
-            logger.debug("Reloaded favorites.json (%d contacts)", len(normalized))
+            logger.debug("Reloaded favorites allowlist from %s (%d contacts)", favorites_path, len(normalized))
             return list(normalized)
         except Exception as e:
             _FAVORITES_CACHE["contacts"] = []
             _FAVORITES_CACHE["mtime"] = 0.0
             _FAVORITES_CACHE["loaded"] = False
-            logger.warning("Failed to parse favorites.json: %s", e)
+            logger.warning("Failed to parse favorites allowlist at %s: %s", favorites_path, e)
             return []
 
 
 def init_chat_db():
     """Initialize persistent read-only connection to chat.db.
-    
+
     🚀 Performance: Reuses connection across polls (80-150ms saved per poll)
     """
     global _CHAT_DB_CONN
@@ -1246,12 +1247,12 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 
 def background_imessage_worker() -> None:
     """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
-    
+
     🆕 Now with prompt caching enabled for 80-90% token savings!
     """
     logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
     logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
-    
+
     last_id = get_last_message_id()
     if last_id is None:
         logger.error(
@@ -1284,14 +1285,16 @@ def background_imessage_worker() -> None:
             if sender.lower() == "me":
                 is_authorized = True
             else:
+                favorites_path = IVY_FAVORITES_FILE
                 # 🚀 Use cached favorites (reloads only if file changes)
                 allowed_contacts = load_favorites_cached()
                 if sender in allowed_contacts:
                     is_authorized = True
                 elif not allowed_contacts:
                     logger.warning(
-                        "⚠️ Security Alert: No contacts loaded from favorites.json! "
+                        "⚠️ Security Alert: No contacts loaded from favorites allowlist at %s! "
                         "Blocking external sender %s.",
+                        favorites_path,
                         sender,
                     )
 
@@ -1497,7 +1500,7 @@ def get_cache_stats(authenticated: bool = Depends(verify_api_key)):
     """🆕 View prompt caching performance and cost savings."""
     if not CACHING_AVAILABLE:
         return {"error": "Caching not available", "caching_enabled": False}
-    
+
     stats = cache_manager.get_cache_statistics()
     return {
         "caching_enabled": ENABLE_PROMPT_CACHING,

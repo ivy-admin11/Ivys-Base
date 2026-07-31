@@ -6,7 +6,7 @@ A FastAPI-powered local iMessage automation engine for managing sports picks, me
 
 - **Core Engine**: `main.py` (FastAPI app with background iMessage database polling)
 - **Primary Database**: macOS Chat DB (`~/Library/Messages/chat.db`)
-- **Primary LLM**: Gemini 2.5 Flash via `google-genai` (DeepSeek fallback on error)
+- **Primary LLM**: DeepSeek (`deepseek-chat`); falls back to Gemini 2.5 Flash on provider failure, timeout, or empty response
 - **Integrations**: Google Docs/Slides API, xAI (Grok), Odds API
 - **Automation**: AppleScript for outbound iMessage routing, launchd for scheduled jobs
 
@@ -99,15 +99,14 @@ uvicorn main:app --host 127.0.0.1 --port 8000 2>&1 | tee run.log
 ## Automation Schedule
 
 Jobs run automatically via launchd:
-- **Sharp Picks**: Every 30 minutes (4 CST windows)
-- **Happy Hour Scout**: Weekly Sundays at 12pm CST
-- **Weekly Planner**: On demand
-- **Bravo Scout**: Daily monitoring
+- **Sharp Picks**: 3x daily at 9am / 3pm / 9pm CT
+- **Happy Hour Scout**: Weekly, Sundays at 12pm CST
+- **Familia Meal Planner**: Sundays at 8am CST
+- **Bravo Scout**: unavailable — not implemented in this repo
 
 ## Security Notes
 
-- Endpoints currently unauthenticated (localhost only)
-- Add shared-secret header before exposing beyond localhost
+- Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`; the process fails closed and refuses to start if `ADMIN_SECRET` is unset
 - Never commit `.env`, `*.pem`, or credential files
 - iMessage files must be staged in `~/Pictures` (chat.db limitation)
 
