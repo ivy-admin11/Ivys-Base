@@ -4,7 +4,7 @@ Ivy Local Admin API Gateway v2.2 — Voice Assistant Edition
 Architecture:
 - Phase 1: Critical fixes (duplicates, auth, f-string bugs)
 - Phase 2: Config consolidation (tool schemas, timeouts, feature flags)
-- Phase 3: Gemini SDK refactor (use google.generativeai official library)
+- Phase 3: Gemini SDK refactor (use google.genai official SDK)
 - Phase 4: Prompt caching for 80-90% token cost reduction ✅ IMPLEMENTED
 - Phase 5: Voice assistant with session management and cache optimization ✅ IMPLEMENTED
 
@@ -38,7 +38,7 @@ import logging
 import json
 import requests
 import subprocess
-import google.generativeai as genai
+from google import genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Callable
@@ -134,8 +134,107 @@ except ImportError:
 # GEMINI SDK CONFIGURATION
 # ============================================================================
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+_GEMINI_MODEL = "gemini-2.5-flash"
+_gemini_client = None
+
+
+def _get_gemini_client():
+    """Lazily initialize Gemini client using API-key auth."""
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    # Keep ADC env noise from interfering with explicit API-key auth.
+    saved = {
+        k: os.environ.pop(k)
+        for k in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")
+        if k in os.environ
+    }
+    try:
+        _gemini_client = genai.Client(api_key=api_key)
+    finally:
+        os.environ.update(saved)
+    return _gemini_client
+
+
+def _make_gemini_config(
+    system_instruction: Optional[str] = None,
+    *,
+    include_tools: bool = True,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if include_tools:
+        config["tools"] = [{"function_declarations": GEMINI_TOOL_DECLARATIONS}]
+    if system_instruction:
+        config["system_instruction"] = system_instruction
+    return config
+
+
+def _part_text(part: Any) -> str:
+    if isinstance(part, dict):
+        return part.get("text") or ""
+    return getattr(part, "text", "") or ""
+
+
+def _part_function_call(part: Any) -> Optional[Dict[str, Any]]:
+    # Handles both SDK objects and plain dict parts used in tests/follow-up payloads.
+    raw = part.get("function_call") if isinstance(part, dict) else getattr(part, "function_call", None)
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return {"name": raw.get("name"), "args": raw.get("args") or {}}
+    return {"name": getattr(raw, "name", None), "args": getattr(raw, "args", {}) or {}}
+
+
+def _extract_gemini_parts(response: Any) -> List[Any]:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return []
+    content = getattr(candidates[0], "content", None)
+    return getattr(content, "parts", None) or []
+
+
+def _extract_gemini_reply_and_tool_calls(response: Any) -> tuple[str, List[Dict[str, Any]], List[Any]]:
+    parts = _extract_gemini_parts(response)
+    text_reply = "".join(_part_text(part) for part in parts)
+    tool_calls = []
+    for part in parts:
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            tool_calls.append(call)
+    return text_reply, tool_calls, parts
+
+
+def _serialize_parts(parts: List[Any]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for part in parts:
+        text = _part_text(part)
+        if text:
+            serialized.append({"text": text})
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            serialized.append(
+                {"function_call": {"name": call["name"], "args": call.get("args") or {}}}
+            )
+    return serialized
+
+
+def _gemini_generate_content(
+    *,
+    contents: Any,
+    system_instruction: Optional[str] = None,
+    include_tools: bool = True,
+):
+    client = _get_gemini_client()
+    return client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=contents,
+        config=_make_gemini_config(system_instruction, include_tools=include_tools),
+    )
 
 # ============================================================================
 # PYDANTIC MODELS (Voice Assistant)
@@ -364,9 +463,12 @@ def _probe_gemini() -> Dict[str, Any]:
             "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
         }
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        model.generate_content("hi", generation_config={"max_output_tokens": 1})
+        client = genai.Client(api_key=api_key)
+        client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents="hi",
+            config={"max_output_tokens": 1},
+        )
         return {
             "configured": True, "authenticated": True, "reachable": True,
             "role": "failover", "status": "ready", "reason": None,
@@ -848,24 +950,22 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
             tool_declarations=GEMINI_TOOL_DECLARATIONS,
         )
-        if messages is None:
+        if not messages:
             logger.warning("Caching failed, falling back to non-cached request")
-            messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+            messages = [{"role": "user", "parts": [{"text": text}]}]
             use_caching = False
     else:
-        messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+        messages = [{"role": "user", "parts": [{"text": text}]}]
 
     # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
     # The cache_manager already includes it in the message stream
     if use_caching:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
         )
     else:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
         )
 
@@ -875,20 +975,7 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             response, endpoint="background_imessage_worker", model="gemini-2.5-flash"
         )
 
-    if not (response.candidates and response.candidates[0].content):
-        return None
-
-    parts = response.candidates[0].content.parts
-    text_reply = ""
-    tool_calls = []
-    for part in parts:
-        if hasattr(part, "text") and part.text:
-            text_reply += part.text
-        # part.function_call is always a present attribute (protobuf oneof
-        # field) even on text-only parts — checking truthiness, not hasattr,
-        # is what actually detects a real tool call.
-        if getattr(part, "function_call", None):
-            tool_calls.append(part.function_call)
+    text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
 
     if not tool_calls:
         return text_reply.strip() or None
@@ -896,8 +983,8 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
     logger.info("🛠️ Gemini returned %d tool operations", len(tool_calls))
     tool_results = []
     for call in tool_calls:
-        tool_name = call.name
-        tool_args = call.args
+        tool_name = call["name"]
+        tool_args = dict(call.get("args") or {})
         # Enforce Household list for reminders
         if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
             tool_args["list_name"] = "Household"
@@ -908,14 +995,10 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
 
     # Follow-up call with the *real* tool results (previously always sent
     # back an empty {} regardless of what the tool actually returned).
-    follow_up_kwargs = {"tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
-    if not use_caching:
-        follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
-
-    follow_up_response = gemini_model.generate_content(
-        [
+    follow_up_response = _gemini_generate_content(
+        contents=[
             *messages,
-            {"role": "model", "parts": parts},
+            {"role": "model", "parts": _serialize_parts(parts)},
             {
                 "role": "function",
                 "parts": [
@@ -924,12 +1007,11 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
                 ],
             },
         ],
-        **follow_up_kwargs,
+        system_instruction=None if use_caching else GEMINI_SYSTEM_INSTRUCTION,
+        include_tools=False,
     )
-    if follow_up_response.candidates:
-        follow_up_parts = follow_up_response.candidates[0].content.parts
-        return "".join(p.text for p in follow_up_parts if hasattr(p, "text")).strip() or None
-    return None
+    follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+    return follow_up_text.strip() or None
 
 
 def query_llm_with_tools(prompt_text: str) -> str:
@@ -1552,9 +1634,8 @@ def voice_query(
                     system_instruction=GEMINI_SYSTEM_INSTRUCTION,
                     tool_declarations=GEMINI_TOOL_DECLARATIONS
                 )
-                response = gemini_model.generate_content(
-                    messages,
-                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                response = _gemini_generate_content(
+                    contents=messages,
                 )
 
                 if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
@@ -1562,30 +1643,22 @@ def voice_query(
                         response, endpoint="voice_query", model="gemini-2.5-flash"
                     )
 
-                if response.candidates and response.candidates[0].content:
-                    parts = response.candidates[0].content.parts
-                    text_reply = ""
-                    tool_calls = []
-                    for part in parts:
-                        if hasattr(part, "text") and part.text:
-                            text_reply += part.text
-                        # Truthiness, not hasattr — see _gemini_backup_reply.
-                        if getattr(part, "function_call", None):
-                            tool_calls.append(part.function_call)
+                text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
+                if text_reply or tool_calls:
 
                     if tool_calls:
                         tool_results = []
                         for call in tool_calls:
-                            tool_name = call.name
-                            tool_args = call.args
+                            tool_name = call["name"]
+                            tool_args = dict(call.get("args") or {})
                             if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
                                 tool_args["list_name"] = "Household"
                             tool_results.append((tool_name, _execute_tool_call(tool_name, tool_args)))
 
-                        follow_up_response = gemini_model.generate_content(
-                            [
+                        follow_up_response = _gemini_generate_content(
+                            contents=[
                                 *messages,
-                                {"role": "model", "parts": parts},
+                                {"role": "model", "parts": _serialize_parts(parts)},
                                 {
                                     "role": "function",
                                     "parts": [
@@ -1594,13 +1667,10 @@ def voice_query(
                                     ],
                                 },
                             ],
-                            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                            include_tools=False,
                         )
-                        if follow_up_response.candidates:
-                            follow_up_parts = follow_up_response.candidates[0].content.parts
-                            reply = "".join(
-                                p.text for p in follow_up_parts if hasattr(p, "text")
-                            ).strip() or None
+                        follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+                        reply = follow_up_text.strip() or None
                     else:
                         reply = text_reply.strip() or None
             except Exception as gemini_err:

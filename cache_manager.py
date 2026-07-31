@@ -17,11 +17,6 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
-
 logger = logging.getLogger("ivy.cache")
 
 
@@ -121,37 +116,33 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
         Returns: [cached_system_block, user_message]
         where cached_system_block has cache_control set to ephemeral.
         """
-        if genai is None:
-            logger.warning("google.generativeai not installed, caching disabled")
-            return None
-            
         if not self.enable_caching:
             # Fallback: send everything in a single message (no caching)
-            return [genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=f"{system_instruction}\n\nUser: {user_message}")]
-            )]
+            return [{
+                "role": "user",
+                "parts": [{"text": f"{system_instruction}\n\nUser: {user_message}"}],
+            }]
 
         messages = []
 
         # ✅ PART 1: Cached system + tools (reused across requests)
         cached_system = self.build_cached_system_prompt(system_instruction, tool_declarations)
         messages.append(
-            genai.types.ContentDict(
-                role="user",
-                parts=[{
+            {
+                "role": "user",
+                "parts": [{
                     "text": cached_system,
                     "cache_control": {"type": "ephemeral"}  # ✅ KEY: Mark for caching
                 }]
-            )
+            }
         )
 
         # ✅ PART 2: Current user message (unique, not cached)
         messages.append(
-            genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=user_message)]
-            )
+            {
+                "role": "user",
+                "parts": [{"text": user_message}],
+            }
         )
 
         return messages
