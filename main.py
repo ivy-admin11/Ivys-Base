@@ -29,6 +29,7 @@ Cost Optimization:
 """
 
 import os
+import shutil as _shutil
 import socket
 import sys
 import time
@@ -1337,6 +1338,290 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 
 
 # ============================================================================
+# OPERATIONS COMMAND HANDLER (deterministic — no LLM)
+# ============================================================================
+
+
+def get_tailscale_status() -> str:
+    """Return a concise, iMessage-safe Tailscale status summary.
+
+    Uses ``tailscale status --json`` via subprocess (no shell=True).
+    Never exposes auth keys, node keys, machine keys, or control URLs.
+    """
+    cli = _shutil.which("tailscale")
+    if not cli:
+        return "🔴 Tailscale unavailable\nThe tailscale CLI was not found on the iMac."
+
+    try:
+        result = subprocess.run(
+            [cli, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return "🟠 Tailscale status could not be read.\n(CLI timed out after 5 s)"
+    except Exception as exc:
+        logger.warning("tailscale status error: %s", exc)
+        return "🟠 Tailscale status could not be read."
+
+    if result.returncode != 0:
+        return "🟠 Tailscale status could not be read."
+
+    try:
+        data = json.loads(result.stdout)
+    except Exception:
+        return "🟠 Tailscale status could not be read."
+
+    # --- Extract safe fields only ---
+    backend_state: str = data.get("BackendState", "Unknown")
+    self_node: Dict[str, Any] = data.get("Self", {})
+
+    hostname: str = self_node.get("HostName") or self_node.get("DNSName", "unknown")
+    # Strip trailing dot and domain suffix from DNSName if present
+    if "." in hostname:
+        hostname = hostname.split(".")[0]
+
+    ts_ip: str = ""
+    tailscale_ips = self_node.get("TailscaleIPs") or []
+    for ip in tailscale_ips:
+        # Prefer IPv4
+        if ":" not in str(ip):
+            ts_ip = str(ip)
+            break
+    if not ts_ip and tailscale_ips:
+        ts_ip = str(tailscale_ips[0])
+
+    running = backend_state in ("Running", "Starting")
+    state_label = "Running" if running else backend_state
+
+    # Exit node
+    exit_node_status = data.get("ExitNodeStatus") or {}
+    exit_node_id = exit_node_status.get("ID", "")
+    exit_node_name = "None"
+    if exit_node_id:
+        # Try to resolve name from peer list
+        for peer in (data.get("Peer") or {}).values():
+            if peer.get("ID") == exit_node_id:
+                peer_host = peer.get("HostName") or peer.get("DNSName", "")
+                if "." in peer_host:
+                    peer_host = peer_host.split(".")[0]
+                exit_node_name = peer_host or exit_node_id
+                break
+        if exit_node_name == "None":
+            exit_node_name = exit_node_id[:16]
+
+    # Online peers
+    peers: Dict[str, Any] = data.get("Peer") or {}
+    online_peers = []
+    for peer in peers.values():
+        if peer.get("Online"):
+            name = peer.get("HostName") or peer.get("DNSName", "")
+            if "." in name:
+                name = name.split(".")[0]
+            if name:
+                online_peers.append(name)
+
+    # Build summary
+    icon = "🟢" if running else "🟠"
+    lines = [
+        f"{icon} Tailscale Status",
+        "",
+        f"Local device: {hostname}",
+        f"Tailscale IP: {ts_ip or 'N/A'}",
+        f"Backend: {state_label}",
+        f"Exit node: {exit_node_name}",
+        f"Online peers: {len(online_peers)}",
+    ]
+    for p in online_peers:
+        lines.append(f"• {p}")
+
+    return "\n".join(lines)
+
+
+def _get_ivy_status_text() -> str:
+    """Return a brief, deterministic status of the Ivy gateway."""
+    uptime = datetime.now() - PROCESS_STARTED_AT
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes = remainder // 60
+    uptime_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+    statuses = compute_tool_statuses()
+    ready_count = sum(1 for s in statuses if s["status"] == "ready")
+    total_count = len(statuses)
+
+    jobs_available = 0
+    jobs_total = 0
+    if JOB_RUNNER_AVAILABLE:
+        all_jobs = job_runner.list_jobs()
+        jobs_total = len(all_jobs)
+        jobs_available = sum(1 for j in all_jobs if j["available"])
+
+    lines = [
+        "🟢 Ivy Gateway — Online",
+        "",
+        f"Uptime: {uptime_str}",
+        f"Poller: {'active' if ENABLE_IMESSAGE_POLLER else 'disabled'}",
+        f"Tools ready: {ready_count}/{total_count}",
+        f"Jobs available: {jobs_available}/{jobs_total}",
+        f"Caching: {'on' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'off'}",
+        f"Host: {socket.gethostname()}",
+    ]
+    return "\n".join(lines)
+
+
+def _get_capabilities_text() -> str:
+    """Return a human-readable list of all tools and jobs."""
+    statuses = compute_tool_statuses()
+    lines = ["📋 Ivy Skills & Capabilities", ""]
+    lines.append("Tools:")
+    for s in statuses:
+        if s["status"] == "ready":
+            lines.append(f"  ✅ {s['tool_name']}")
+        elif s["status"] == "disabled":
+            lines.append(f"  ⊘ {s['tool_name']} (disabled)")
+        else:
+            lines.append(f"  ❌ {s['tool_name']} (unavailable)")
+
+    if JOB_RUNNER_AVAILABLE:
+        lines.append("")
+        lines.append("Jobs:")
+        for job in job_runner.list_jobs():
+            if job["available"]:
+                sched = job.get("schedule") or "on-demand"
+                lines.append(f"  ✅ {job['display_name']} — {sched}")
+            else:
+                lines.append(f"  ❌ {job['display_name']} (unavailable)")
+
+    return "\n".join(lines)
+
+
+def _get_job_status_text(job_name: Optional[str] = None) -> str:
+    """Return recent execution history for a job (or all jobs)."""
+    try:
+        recent = receipts.list_recent(limit=5, job_name=job_name)
+    except Exception as exc:
+        logger.warning("receipts.list_recent error: %s", exc)
+        return "⚠️ Could not read execution history."
+
+    label = job_name.replace("_", " ").title() if job_name else "All Jobs"
+    if not recent:
+        return f"📋 {label} — no recent executions found."
+
+    lines = [f"📋 {label} — recent runs:", ""]
+    for rec in recent:
+        started = rec.get("started_at", "")[:16].replace("T", " ")
+        status = rec.get("status", "?")
+        name = rec.get("job_name", "?")
+        icon = "✅" if status == "success" else ("🔄" if status == "started" else "❌")
+        lines.append(f"{icon} {name} @ {started} — {status}")
+    return "\n".join(lines)
+
+
+# Phrase → category mapping for deterministic operations routing.
+# Phrases are matched after stripping a leading "ivy" or "ivy," token and
+# collapsing whitespace.  Order does not matter; exact set-membership lookup.
+_OPS_TAILSCALE: frozenset = frozenset({
+    "tailscale status",
+    "check tailscale",
+    "is tailscale online",
+    "tailscale",
+    "vpn status",
+    "network status",
+})
+
+_OPS_IVY_STATUS: frozenset = frozenset({
+    "ivy status",
+    "status",
+    "health check",
+    "system health",
+    "gateway status",
+    "poller status",
+    "is ivy online",
+    "are you working",
+})
+
+_OPS_CAPABILITIES: frozenset = frozenset({
+    "skills",
+    "ivy skills",
+    "list skills",
+    "tell me all your skills",
+    "tell me all of your skills",
+    "what can you do",
+    "capabilities",
+    "list capabilities",
+    "what is turned on",
+    "what things are turned on",
+    "are all your skills active",
+    "advise if all your skills are active",
+    # variants with "of your" wording (seen in real messages)
+    "advise if all of your skills are active",
+    "tell me what are all of the things that are turned on",
+})
+
+_OPS_JOB_STATUS: frozenset = frozenset({
+    "sharp picks status",
+    "last sharp picks",
+    "last job",
+    "recent jobs",
+    "execution status",
+})
+
+
+def _normalize_ops_text(text: str) -> str:
+    """Normalize text for operations command recognition only.
+
+    - Strips leading/trailing whitespace.
+    - Collapses repeated whitespace to a single space.
+    - Lowercases.
+    - Optionally removes a leading ``ivy`` or ``ivy,`` token.
+    """
+    normalized = " ".join(text.strip().split()).lower()
+    # Strip optional leading "ivy," or "ivy " prefix
+    for prefix in ("ivy, ", "ivy,", "ivy "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+            break
+    return normalized
+
+
+def handle_operations_command(text: str, sender: str) -> Optional[str]:  # noqa: ARG001
+    """Deterministic operations command handler — never calls an LLM.
+
+    Returns a user-facing reply string when the text matches a known
+    operations command, or ``None`` to let the caller fall through to the
+    LLM provider chain.
+
+    Routing order handled here (after auth & resend, before LLM):
+      tailscale status  →  get_tailscale_status()
+      ivy/gateway status  →  _get_ivy_status_text()
+      skills/capabilities  →  _get_capabilities_text()
+      job status  →  _get_job_status_text()
+    """
+    key = _normalize_ops_text(text)
+
+    if key in _OPS_TAILSCALE:
+        logger.info("OPS: tailscale status request from %s", sender)
+        return get_tailscale_status()
+
+    if key in _OPS_IVY_STATUS:
+        logger.info("OPS: ivy status request from %s", sender)
+        return _get_ivy_status_text()
+
+    if key in _OPS_CAPABILITIES:
+        logger.info("OPS: capabilities request from %s", sender)
+        return _get_capabilities_text()
+
+    if key in _OPS_JOB_STATUS:
+        logger.info("OPS: job status request from %s", sender)
+        # "sharp picks status" → filter to that job
+        job_filter: Optional[str] = "sharp_picks" if "sharp picks" in key else None
+        return _get_job_status_text(job_filter)
+
+    return None
+
+
+# ============================================================================
 # BACKGROUND IMESSAGE WORKER: DeepSeek Primary + Gemini Backup with CACHING
 # ============================================================================
 
@@ -1409,6 +1694,13 @@ def background_imessage_worker() -> None:
             resend_reply = handle_resend_command(text, sender)
             if resend_reply is not None:
                 run_local_applescript_send(sender, resend_reply)
+                consecutive_failures = 0
+                continue
+
+            # ========== OPERATIONS COMMAND (deterministic, no LLM) ==========
+            ops_reply = handle_operations_command(text, sender)
+            if ops_reply is not None:
+                run_local_applescript_send(sender, ops_reply)
                 consecutive_failures = 0
                 continue
 
