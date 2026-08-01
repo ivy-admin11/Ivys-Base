@@ -82,7 +82,7 @@ cp ~/ai-admin-api/google_credentials.json .
 
 ### Testing Failover
 ```bash
-export GEMINI_API_KEY="broken_test_key" # pragma: allowlist secret
+export DEEPSEEK_API_KEY="broken_test_key" # pragma: allowlist secret
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
