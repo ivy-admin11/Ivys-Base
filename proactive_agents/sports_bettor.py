@@ -47,10 +47,7 @@ from zoneinfo import ZoneInfo
 import requests
 from filelock import FileLock, Timeout
 
-<<<<<<< HEAD
-=======
 import config
->>>>>>> origin/main
 from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
@@ -1131,10 +1128,6 @@ def _run_pipeline(
     # A valid pick should have:
     #   - confidence level (not just 55% single-sharp noise)
     #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
-<<<<<<< HEAD
-    
-=======
->>>>>>> origin/main
     filtered_picks = []
     for p in merged:
         confidence = (p.get("confidence") or p.get("enrichment", {}).get("confidence") or "").lower()
