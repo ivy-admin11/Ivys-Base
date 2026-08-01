@@ -9,8 +9,11 @@ from proactive_agents import sports_bettor
 
 
 def _reset_favorites_cache() -> None:
-    main._FAVORITES_CACHE["contacts"] = []
-    main._FAVORITES_CACHE["mtime_ns"] = -1
+    main._FAVORITES_CACHE_STATE = None
+    main._FAVORITES_CACHE_CONTACTS = None
+    main._FAVORITES_CACHE_MTIME_NS = None
+    main._FAVORITES_CACHE_SIZE = None
+    main._FAVORITES_WARNED_INVALID_PATHS.clear()
 
 
 def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatch):
@@ -20,6 +23,7 @@ def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatc
     favorites_path.write_text('["+15555550123"]', encoding="utf-8")
 
     monkeypatch.setattr(main, "PROJECT_ROOT_DIR", str(repo_root))
+    monkeypatch.setattr(main, "_get_project_root", lambda: repo_root)
     monkeypatch.chdir(tmp_path)
     _reset_favorites_cache()
 
@@ -34,8 +38,8 @@ def test_load_favorites_cached_uses_project_root_and_caches(tmp_path, monkeypatc
 
     monkeypatch.setattr(builtins, "open", track_favorites_open)
 
-    assert main.load_favorites_cached() == ["+15555550123"]
-    assert main.load_favorites_cached() == ["+15555550123"]
+    assert main.load_favorites_cached() == frozenset(["+15555550123"])
+    assert main.load_favorites_cached() == frozenset(["+15555550123"])
     assert open_calls == 1
 
 
@@ -65,7 +69,7 @@ def test_safe_fetch_last_message_retries_and_recovers(monkeypatch):
     reset_calls = []
 
     monkeypatch.setattr(main, "init_chat_db", lambda: next(connections))
-    monkeypatch.setattr(main, "close_chat_db_connection", lambda: reset_calls.append("reset"))
+    monkeypatch.setattr(main, "_close_chat_db_locked", lambda: reset_calls.append("reset"))
     monkeypatch.setattr(main.time, "sleep", lambda *_args, **_kwargs: None)
 
     assert main.safe_fetch_last_message(100) == expected_row
@@ -96,7 +100,7 @@ def test_close_chat_db_connection_closes_and_clears_cached_connection(monkeypatc
     monkeypatch.setattr(main, "_CHAT_DB_LOCK", lock)
     monkeypatch.setattr(main, "_CHAT_DB_CONN", conn)
 
-    main.close_chat_db_connection()
+    main.close_chat_db()
 
     assert lock.enter_count == 1
     assert conn.closed is True

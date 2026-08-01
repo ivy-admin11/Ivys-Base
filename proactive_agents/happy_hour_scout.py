@@ -19,22 +19,17 @@ import logging
 import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
+from pathlib import Path
 
 # Add parent directory to path for .ivy module access
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-# Native .env auto-loader (mirrors sports_bettor.py) so this agent works
-# standalone — anchored to parent_dir, not the CWD, and never clobbers vars
-# already exported in the shell/launchd.
-_ENV_PATH = os.path.join(parent_dir, ".env")
-if os.path.exists(_ENV_PATH):
-    with open(_ENV_PATH, "r") as _f:
-        for _line in _f:
-            if "=" in _line and not _line.strip().startswith("#"):
-                _k, _v = _line.strip().split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+# Load .env file using dotenv (if it exists) before any env-dependent imports.
+# Use override=False so variables already exported by the shell or launchd win.
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(parent_dir) / ".env", override=False)
 
 from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 from ivy_core import outbox as _outbox

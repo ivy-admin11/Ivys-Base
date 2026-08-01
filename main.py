@@ -37,11 +37,14 @@ import sqlite3
 import threading
 import logging
 import json
+import re
 import requests
 import subprocess
+import atexit
 from google import genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -372,30 +375,171 @@ _PROVIDER_PROBE_LOCK = threading.Lock()
 _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health poll
 
 # ============================================================================
-# PERFORMANCE OPTIMIZATIONS
+# PERFORMANCE OPTIMIZATIONS (Thread-safe, Fail-Closed)
 # ============================================================================
 
-# Favorites list cache — reload only when file changes
-_FAVORITES_CACHE = {
-    "contacts": [],
-    "mtime_ns": -1,  # -1 means the favorites cache is uninitialized/unavailable.
-}
+# ---- Favorites Cache State Model ----
+# State tracking for immutable, thread-safe favorites.json caching.
+# Distinguishes: uninitialized, valid (nonempty/empty), missing, unreadable,
+# malformed JSON, invalid schema.
+
 _FAVORITES_CACHE_LOCK = threading.RLock()
 
-# Persistent chat.db connection — reuse for all polls
+# Cache state: None (uninitialized), True (valid), False (invalid/unreadable)
+_FAVORITES_CACHE_STATE = None
+
+# Immutable contact list (frozenset or tuple) — None if uninitialized/invalid
+_FAVORITES_CACHE_CONTACTS = None
+
+# File metadata for change detection
+_FAVORITES_CACHE_MTIME_NS = None
+_FAVORITES_CACHE_SIZE = None
+
+# Warning suppression — track which invalid paths have been warned about
+_FAVORITES_WARNED_INVALID_PATHS = set()
+
+
+def _warn_once_favorites(message: str, path: str) -> None:
+    """Log a warning once per path to avoid spam on repeated invalid/missing files."""
+    if path not in _FAVORITES_WARNED_INVALID_PATHS:
+        logger.warning(message)
+        _FAVORITES_WARNED_INVALID_PATHS.add(path)
+
+
+def _get_project_root() -> Path:
+    """Get the project root directory independent of current working directory."""
+    return Path(__file__).resolve().parent
+
+
+# ---- SQLite Connection Lifecycle ----
+# Persistent, thread-safe read-only connection to the Apple Messages database.
+# Health-checked on first use and reconnected on failure.
+
 _CHAT_DB_CONN = None
 _CHAT_DB_LOCK = threading.RLock()
+_CHAT_DB_SHUTDOWN_REGISTERED = False
 
 
-def _cached_favorites_contacts() -> List[str]:
-    """Return a defensive copy of the cached favorites list."""
-    return list(_FAVORITES_CACHE["contacts"])
+def _create_chat_db_connection() -> Optional[sqlite3.Connection]:
+    """Create a new read-only SQLite connection to CHAT_DB_PATH.
+    
+    Returns:
+        sqlite3.Connection or None if connection fails.
+    """
+    try:
+        # Build read-only URI from CHAT_DB_PATH
+        conn = sqlite3.connect(
+            f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
+            uri=True,
+            timeout=DB_TIMEOUT,
+            check_same_thread=False,  # Safe because all access serialized with _CHAT_DB_LOCK
+        )
+        return conn
+    except Exception as e:
+        logger.error("Failed to create chat.db connection: %s", e)
+        return None
 
 
-def _clear_favorites_cache() -> None:
-    """Reset the favorites cache to an uninitialized state."""
-    _FAVORITES_CACHE["contacts"] = []
-    _FAVORITES_CACHE["mtime_ns"] = -1
+def _health_check_connection(conn: sqlite3.Connection) -> bool:
+    """Test the connection with SELECT 1; explicitly close cursor.
+    
+    Returns:
+        True if connection is healthy, False otherwise.
+    """
+    if not conn:
+        return False
+    
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        return True
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
+        return False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
+def _close_chat_db_locked() -> None:
+    """Close the persistent connection while holding _CHAT_DB_LOCK.
+    
+    Must be called only when _CHAT_DB_LOCK is already held.
+    Clears _CHAT_DB_CONN to None.
+    """
+    global _CHAT_DB_CONN
+    
+    if _CHAT_DB_CONN:
+        try:
+            _CHAT_DB_CONN.close()
+        except Exception as e:
+            logger.debug("Error closing chat.db connection: %s", e)
+    
+    _CHAT_DB_CONN = None
+
+
+def close_chat_db() -> None:
+    """Public idempotent shutdown function for the persistent connection.
+    
+    Called at program exit via atexit.
+    """
+    with _CHAT_DB_LOCK:
+        _close_chat_db_locked()
+
+
+def _register_chat_db_atexit() -> None:
+    """Register atexit cleanup once (idempotent)."""
+    global _CHAT_DB_SHUTDOWN_REGISTERED
+    
+    if not _CHAT_DB_SHUTDOWN_REGISTERED:
+        atexit.register(close_chat_db)
+        _CHAT_DB_SHUTDOWN_REGISTERED = True
+
+
+def init_chat_db() -> Optional[sqlite3.Connection]:
+    """Initialize or return the persistent chat.db connection.
+    
+    On first call:
+        - Creates a new connection
+        - Registers atexit cleanup
+        - Health-checks the connection
+    
+    On subsequent calls:
+        - Health-checks the existing connection
+        - If stale, closes it and creates a new one
+    
+    Returns:
+        sqlite3.Connection (healthy) or None if all attempts fail.
+    """
+    global _CHAT_DB_CONN
+    
+    with _CHAT_DB_LOCK:
+        # Register atexit cleanup once
+        _register_chat_db_atexit()
+        
+        # If we have a connection, health-check it
+        if _CHAT_DB_CONN:
+            if _health_check_connection(_CHAT_DB_CONN):
+                return _CHAT_DB_CONN
+            
+            # Stale connection; close and clear
+            _close_chat_db_locked()
+        
+        # Create a new connection
+        _CHAT_DB_CONN = _create_chat_db_connection()
+        if _CHAT_DB_CONN and _health_check_connection(_CHAT_DB_CONN):
+            logger.info("✅ Persistent chat.db connection established")
+            return _CHAT_DB_CONN
+        
+        # Failed to create or health-check
+        if _CHAT_DB_CONN:
+            _close_chat_db_locked()
+        
+        logger.error("Failed to initialize chat.db connection")
+        return None
 
 
 def _db_retry_backoff(attempt: int) -> float:
@@ -544,25 +688,26 @@ def print_startup_banner() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Print banner, start iMessage poller, initialize voice assistant."""
+    """Print banner, initialize persistent connections, start iMessage poller."""
     print_startup_banner()
-
+    
+    # Initialize persistent chat.db connection (registers atexit cleanup)
+    init_chat_db()
+    
     # Initialize voice session manager if available
     if VOICE_ASSISTANT_AVAILABLE:
         logger.info("Voice session manager initialized and ready.")
-
-    # Start iMessage poller if enabled
-
+    
     # Start iMessage poller if enabled
     if ENABLE_IMESSAGE_POLLER:
         worker_thread = threading.Thread(target=background_imessage_worker, daemon=True)
         worker_thread.start()
         logger.info("Background iMessage polling thread started.")
-
+    
     try:
         yield
     finally:
-        close_chat_db_connection()
+        close_chat_db()
         logger.info("Gateway shutdown complete.")
 
 
@@ -875,16 +1020,27 @@ def run_local_applescript_send(target: str, body: str) -> str:
 
 
 def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
-    """Execute call via DeepSeek API with tool calling support."""
+    """Execute call via DeepSeek API with tool calling support.
+    
+    Raises:
+        ValueError: If DEEPSEEK_API_KEY is not configured
+        ProviderHTTPError: If the API returns a non-200 status code
+        Exception: For other runtime errors
+    
+    Returns:
+        The response text from DeepSeek, or a tool execution result.
+    """
+    from ivy_core.pipeline_status import ProviderHTTPError
+    
     active_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not active_key:
-        logger.warning("DeepSeek call attempted with no DEEPSEEK_API_KEY configured.")
-        return (
-            "DeepSeek is not configured. Please set the DEEPSEEK_API_KEY environment variable."
-        )
+        raise ValueError("DeepSeek is not configured. Set DEEPSEEK_API_KEY environment variable.")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": "Bearer " + active_key,
+        "Content-Type": "application/json"
+    }
 
     payload = {
         "model": "deepseek-chat",
@@ -898,8 +1054,20 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        
         if response.status_code != 200:
-            return f"❌ DeepSeek Engine Communication Fault. Status: {response.status_code}"
+            # Sanitize and truncate response body for logging (never include secrets)
+            sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
+            logger.error(
+                "DeepSeek API returned %s: %s",
+                response.status_code,
+                sanitized_response,
+            )
+            raise ProviderHTTPError(
+                provider="deepseek",
+                status_code=response.status_code,
+                detail=sanitized_response,
+            )
 
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
@@ -926,12 +1094,104 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
             return _execute_tool_call(func_name, args)
 
         return message_node.get("content", "").strip()
+    except ProviderHTTPError:
+        raise
+    except requests.RequestException as e:
+        logger.error("DeepSeek request failed: %s", str(e))
+        raise
     except Exception as e:
-        return f"❌ DeepSeek Execution Layer Exception: {str(e)}"
+        logger.error("DeepSeek execution error: %s", str(e))
+        raise
 
 
 # ============================================================================
-# GEMINI BACKUP ENGINE (only reached when DeepSeek is unavailable/empty)
+# OPENAI FALLBACK ENGINE (reached when DeepSeek is unavailable)
+# ============================================================================
+
+
+def execute_openai_call(text_content: str, system_instruction: str) -> str:
+    """Execute call via OpenAI API with tool calling support.
+    
+    Raises:
+       ValueError: If OPENAI_API_KEY is not configured
+       ProviderHTTPError: If the API returns a non-200 status code
+       Exception: For other runtime errors
+    
+    Returns:
+       The response text from OpenAI, or a tool execution result.
+    """
+    from ivy_core.pipeline_status import ProviderHTTPError
+    
+    active_key = os.environ.get("OPENAI_API_KEY", "")
+    if not active_key:
+       raise ValueError("OpenAI is not configured. Set OPENAI_API_KEY environment variable.")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer " + active_key,
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+       "model": "gpt-4o-mini",
+       "messages": [
+           {"role": "system", "content": system_instruction},
+           {"role": "user", "content": text_content},
+       ],
+       "tools": DEEPSEEK_TOOL_SCHEMA,  # OpenAI uses same format as DeepSeek
+       "temperature": 0.1,
+       "max_tokens": 2000,
+    }
+
+    try:
+       logger.info("📡 OpenAI API request: %s", url)
+       response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
+        
+       if response.status_code != 200:
+           sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
+           logger.error("OpenAI API error (status %d): %s", response.status_code, sanitized_response)
+           raise ProviderHTTPError(
+               provider="openai",
+               status_code=response.status_code,
+               detail=sanitized_response,
+           )
+        
+       response_json = response.json()
+        
+       # Check if tool was called
+       choice = response_json.get("choices", [{}])[0]
+       message = choice.get("message", {})
+       tool_calls = message.get("tool_calls", [])
+        
+       if tool_calls:
+           logger.info("🔧 OpenAI tool execution triggered")
+           call = tool_calls[0]
+           func_name = call.get("function", {}).get("name", "")
+           args = (
+               json.loads(call.get("function", {}).get("arguments", "{}"))
+               if call.get("function", {}).get("arguments")
+               else {}
+           )
+            
+           logger.info(
+               "OpenAI triggered tool: %s with arguments: %s",
+               func_name,
+               args,
+           )
+            
+           return _execute_tool_call(func_name, args)
+        
+       # Return text response if no tool was called
+       text_response = message.get("content", "")
+       return text_response if text_response else "No response from OpenAI."
+        
+    except Exception as e:
+       logger.error("OpenAI execution error: %s", str(e))
+       raise
+
+
+# ============================================================================
+# GEMINI BACKUP ENGINE (only reached when DeepSeek and OpenAI are unavailable)
 # ============================================================================
 
 
@@ -1049,165 +1309,238 @@ def query_llm_with_tools(prompt_text: str) -> str:
 # DATABASE OPERATIONS: Safe SQLite Read-Only Access
 # ============================================================================
 
-def load_favorites_cached() -> List[str]:
+def load_favorites_cached() -> frozenset:
     """Load favorites.json once, cache in memory. Reload only if file changes.
-
+    
+    Fail-closed semantics: Returns immutable empty frozenset on any error.
+    
+    Cache state model:
+    - Uninitialized: _FAVORITES_CACHE_STATE is None
+    - Valid (any size): _FAVORITES_CACHE_STATE is True, contacts immutable
+    - Invalid: _FAVORITES_CACHE_STATE is False, contacts empty
+    
+    Changes trigger reload:
+    - File stat.st_mtime_ns differs
+    - File stat.st_size differs
+    - File deleted
+    - JSON parsing fails
+    - Root is not a list
+    - Entry is not a string
+    
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
-    favorites_path = os.path.join(PROJECT_ROOT_DIR, FAVORITES_FILENAME)
-
+    global _FAVORITES_CACHE_STATE, _FAVORITES_CACHE_CONTACTS
+    global _FAVORITES_CACHE_MTIME_NS, _FAVORITES_CACHE_SIZE
+    
+    favorites_path = _get_project_root() / "favorites.json"
+    
     with _FAVORITES_CACHE_LOCK:
+        # Try to stat the file
         try:
-            stat = os.stat(favorites_path)
+            stat = favorites_path.stat()
             current_mtime_ns = stat.st_mtime_ns
-        except OSError:
+            current_size = stat.st_size
+        except (OSError, FileNotFoundError):
             # File doesn't exist or is unreadable
-            _clear_favorites_cache()
-            return []
-
-        # If file hasn't changed since last load, return cached
-        if current_mtime_ns == _FAVORITES_CACHE["mtime_ns"]:
-            return _cached_favorites_contacts()
-
-        # File is new or modified; reload and normalize
-        try:
-            with open(favorites_path, "r", encoding="utf-8") as f:
-                contacts = json.load(f)
-            if isinstance(contacts, list):
-                normalized = []
-                skipped = 0
-                for contact in contacts:
-                    if isinstance(contact, str):
-                        stripped = contact.strip()
-                        if stripped:
-                            normalized.append(stripped)
-                        else:
-                            skipped += 1
-                    else:
-                        skipped += 1
-                if skipped:
-                    logger.debug("Skipped %d invalid/empty entries in favorites allowlist", skipped)
-            else:
-                normalized = []
-            _FAVORITES_CACHE["contacts"] = normalized
-            _FAVORITES_CACHE["mtime_ns"] = current_mtime_ns
-            logger.debug("Reloaded favorites.json (%d contacts)", len(normalized))
-            return _cached_favorites_contacts()
-        except Exception as e:
-            logger.warning("Failed to parse favorites.json: %s", e)
-            _clear_favorites_cache()
-            return []
-
-
-def close_chat_db_connection() -> None:
-    """Close and clear the cached chat.db connection."""
-    global _CHAT_DB_CONN
-
-    with _CHAT_DB_LOCK:
-        if _CHAT_DB_CONN is None:
-            return
-        conn = _CHAT_DB_CONN
-        _CHAT_DB_CONN = None
-        try:
-            conn.close()
-            logger.info("Closed cached chat.db connection")
-        except Exception as e:
-            logger.warning("Failed to close cached chat.db connection: %s", e)
-
-
-def init_chat_db():
-    """Initialize persistent read-only connection to chat.db.
-
-    🚀 Performance: Reuses connection across polls (80-150ms saved per poll)
-    """
-    global _CHAT_DB_CONN
-    with _CHAT_DB_LOCK:
-        if _CHAT_DB_CONN:
-            return _CHAT_DB_CONN
-        try:
-            _CHAT_DB_CONN = sqlite3.connect(
-                f"file:{CHAT_DB_PATH}?mode=ro&uri=true",
-                uri=True,
-                timeout=DB_TIMEOUT,
-                check_same_thread=False,  # Safe with RLock
+            if _FAVORITES_CACHE_STATE is False:
+                # Already marked invalid; return cached empty set without re-warning
+                return frozenset()
+            
+            # First time seeing this error; warn once
+            _warn_once_favorites(
+                f"favorites.json missing or unreadable: {favorites_path}",
+                str(favorites_path)
             )
-            logger.info("✅ Persistent chat.db connection established")
-            return _CHAT_DB_CONN
+            _FAVORITES_CACHE_STATE = False
+            _FAVORITES_CACHE_CONTACTS = frozenset()
+            return frozenset()
+        
+        # File exists. Check if it's changed.
+        if (
+            _FAVORITES_CACHE_STATE is True
+            and _FAVORITES_CACHE_MTIME_NS == current_mtime_ns
+            and _FAVORITES_CACHE_SIZE == current_size
+        ):
+            # File unchanged since last load
+            return _FAVORITES_CACHE_CONTACTS or frozenset()
+        
+        # File is new, modified, or first load attempt
+        try:
+            with open(favorites_path, "r") as f:
+                data = json.load(f)
+            
+            # Validate: root must be a list
+            if not isinstance(data, list):
+                _warn_once_favorites(
+                    f"favorites.json root is not a list: {type(data).__name__}",
+                    str(favorites_path)
+                )
+                _FAVORITES_CACHE_STATE = False
+                _FAVORITES_CACHE_CONTACTS = frozenset()
+                return frozenset()
+            
+            # Validate: every entry must be a string
+            for i, entry in enumerate(data):
+                if not isinstance(entry, str):
+                    _warn_once_favorites(
+                        f"favorites.json entry {i} is not a string: {type(entry).__name__}",
+                        str(favorites_path)
+                    )
+                    _FAVORITES_CACHE_STATE = False
+                    _FAVORITES_CACHE_CONTACTS = frozenset()
+                    return frozenset()
+            
+            # Valid; store immutable contacts
+            _FAVORITES_CACHE_CONTACTS = frozenset(data)
+            _FAVORITES_CACHE_STATE = True
+            _FAVORITES_CACHE_MTIME_NS = current_mtime_ns
+            _FAVORITES_CACHE_SIZE = current_size
+            
+            logger.debug(
+                "Reloaded favorites.json (%d contacts)",
+                len(_FAVORITES_CACHE_CONTACTS)
+            )
+            return _FAVORITES_CACHE_CONTACTS
+        
+        except json.JSONDecodeError as e:
+            _warn_once_favorites(
+                f"favorites.json JSON parse error: {e}",
+                str(favorites_path)
+            )
+            _FAVORITES_CACHE_STATE = False
+            _FAVORITES_CACHE_CONTACTS = frozenset()
+            return frozenset()
+        
         except Exception as e:
-            logger.error("Failed to initialize chat.db connection: %s", e)
-            return None
+            _warn_once_favorites(
+                f"Failed to read favorites.json: {e}",
+                str(favorites_path)
+            )
+            _FAVORITES_CACHE_STATE = False
+            _FAVORITES_CACHE_CONTACTS = frozenset()
+            return frozenset()
 
 
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
-    """Fetch next message from chat.db with retry logic and cached connection."""
+    """Fetch next message from chat.db with retry logic and proper cursor cleanup.
+    
+    Retries up to DB_RETRY_ATTEMPTS on recoverable OperationalError.
+    
+    Behavior:
+    - Serializes access with _CHAT_DB_LOCK
+    - Explicitly closes cursor in finally block
+    - On recovery error: closes conn, clears _CHAT_DB_CONN, sleeps, retries
+    - After retries exhausted: returns None
+    - Never logs message text or sender data
+    
+    Args:
+        last_id: Last processed ROWID; fetch next message > this ID
+    
+    Returns:
+        (rowid, text, sender_id) tuple or None if not found/error.
+    """
     for attempt in range(DB_RETRY_ATTEMPTS):
-        conn = init_chat_db()
-        if not conn:
-            return None
-
-        try:
-            with _CHAT_DB_LOCK:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
-                    FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-                    WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
-                    ORDER BY m.ROWID ASC LIMIT 1
-                    """,
-                    (last_id,),
-                )
-                return cursor.fetchone()
-        except sqlite3.OperationalError as e:
-            close_chat_db_connection()
-            if attempt == DB_RETRY_ATTEMPTS - 1:
-                logger.warning("Database query failed after %d attempts: %s", attempt + 1, e)
-                return None
-            backoff = _db_retry_backoff(attempt)
-            logger.warning(
-                "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
-                attempt + 1,
-                e,
-                backoff,
-            )
-            time.sleep(backoff)
-        except sqlite3.Error as e:
-            logger.warning("Database read failed with sqlite error: %s", e)
-            close_chat_db_connection()
-            return None
+        _backoff = 0
+        with _CHAT_DB_LOCK:
+            conn = init_chat_db()
+            if not conn:
+                logger.warning("Could not establish chat.db connection (attempt %d/%d)", 
+                             attempt + 1, DB_RETRY_ATTEMPTS)
+                if attempt < DB_RETRY_ATTEMPTS - 1:
+                    _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            else:
+                cursor = None
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
+                        FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
+                        WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
+                        ORDER BY m.ROWID ASC LIMIT 1
+                        """,
+                        (last_id,),
+                    )
+                    result = cursor.fetchone()
+                    return result
+                
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                    # Recoverable database error; close connection and retry
+                    logger.debug("Database query error (attempt %d/%d): %s",
+                               attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
+                    _close_chat_db_locked()
+                    
+                    if attempt < DB_RETRY_ATTEMPTS - 1:
+                        _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+                
+                finally:
+                    # Always close cursor explicitly
+                    if cursor:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+        
+        # Backoff sleep after releasing the lock
+        if _backoff:
+            time.sleep(_backoff)
+    
+    # Exhausted retries
+    logger.warning("Failed to fetch message after %d retries", DB_RETRY_ATTEMPTS)
     return None
 
 
 def get_last_message_id() -> Optional[int]:
-    """Get the highest ROWID from the message table using the cached connection."""
+    """Get the highest ROWID from the message table with retry logic.
+    
+    Returns 0 if the message table is empty (no error).
+    Returns None only if connection fails after all retries.
+    
+    Behavior:
+    - Retries up to DB_RETRY_ATTEMPTS on recoverable errors
+    - Explicitly closes cursor in finally block
+    - Never logs message data
+    
+    Returns:
+        int (possibly 0 if table empty) or None if error after retries exhausted.
+    """
     for attempt in range(DB_RETRY_ATTEMPTS):
-        conn = init_chat_db()
-        if not conn:
-            return None
-
-        try:
-            with _CHAT_DB_LOCK:
-                cursor = conn.cursor()
-                cursor.execute("SELECT MAX(ROWID) FROM message")
-                row = cursor.fetchone()
-                return row[0] if row and row[0] else 0
-        except sqlite3.OperationalError as e:
-            close_chat_db_connection()
-            if attempt == DB_RETRY_ATTEMPTS - 1:
-                logger.warning("Failed to get last message ID after %d attempts: %s", attempt + 1, e)
-                return None
-            backoff = _db_retry_backoff(attempt)
-            logger.warning(
-                "Last-message lookup attempt %d failed: %s. Retrying in %.1f seconds...",
-                attempt + 1,
-                e,
-                backoff,
-            )
-            time.sleep(backoff)
-        except sqlite3.Error as e:
-            logger.warning("Failed to get last message ID: %s", e)
-            close_chat_db_connection()
-            return None
+        _backoff = 0
+        with _CHAT_DB_LOCK:
+            conn = init_chat_db()
+            if not conn:
+                logger.warning("Could not establish chat.db connection (attempt %d/%d)",
+                             attempt + 1, DB_RETRY_ATTEMPTS)
+                if attempt < DB_RETRY_ATTEMPTS - 1:
+                    _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            else:
+                cursor = None
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT MAX(ROWID) FROM message")
+                    row = cursor.fetchone()
+                    return row[0] if row and row[0] else 0
+                
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                    logger.debug("Database query error (attempt %d/%d): %s",
+                               attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
+                    _close_chat_db_locked()
+                    
+                    if attempt < DB_RETRY_ATTEMPTS - 1:
+                        _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+                
+                finally:
+                    if cursor:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+        
+        # Backoff sleep after releasing the lock
+        if _backoff:
+            time.sleep(_backoff)
+    
+    logger.warning("Failed to get last message ID after %d retries", DB_RETRY_ATTEMPTS)
     return None
 
 
@@ -1245,12 +1578,10 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 # RESEND COMMAND HANDLER
 # ============================================================================
 
-import re as _re
-
-_RESEND_PATTERN = _re.compile(
+_RESEND_PATTERN = re.compile(
     r"^\s*resend\s+"
     r"(picks|sharp\s+picks|happy\s+hour|meal\s+plan|[A-Z]{2}-\d{8}-\d{4}(?::\d{2})?)\s*$",
-    _re.IGNORECASE,
+    re.IGNORECASE,
 )
 
 _RESEND_ALIASES: Dict[str, str] = {
@@ -1294,7 +1625,7 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
     report_id: Optional[str] = None
 
     # Is this an explicit report ID (e.g. SP-20260719-1430)?
-    if _re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, _re.IGNORECASE):
+    if re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, re.IGNORECASE):
         report_id = target.upper()
         job_name = _outbox.job_name_for_report_id(report_id)
         if not job_name:
@@ -1338,6 +1669,125 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 
 
 # ============================================================================
+# JOB COMMAND ROUTING (deterministic, no LLM)
+# ============================================================================
+
+# Pattern for operational job commands (e.g., "run sharp picks", "send me happy hour")
+_JOB_COMMAND_PATTERN = re.compile(
+    r"^\s*(?:run|send|launch|start|dispatch)\s+"
+    r"(?:me\s+)?(?:the\s+)?"
+    r"([a-z0-9\s_\-]+?)\s*$",
+    re.IGNORECASE,
+)
+
+_JOB_ALIASES: Dict[str, str] = {
+    # Sharp Picks aliases
+    "picks": "sharp_picks",
+    "sharp picks": "sharp_picks",
+    "sharppicks": "sharp_picks",
+    "daily picks": "sharp_picks",
+    "sports picks": "sharp_picks",
+    "sports bettor": "sharp_picks",
+    "sports_bettor": "sharp_picks",
+    "my sports picks": "sharp_picks",
+    "run picks": "sharp_picks",
+    "send me sharp picks": "sharp_picks",
+    
+    # Happy Hour Scout aliases
+    "happy hour": "happy_hour",
+    "happy hour scout": "happy_hour",
+    "happy_hour_scout": "happy_hour",
+    "happy_hour scout": "happy_hour",
+    "hh scout": "happy_hour",
+    "scout": "happy_hour",
+    
+    # Familia Meal Planner aliases
+    "meals": "familia_meal_planner",
+    "meal plan": "familia_meal_planner",
+    "meal planner": "familia_meal_planner",
+    "meal planning": "familia_meal_planner",
+    "planner": "familia_meal_planner",
+    "weekly planner": "familia_meal_planner",
+    "familia": "familia_meal_planner",
+    "familia meal planner": "familia_meal_planner",
+    "familia_meal_planner": "familia_meal_planner",
+    "household meal plan": "familia_meal_planner",
+    "household meal planner": "familia_meal_planner",
+}
+
+
+def handle_job_command(text: str, sender: str) -> Optional[str]:
+    """Deterministic JOB COMMAND handler — never calls an LLM.
+
+    Returns a user-facing reply string if the text is a job command
+    (e.g., "Run sharp picks"), or None if the text is not a job command
+    (caller should proceed to LLM).
+
+    Supported commands:
+      RUN / SEND / LAUNCH / START / DISPATCH <JOB_NAME>
+      where JOB_NAME can be:
+        - picks, sharp picks, sports picks
+        - happy hour, hh scout
+        - meals, meal plan, planner, familia meal planner
+    """
+    m = _JOB_COMMAND_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    job_query = m.group(1).strip().lower()
+    
+    # Try exact alias match first
+    canonical_job_name = _JOB_ALIASES.get(job_query)
+    
+    # If no exact match, try to find a job by substring
+    if not canonical_job_name:
+        # Check if any alias contains this as a substring
+        for alias, job_name in _JOB_ALIASES.items():
+            if job_query in alias or alias in job_query:
+                canonical_job_name = job_name
+                break
+    
+    if not canonical_job_name:
+        # Not a recognized job command
+        return None
+    
+    # Dispatch the job using job_runner
+    try:
+        from job_runner import job_runner, JobStatus
+        status, message = job_runner.run_job(
+            canonical_job_name,
+            force=True,
+            send=True,
+            requester=sender,
+        )
+        
+        # Return a user-facing message based on the status
+        if status == JobStatus.SUCCESS:
+            # Extract the canonical job display name
+            job_display = {
+                "sharp_picks": "Sharp Picks",
+                "happy_hour": "Happy Hour Scout",
+                "familia_meal_planner": "Familia Meal Planner",
+            }.get(canonical_job_name, canonical_job_name)
+            
+            return f"✅ {job_display} was dispatched. I'll send the report when generation and delivery complete."
+        
+        elif status == JobStatus.ALREADY_RUNNING:
+            return "⏳ That job is already running. Please wait for it to complete."
+        
+        elif status == JobStatus.NOT_FOUND:
+            return f"❌ Job '{canonical_job_name}' not found. Try: Run Sharp Picks, Run Happy Hour, or Run Meal Planner."
+        
+        elif status == JobStatus.UNAVAILABLE:
+            return f"⚠️ {canonical_job_name} is currently unavailable. Please try again later."
+        
+        else:  # ERROR or other status
+            return f"❌ Could not start {canonical_job_name}. Please try again."
+    
+    except Exception as e:
+        logger.error("Error executing job command '%s': %s", canonical_job_name, e)
+        return "❌ An error occurred while starting that job. Please try again."
+
 # OPERATIONS COMMAND HANDLER (deterministic — no LLM)
 # ============================================================================
 
@@ -1699,6 +2149,13 @@ def background_imessage_worker() -> None:
                 consecutive_failures = 0
                 continue
 
+            # ========== JOB COMMAND ROUTING (deterministic, no LLM) ==========
+            job_reply = handle_job_command(text, sender)
+            if job_reply is not None:
+                run_local_applescript_send(sender, job_reply)
+                consecutive_failures = 0
+                continue
+
             # ========== OPERATIONS COMMAND (deterministic, no LLM) ==========
             ops_reply = handle_operations_command(text, sender)
             if ops_reply is not None:
@@ -1717,10 +2174,22 @@ def background_imessage_worker() -> None:
                 )
                 reply = None
 
-            # ========== PHASE 2: GEMINI BACKUP (WITH CACHING) ==========
+            # ========== PHASE 2: OPENAI FALLBACK ==========
             if not reply:
                 try:
-                    logger.info("🛡️ Primary Engine Offline. Engaging Backup Core (Gemini SDK)...")
+                    logger.info("🛡️ Primary Engine Offline. Engaging OpenAI Fallback...")
+                    reply = execute_openai_call(text, deepseek_sys_instruction)
+                except Exception as openai_err:
+                    logger.error(
+                        "❌ OpenAI Fallback Layer Fault: %s. Engaging Secondary Backup (Gemini)...",
+                        str(openai_err),
+                    )
+                    reply = None
+
+            # ========== PHASE 3: GEMINI BACKUP (WITH CACHING) ==========
+            if not reply:
+                try:
+                    logger.info("🛡️ Primary and Secondary Engines Offline. Engaging Gemini Backup Core...")
                     reply = _gemini_backup_reply(text)
                 except Exception as gemini_err:
                     logger.error(
@@ -1736,7 +2205,13 @@ def background_imessage_worker() -> None:
                 logger.info("📤 Clean prose payload dispatched back via local AppleScript link.")
                 run_local_applescript_send(sender, str(reply))
             else:
-                logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
+                # All providers failed — send a friendly message instead of exposing internal errors
+                fallback_msg = (
+                    "Ivy's conversation engines are temporarily unavailable. "
+                    "Local commands such as 'Run Sharp Picks' still work."
+                )
+                logger.warning("❌ Both Primary and Backup layers produced no usable reply. Sending fallback.")
+                run_local_applescript_send(sender, fallback_msg)
 
             consecutive_failures = 0
 
