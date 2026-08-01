@@ -4,7 +4,7 @@ Ivy Local Admin API Gateway v2.2 — Voice Assistant Edition
 Architecture:
 - Phase 1: Critical fixes (duplicates, auth, f-string bugs)
 - Phase 2: Config consolidation (tool schemas, timeouts, feature flags)
-- Phase 3: Gemini SDK refactor (use google.generativeai official library)
+- Phase 3: Gemini SDK refactor (use google.genai official SDK)
 - Phase 4: Prompt caching for 80-90% token cost reduction ✅ IMPLEMENTED
 - Phase 5: Voice assistant with session management and cache optimization ✅ IMPLEMENTED
 
@@ -38,7 +38,7 @@ import logging
 import json
 import requests
 import subprocess
-import google.generativeai as genai
+from google import genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Callable
@@ -135,8 +135,107 @@ except ImportError:
 # GEMINI SDK CONFIGURATION
 # ============================================================================
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+_GEMINI_MODEL = "gemini-2.5-flash"
+_gemini_client = None
+
+
+def _get_gemini_client():
+    """Lazily initialize Gemini client using API-key auth."""
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    # Keep ADC env noise from interfering with explicit API-key auth.
+    saved = {
+        k: os.environ.pop(k)
+        for k in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")
+        if k in os.environ
+    }
+    try:
+        _gemini_client = genai.Client(api_key=api_key)
+    finally:
+        os.environ.update(saved)
+    return _gemini_client
+
+
+def _make_gemini_config(
+    system_instruction: Optional[str] = None,
+    *,
+    include_tools: bool = True,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if include_tools:
+        config["tools"] = [{"function_declarations": GEMINI_TOOL_DECLARATIONS}]
+    if system_instruction:
+        config["system_instruction"] = system_instruction
+    return config
+
+
+def _part_text(part: Any) -> str:
+    if isinstance(part, dict):
+        return part.get("text") or ""
+    return getattr(part, "text", "") or ""
+
+
+def _part_function_call(part: Any) -> Optional[Dict[str, Any]]:
+    # Handles both SDK objects and plain dict parts used in tests/follow-up payloads.
+    raw = part.get("function_call") if isinstance(part, dict) else getattr(part, "function_call", None)
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return {"name": raw.get("name"), "args": raw.get("args") or {}}
+    return {"name": getattr(raw, "name", None), "args": getattr(raw, "args", {}) or {}}
+
+
+def _extract_gemini_parts(response: Any) -> List[Any]:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return []
+    content = getattr(candidates[0], "content", None)
+    return getattr(content, "parts", None) or []
+
+
+def _extract_gemini_reply_and_tool_calls(response: Any) -> tuple[str, List[Dict[str, Any]], List[Any]]:
+    parts = _extract_gemini_parts(response)
+    text_reply = "".join(_part_text(part) for part in parts)
+    tool_calls = []
+    for part in parts:
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            tool_calls.append(call)
+    return text_reply, tool_calls, parts
+
+
+def _serialize_parts(parts: List[Any]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for part in parts:
+        text = _part_text(part)
+        if text:
+            serialized.append({"text": text})
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            serialized.append(
+                {"function_call": {"name": call["name"], "args": call.get("args") or {}}}
+            )
+    return serialized
+
+
+def _gemini_generate_content(
+    *,
+    contents: Any,
+    system_instruction: Optional[str] = None,
+    include_tools: bool = True,
+):
+    client = _get_gemini_client()
+    return client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=contents,
+        config=_make_gemini_config(system_instruction, include_tools=include_tools),
+    )
 
 # ============================================================================
 # PYDANTIC MODELS (Voice Assistant)
@@ -278,14 +377,29 @@ _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health po
 # Favorites list cache — reload only when file changes
 _FAVORITES_CACHE = {
     "contacts": [],
-    "mtime": 0.0,
-    "loaded": False,
+    "mtime_ns": -1,  # -1 means the favorites cache is uninitialized/unavailable.
 }
 _FAVORITES_CACHE_LOCK = threading.RLock()
 
 # Persistent chat.db connection — reuse for all polls
 _CHAT_DB_CONN = None
 _CHAT_DB_LOCK = threading.RLock()
+
+
+def _cached_favorites_contacts() -> List[str]:
+    """Return a defensive copy of the cached favorites list."""
+    return list(_FAVORITES_CACHE["contacts"])
+
+
+def _clear_favorites_cache() -> None:
+    """Reset the favorites cache to an uninitialized state."""
+    _FAVORITES_CACHE["contacts"] = []
+    _FAVORITES_CACHE["mtime_ns"] = -1
+
+
+def _db_retry_backoff(attempt: int) -> float:
+    """Return the exponential backoff delay for chat.db retries."""
+    return DB_RETRY_BACKOFF * (2 ** attempt)
 
 
 def _probe_deepseek() -> Dict[str, Any]:
@@ -350,9 +464,12 @@ def _probe_gemini() -> Dict[str, Any]:
             "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
         }
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        model.generate_content("hi", generation_config={"max_output_tokens": 1})
+        client = genai.Client(api_key=api_key)
+        client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents="hi",
+            config={"max_output_tokens": 1},
+        )
         return {
             "configured": True, "authenticated": True, "reachable": True,
             "role": "failover", "status": "ready", "reason": None,
@@ -444,6 +561,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        close_chat_db_connection()
         logger.info("Gateway shutdown complete.")
 
 
@@ -451,6 +569,7 @@ app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", life
 
 PROCESS_STARTED_AT = datetime.now()
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+FAVORITES_FILENAME = "favorites.json"
 
 # ============================================================================
 # SECURITY: Authentication Middleware
@@ -832,24 +951,22 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
             tool_declarations=GEMINI_TOOL_DECLARATIONS,
         )
-        if messages is None:
+        if not messages:
             logger.warning("Caching failed, falling back to non-cached request")
-            messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+            messages = [{"role": "user", "parts": [{"text": text}]}]
             use_caching = False
     else:
-        messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+        messages = [{"role": "user", "parts": [{"text": text}]}]
 
     # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
     # The cache_manager already includes it in the message stream
     if use_caching:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
         )
     else:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
         )
 
@@ -859,20 +976,7 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             response, endpoint="background_imessage_worker", model="gemini-2.5-flash"
         )
 
-    if not (response.candidates and response.candidates[0].content):
-        return None
-
-    parts = response.candidates[0].content.parts
-    text_reply = ""
-    tool_calls = []
-    for part in parts:
-        if hasattr(part, "text") and part.text:
-            text_reply += part.text
-        # part.function_call is always a present attribute (protobuf oneof
-        # field) even on text-only parts — checking truthiness, not hasattr,
-        # is what actually detects a real tool call.
-        if getattr(part, "function_call", None):
-            tool_calls.append(part.function_call)
+    text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
 
     if not tool_calls:
         return text_reply.strip() or None
@@ -880,8 +984,8 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
     logger.info("🛠️ Gemini returned %d tool operations", len(tool_calls))
     tool_results = []
     for call in tool_calls:
-        tool_name = call.name
-        tool_args = call.args
+        tool_name = call["name"]
+        tool_args = dict(call.get("args") or {})
         # Enforce Household list for reminders
         if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
             tool_args["list_name"] = "Household"
@@ -892,14 +996,10 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
 
     # Follow-up call with the *real* tool results (previously always sent
     # back an empty {} regardless of what the tool actually returned).
-    follow_up_kwargs = {"tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
-    if not use_caching:
-        follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
-
-    follow_up_response = gemini_model.generate_content(
-        [
+    follow_up_response = _gemini_generate_content(
+        contents=[
             *messages,
-            {"role": "model", "parts": parts},
+            {"role": "model", "parts": _serialize_parts(parts)},
             {
                 "role": "function",
                 "parts": [
@@ -908,12 +1008,11 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
                 ],
             },
         ],
-        **follow_up_kwargs,
+        system_instruction=None if use_caching else GEMINI_SYSTEM_INSTRUCTION,
+        include_tools=False,
     )
-    if follow_up_response.candidates:
-        follow_up_parts = follow_up_response.candidates[0].content.parts
-        return "".join(p.text for p in follow_up_parts if hasattr(p, "text")).strip() or None
-    return None
+    follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+    return follow_up_text.strip() or None
 
 
 def query_llm_with_tools(prompt_text: str) -> str:
@@ -954,25 +1053,22 @@ def load_favorites_cached() -> List[str]:
 
     🚀 Performance: Eliminates disk I/O on 99% of polls (5-10ms saved per poll)
     """
-    favorites_path = IVY_FAVORITES_FILE
-
-    try:
-        stat = os.stat(favorites_path)
-        current_mtime = stat.st_mtime
-    except OSError:
-        # File doesn't exist or is unreadable
-        with _FAVORITES_CACHE_LOCK:
-            _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime"] = 0.0
-            _FAVORITES_CACHE["loaded"] = False
-        return []
+    favorites_path = os.path.join(PROJECT_ROOT_DIR, FAVORITES_FILENAME)
 
     with _FAVORITES_CACHE_LOCK:
-        # If file hasn't changed since last load, return a defensive copy.
-        if current_mtime == _FAVORITES_CACHE["mtime"] and _FAVORITES_CACHE["loaded"]:
-            return list(_FAVORITES_CACHE["contacts"])
+        try:
+            stat = os.stat(favorites_path)
+            current_mtime_ns = stat.st_mtime_ns
+        except OSError:
+            # File doesn't exist or is unreadable
+            _clear_favorites_cache()
+            return []
 
-        # File is new or modified; reload and normalize.
+        # If file hasn't changed since last load, return cached
+        if current_mtime_ns == _FAVORITES_CACHE["mtime_ns"]:
+            return _cached_favorites_contacts()
+
+        # File is new or modified; reload and normalize
         try:
             with open(favorites_path, "r", encoding="utf-8") as f:
                 contacts = json.load(f)
@@ -993,16 +1089,29 @@ def load_favorites_cached() -> List[str]:
             else:
                 normalized = []
             _FAVORITES_CACHE["contacts"] = normalized
-            _FAVORITES_CACHE["mtime"] = current_mtime
-            _FAVORITES_CACHE["loaded"] = True
-            logger.debug("Reloaded favorites allowlist from %s (%d contacts)", favorites_path, len(normalized))
-            return list(normalized)
+            _FAVORITES_CACHE["mtime_ns"] = current_mtime_ns
+            logger.debug("Reloaded favorites.json (%d contacts)", len(normalized))
+            return _cached_favorites_contacts()
         except Exception as e:
-            _FAVORITES_CACHE["contacts"] = []
-            _FAVORITES_CACHE["mtime"] = 0.0
-            _FAVORITES_CACHE["loaded"] = False
-            logger.warning("Failed to parse favorites allowlist at %s: %s", favorites_path, e)
+            logger.warning("Failed to parse favorites.json: %s", e)
+            _clear_favorites_cache()
             return []
+
+
+def close_chat_db_connection() -> None:
+    """Close and clear the cached chat.db connection."""
+    global _CHAT_DB_CONN
+
+    with _CHAT_DB_LOCK:
+        if _CHAT_DB_CONN is None:
+            return
+        conn = _CHAT_DB_CONN
+        _CHAT_DB_CONN = None
+        try:
+            conn.close()
+            logger.info("Closed cached chat.db connection")
+        except Exception as e:
+            logger.warning("Failed to close cached chat.db connection: %s", e)
 
 
 def init_chat_db():
@@ -1028,25 +1137,8 @@ def init_chat_db():
             return None
 
 
-def _reset_chat_db_connection() -> None:
-    """Reset stale chat.db connection so the next read can reopen it."""
-    global _CHAT_DB_CONN
-    with _CHAT_DB_LOCK:
-        if _CHAT_DB_CONN:
-            try:
-                _CHAT_DB_CONN.close()
-            except Exception:
-                pass
-            _CHAT_DB_CONN = None
-
-
-def _retry_backoff_seconds(attempt: int) -> float:
-    """Return exponential backoff delay for sqlite retries (zero-indexed attempt)."""
-    return DB_RETRY_BACKOFF * (2 ** attempt)
-
-
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
-    """Fetch next message from chat.db with persistent connection (optimized)."""
+    """Fetch next message from chat.db with retry logic and cached connection."""
     for attempt in range(DB_RETRY_ATTEMPTS):
         conn = init_chat_db()
         if not conn:
@@ -1066,25 +1158,27 @@ def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
                 )
                 return cursor.fetchone()
         except sqlite3.OperationalError as e:
-            backoff = _retry_backoff_seconds(attempt)
+            close_chat_db_connection()
+            if attempt == DB_RETRY_ATTEMPTS - 1:
+                logger.warning("Database query failed after %d attempts: %s", attempt + 1, e)
+                return None
+            backoff = _db_retry_backoff(attempt)
             logger.warning(
                 "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
                 attempt + 1,
                 e,
                 backoff,
             )
-            _reset_chat_db_connection()
-            if attempt < DB_RETRY_ATTEMPTS - 1:
-                time.sleep(backoff)
+            time.sleep(backoff)
         except sqlite3.Error as e:
             logger.warning("Database read failed with sqlite error: %s", e)
-            _reset_chat_db_connection()
+            close_chat_db_connection()
             return None
     return None
 
 
 def get_last_message_id() -> Optional[int]:
-    """Get the highest ROWID from the message table (optimized with persistent connection)."""
+    """Get the highest ROWID from the message table using the cached connection."""
     for attempt in range(DB_RETRY_ATTEMPTS):
         conn = init_chat_db()
         if not conn:
@@ -1097,19 +1191,21 @@ def get_last_message_id() -> Optional[int]:
                 row = cursor.fetchone()
                 return row[0] if row and row[0] else 0
         except sqlite3.OperationalError as e:
-            backoff = _retry_backoff_seconds(attempt)
+            close_chat_db_connection()
+            if attempt == DB_RETRY_ATTEMPTS - 1:
+                logger.warning("Failed to get last message ID after %d attempts: %s", attempt + 1, e)
+                return None
+            backoff = _db_retry_backoff(attempt)
             logger.warning(
-                "Last message ID read attempt %d failed: %s. Retrying in %.1f seconds...",
+                "Last-message lookup attempt %d failed: %s. Retrying in %.1f seconds...",
                 attempt + 1,
                 e,
                 backoff,
             )
-            _reset_chat_db_connection()
-            if attempt < DB_RETRY_ATTEMPTS - 1:
-                time.sleep(backoff)
+            time.sleep(backoff)
         except sqlite3.Error as e:
             logger.warning("Failed to get last message ID: %s", e)
-            _reset_chat_db_connection()
+            close_chat_db_connection()
             return None
     return None
 
@@ -1565,9 +1661,8 @@ def voice_query(
                     system_instruction=GEMINI_SYSTEM_INSTRUCTION,
                     tool_declarations=GEMINI_TOOL_DECLARATIONS
                 )
-                response = gemini_model.generate_content(
-                    messages,
-                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                response = _gemini_generate_content(
+                    contents=messages,
                 )
 
                 if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
@@ -1575,30 +1670,22 @@ def voice_query(
                         response, endpoint="voice_query", model="gemini-2.5-flash"
                     )
 
-                if response.candidates and response.candidates[0].content:
-                    parts = response.candidates[0].content.parts
-                    text_reply = ""
-                    tool_calls = []
-                    for part in parts:
-                        if hasattr(part, "text") and part.text:
-                            text_reply += part.text
-                        # Truthiness, not hasattr — see _gemini_backup_reply.
-                        if getattr(part, "function_call", None):
-                            tool_calls.append(part.function_call)
+                text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
+                if text_reply or tool_calls:
 
                     if tool_calls:
                         tool_results = []
                         for call in tool_calls:
-                            tool_name = call.name
-                            tool_args = call.args
+                            tool_name = call["name"]
+                            tool_args = dict(call.get("args") or {})
                             if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
                                 tool_args["list_name"] = "Household"
                             tool_results.append((tool_name, _execute_tool_call(tool_name, tool_args)))
 
-                        follow_up_response = gemini_model.generate_content(
-                            [
+                        follow_up_response = _gemini_generate_content(
+                            contents=[
                                 *messages,
-                                {"role": "model", "parts": parts},
+                                {"role": "model", "parts": _serialize_parts(parts)},
                                 {
                                     "role": "function",
                                     "parts": [
@@ -1607,13 +1694,10 @@ def voice_query(
                                     ],
                                 },
                             ],
-                            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                            include_tools=False,
                         )
-                        if follow_up_response.candidates:
-                            follow_up_parts = follow_up_response.candidates[0].content.parts
-                            reply = "".join(
-                                p.text for p in follow_up_parts if hasattr(p, "text")
-                            ).strip() or None
+                        follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+                        reply = follow_up_text.strip() or None
                     else:
                         reply = text_reply.strip() or None
             except Exception as gemini_err:
