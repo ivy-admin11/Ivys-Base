@@ -239,9 +239,9 @@ Given your current setup (local Mac development), here's the **ideal workflow:**
    def load_keychain_secrets():
        """Load critical secrets from macOS Keychain on startup."""
        keys_to_load = {
-           "GEMINI_API_KEY": "ivy-gemini",
-           "DEEPSEEK_API_KEY": "ivy-deepseek",
-           "ADMIN_SECRET": "ivy-admin-secret",
+           "GEMINI_API_KEY": "ivy-gemini",  # pragma: allowlist secret
+           "DEEPSEEK_API_KEY": "ivy-deepseek",  # pragma: allowlist secret
+           "ADMIN_SECRET": "ivy-admin-secret",  # pragma: allowlist secret
        }
        for env_var, keychain_service in keys_to_load.items():
            value = get_keychain_secret(keychain_service)

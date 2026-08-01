@@ -11,9 +11,9 @@
 ## Development Guidelines
 - Always preserve the dual-brain failover structure (DeepSeek → Gemini) inside `main.py`.
 - Keep text replies short, concise, and direct (under 40 words).
-- Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`. The process fails closed — it refuses to start if `ADMIN_SECRET` is unset (set `ALLOW_INSECURE_ADMIN_SECRET=true` for local/test use only).
+- Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`. The process fails closed — it refuses to start if `ADMIN_SECRET` is unset (set `ALLOW_INSECURE_ADMIN_SECRET=true` for local/test use only). # pragma: allowlist secret
 
 ## Common Operations
 - Run the Live Engine: `uvicorn main:app --host 127.0.0.1 --port 8000` from `~/openclaw-admin/`
-- Test Failover: `export DEEPSEEK_API_KEY="broken_key_test" && uvicorn main:app --host 127.0.0.1 --port 8000`
+- Test Failover: `export DEEPSEEK_API_KEY="broken_key_test" && uvicorn main:app --host 127.0.0.1 --port 8000` # pragma: allowlist secret
 - Review Active Local Logs: logs are emitted to stdout; capture with `uvicorn main:app --host 127.0.0.1 --port 8000 2>&1 | tee run.log`
