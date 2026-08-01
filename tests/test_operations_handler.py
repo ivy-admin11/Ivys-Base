@@ -326,9 +326,9 @@ def test_tailscale_status_no_auth_keys_exposed(monkeypatch):
         "Self": {
             "HostName": "myhost",
             "TailscaleIPs": ["100.1.2.3"],
-            "NodeKey": "nodekey:super-secret-key-abc123",
-            "MachineKey": "mkey:machine-secret-abc123",
-            "AuthKey": "tskey-auth-super-secret",
+            "NodeKey": "nodekey:super-secret-key-abc123",  # pragma: allowlist secret
+            "MachineKey": "mkey:machine-secret-abc123",  # pragma: allowlist secret
+            "AuthKey": "tskey-auth-super-secret",  # pragma: allowlist secret
         },
         "Peer": {},
         "ExitNodeStatus": {"ID": ""},
