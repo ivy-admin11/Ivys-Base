@@ -8,6 +8,7 @@ batch — never a sync per pick plus another append-all pass.
 
 import logging
 import re
+
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional, Tuple
 

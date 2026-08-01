@@ -1128,9 +1128,10 @@ def _run_pipeline(
     # A valid pick should have:
     #   - confidence level (not just 55% single-sharp noise)
     #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
+
     filtered_picks = []
     for p in merged:
-        confidence = (p.get("confidence") or p.get("enrichment", {}).get("confidence") or "").lower()
+        confidence = (p.get("enrichment", {}).get("confidence") or p.get("confidence") or "").lower()
         is_consensus = p.get("is_consensus", False)
         sharp_count = p.get("consensus_count", 1)
 

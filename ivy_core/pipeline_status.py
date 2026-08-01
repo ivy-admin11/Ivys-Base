@@ -128,8 +128,18 @@ class SourceHealth:
 
 
 class PipelineResult:
-    """Comprehensive result of a Sharp Picks run."""
+    """Result tracking for pipeline execution.
 
+    Provides explicit status tracking, source health monitoring, and detailed
+    result serialization for proactive agent runs. Currently used by Sharp Picks
+    (sports_bettor), which delivers text-only results. Designed for reuse by other
+    agents that may use PDF or other attachment methods.
+
+    Note: The `attached` field indicates whether results were delivered with an
+    attachment (PDF, file, etc.). Currently always False for Sharp Picks (text-only
+    delivery) but set during initialization to support other delivery mechanisms.
+    This field is also included for backward compatibility with older API contracts.
+    """
     def __init__(self, status: PipelineStatus):
         self.status = status
         self.sources: dict[str, SourceHealth] = {}
@@ -139,8 +149,10 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
+        # Set to True if results were delivered via attachment (PDF, file, etc.)
+        # Currently always False for Sharp Picks; other agents should set appropriately
+        self.attached = False
         self.report_id: Optional[str] = None
-        self.attached = False  # Backward compatibility: whether a PDF was attached
         self.result_type: Optional[str] = None  # Backward compatibility: old result type
 
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
@@ -189,9 +201,11 @@ class PipelineResult:
         """
         return {
             "status": self.status.value,
+            "result_type": self._infer_result_type(),
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
+            "attached": self.attached,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
@@ -204,6 +218,4 @@ class PipelineResult:
                 }
                 for name, source in self.sources.items()
             },
-            "result_type": self._infer_result_type(),
-            "attached": self.attached,
         }
