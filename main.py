@@ -542,17 +542,6 @@ def init_chat_db() -> Optional[sqlite3.Connection]:
         return None
 
 
-def _cached_favorites_contacts() -> List[str]:
-    """Return a defensive copy of the cached favorites list."""
-    return list(_FAVORITES_CACHE["contacts"])
-
-
-def _clear_favorites_cache() -> None:
-    """Reset the favorites cache to an uninitialized state."""
-    _FAVORITES_CACHE["contacts"] = []
-    _FAVORITES_CACHE["mtime_ns"] = -1
-
-
 def _db_retry_backoff(attempt: int) -> float:
     """Return the exponential backoff delay for chat.db retries."""
     return DB_RETRY_BACKOFF * (2 ** attempt)
@@ -718,7 +707,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        close_chat_db_connection()
+        close_chat_db()
         logger.info("Gateway shutdown complete.")
 
 
