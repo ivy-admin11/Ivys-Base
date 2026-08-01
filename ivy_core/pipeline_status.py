@@ -12,23 +12,23 @@ from typing import Optional
 
 class PipelineStatus(str, Enum):
     """Final status of a Sharp Picks run."""
-    
+
     # Successful runs
     SUCCESS = "success"  # All sources healthy, 1+ pick passes minimum threshold
-    
+
     # Degraded runs (partial success)
     DEGRADED = "degraded"  # Non-critical sources unavailable, but minimum picks still delivered
-    
+
     # Failure states
     AUTH_FAILURE = "auth_failure"  # 401/403 on required API (e.g., Odds API)
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"  # All sources down/unavailable
     NO_QUALIFYING_PICKS = "no_qualifying_picks"  # Sources healthy but no picks meet threshold
     INTERNAL_ERROR = "internal_error"  # Code error or unexpected exception
-    
+
     def is_success(self) -> bool:
         """Return True if the run should be considered successful."""
         return self in (PipelineStatus.SUCCESS, PipelineStatus.DEGRADED)
-    
+
     def is_failure(self) -> bool:
         """Return True if the run should be considered a failure."""
         return self in (
@@ -58,7 +58,7 @@ class ProviderHTTPError(Exception):
 
 class ProviderAuthenticationError(Exception):
     """Raised when an API returns 401 or 403 (credentials rejected)."""
-    
+
     def __init__(
         self,
         provider: str,
@@ -71,7 +71,7 @@ class ProviderAuthenticationError(Exception):
         self.message = message
         self.endpoint = endpoint
         super().__init__(message)
-    
+
     def __str__(self) -> str:
         parts = [f"[{self.provider}] {self.message} (HTTP {self.status_code})"]
         if self.endpoint:
@@ -81,7 +81,7 @@ class ProviderAuthenticationError(Exception):
 
 class RetryableProviderError(Exception):
     """Raised when an API returns 429 (rate limited) or 5xx (server error)."""
-    
+
     def __init__(
         self,
         provider: str,
@@ -98,7 +98,7 @@ class RetryableProviderError(Exception):
 
 class ProviderUnavailableError(Exception):
     """Raised when an API is unavailable (network error, timeout, etc.)."""
-    
+
     def __init__(self, provider: str, message: str, cause: Optional[Exception] = None):
         self.provider = provider
         self.message = message
@@ -108,7 +108,7 @@ class ProviderUnavailableError(Exception):
 
 class SourceHealth:
     """Track health of a single data source (e.g., "Odds API", "Grok X Search")."""
-    
+
     def __init__(self, name: str, is_required: bool = False):
         """
         Args:
@@ -121,13 +121,13 @@ class SourceHealth:
         self.error: Optional[Exception] = None
         self.status_code: Optional[int] = None
         self.pick_count = 0
-    
+
     def mark_success(self, pick_count: int = 0):
         """Mark source as healthy."""
         self.healthy = True
         self.error = None
         self.pick_count = pick_count
-    
+
     def mark_failure(
         self,
         error: Exception,
@@ -137,7 +137,7 @@ class SourceHealth:
         self.healthy = False
         self.error = error
         self.status_code = status_code
-    
+
     def __repr__(self) -> str:
         status = "✅" if self.healthy else "❌"
         req = " [REQUIRED]" if self.is_required else ""
@@ -145,8 +145,18 @@ class SourceHealth:
 
 
 class PipelineResult:
-    """Comprehensive result of a Sharp Picks run."""
-    
+    """Result tracking for pipeline execution.
+
+    Provides explicit status tracking, source health monitoring, and detailed
+    result serialization for proactive agent runs. Currently used by Sharp Picks
+    (sports_bettor), which delivers text-only results. Designed for reuse by other
+    agents that may use PDF or other attachment methods.
+
+    Note: The `attached` field indicates whether results were delivered with an
+    attachment (PDF, file, etc.). Currently always False for Sharp Picks (text-only
+    delivery) but set during initialization to support other delivery mechanisms.
+    This field is also included for backward compatibility with older API contracts.
+    """
     def __init__(self, status: PipelineStatus):
         self.status = status
         self.sources: dict[str, SourceHealth] = {}
@@ -156,26 +166,26 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
+        self.attached = False
         self.report_id: Optional[str] = None
-        self.attached = False  # Backward compatibility: whether a PDF was attached
         self.result_type: Optional[str] = None  # Backward compatibility: old result type
-    
+
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
         """Register a data source."""
         source = SourceHealth(name, is_required)
         self.sources[name] = source
         return source
-    
+
     def _infer_result_type(self) -> str:
         """Infer the old-style result_type from status and outcome.
-        
+
         This method maintains backward compatibility with the old return format.
         Note: When status is SUCCESS but sent=False, we cannot definitively
         distinguish between a dry-run and a duplicate suppression without
         additional context. We return "duplicate" as a reasonable default for
         backward compatibility, but callers should prefer using the new
         "status" and "sent" fields for precise semantics.
-        
+
         The mapping is:
         - NO_QUALIFYING_PICKS → "no_picks"
         - SUCCESS (sent=True) → "picks"
@@ -184,7 +194,7 @@ class PipelineResult:
         """
         if self.result_type:
             return self.result_type
-        
+
         # Map new status to old result_type for backward compatibility
         if self.status == PipelineStatus.NO_QUALIFYING_PICKS:
             return "no_picks"
@@ -197,19 +207,20 @@ class PipelineResult:
         else:
             # Other statuses map to their string value
             return self.status.value
-    
+
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict for logging/API response.
-        
+
         Includes both new keys (status, picks, consensus) and old keys
         (result_type, attached) for backward compatibility with existing tests/callers.
         """
         return {
-            # New-style keys
             "status": self.status.value,
+            "result_type": self._infer_result_type(),
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
+            "attached": self.attached,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
@@ -222,7 +233,4 @@ class PipelineResult:
                 }
                 for name, source in self.sources.items()
             },
-            # Backward-compatible keys for existing tests/callers
-            "result_type": self._infer_result_type(),
-            "attached": self.attached,
         }

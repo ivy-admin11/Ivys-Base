@@ -95,11 +95,28 @@ if not ADMIN_SECRET:
             "For local/test use only, set ALLOW_INSECURE_ADMIN_SECRET=true instead."
         )
 
-HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "+12147334061")
+HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "")
 """Primary authorized contact for approval workflows"""
 
-LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "+18179138648")
+if not HENRY_PHONE:
+    raise RuntimeError(
+        "HENRY_PHONE is not set. Add HENRY_PHONE=+1XXXXXXXXXX to your .env file "
+        "or export it in the environment before starting Ivy."
+    )
+
+LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "")
 """Secondary authorized contact for approval workflows"""
+
+if not LEXI_PHONE:
+    raise RuntimeError(
+        "LEXI_PHONE is not set. Add LEXI_PHONE=+1XXXXXXXXXX to your .env file "
+        "or export it in the environment before starting Ivy."
+    )
+
+IVY_FAVORITES_FILE: str = os.path.expanduser(
+    os.environ.get("IVY_FAVORITES_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json"))
+)
+"""Local contact allowlist path (real allowlists are gitignored; see favorites.example.json)"""
 
 # ============================================================================
 # PROVIDER & EXTERNAL SERVICE API KEYS (optional — missing keys disable only
@@ -120,6 +137,24 @@ ODDS_API_KEY: str = os.environ.get("ODDS_API_KEY", "")
 
 READWISE_API_KEY: str = os.environ.get("READWISE_API_KEY", "")
 """Readwise API key"""
+
+# ============================================================================
+# GOOGLE SHEETS — SHARP PICKS SNAPSHOT SYNC
+# ============================================================================
+
+GOOGLE_SERVICE_ACCOUNT_KEY: str = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
+"""Path to a Google service-account JSON key file. Empty means Sheets sync
+falls back to Application Default Credentials (or reports not_configured
+if ADC is also unavailable)."""
+
+GOOGLE_SHEETS_SPREADSHEET_ID: str = os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "")
+"""Target spreadsheet ID for the Sharp Picks canonical snapshot sync."""
+
+GOOGLE_SHEETS_PICKS_TAB: str = os.environ.get("GOOGLE_SHEETS_PICKS_TAB", "Sharp Picks")
+"""Sheet tab name for the canonical picks snapshot."""
+
+GOOGLE_SHEETS_SUMMARY_TAB: str = os.environ.get("GOOGLE_SHEETS_SUMMARY_TAB", "Summary")
+"""Sheet tab name for the W/L/P statistics summary."""
 
 # ============================================================================
 # PROMPT CACHING (Token Cost Optimization)

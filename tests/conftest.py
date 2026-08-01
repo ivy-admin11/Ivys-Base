@@ -27,6 +27,14 @@ os.environ.setdefault("ENABLE_IMESSAGE_POLLER", "false")
 import pytest  # noqa: E402
 
 
+def pytest_configure(config):
+    """Configure pytest with custom markers and skip rules."""
+    # macOS integration tests require explicit opt-in via PYTEST_MACOS_INTEGRATION=1
+    # They are skipped by default in CI and local development.
+    if os.environ.get("PYTEST_MACOS_INTEGRATION") != "1":
+        config.option.markexpr = "not macos_integration"
+
+
 @pytest.fixture(autouse=True)
 def isolated_receipts_db(tmp_path, monkeypatch):
     """Every test gets its own scratch SQLite file — never the real
@@ -34,6 +42,16 @@ def isolated_receipts_db(tmp_path, monkeypatch):
     from ivy_core import receipts
 
     monkeypatch.setattr(receipts, "DB_PATH", tmp_path / "test_executions.db")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_picks_db(tmp_path, monkeypatch):
+    """Every test gets its own scratch SQLite file — never the real
+    data/picks.db."""
+    from ivy_core import picks_tracker
+
+    monkeypatch.setattr(picks_tracker, "PICKS_DB", tmp_path / "test_picks.db")
     yield
 
 

@@ -4,7 +4,7 @@ Ivy Local Admin API Gateway v2.2 — Voice Assistant Edition
 Architecture:
 - Phase 1: Critical fixes (duplicates, auth, f-string bugs)
 - Phase 2: Config consolidation (tool schemas, timeouts, feature flags)
-- Phase 3: Gemini SDK refactor (use google.generativeai official library)
+- Phase 3: Gemini SDK refactor (use google.genai official SDK)
 - Phase 4: Prompt caching for 80-90% token cost reduction ✅ IMPLEMENTED
 - Phase 5: Voice assistant with session management and cache optimization ✅ IMPLEMENTED
 
@@ -14,7 +14,7 @@ Environment-specific secrets go in .env (see .env.example).
 Security:
 - All FastAPI endpoints require X-API-Key header matching ADMIN_SECRET
 - Database reads use SQLite read-only mode to prevent accidental mutations
-- iMessage poller validates sender against favorites.json whitelist
+- iMessage poller validates sender against the IVY_FAVORITES_FILE allowlist
 
 Voice Assistant Features:
 - Session-based conversation management with automatic cleanup
@@ -29,6 +29,7 @@ Cost Optimization:
 """
 
 import os
+import shutil as _shutil
 import socket
 import sys
 import time
@@ -40,7 +41,7 @@ import re
 import requests
 import subprocess
 import atexit
-import google.generativeai as genai
+from google import genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,6 +63,7 @@ from config import (
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
     ADMIN_SECRET,
+    IVY_FAVORITES_FILE,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
@@ -137,8 +139,107 @@ except ImportError:
 # GEMINI SDK CONFIGURATION
 # ============================================================================
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+_GEMINI_MODEL = "gemini-2.5-flash"
+_gemini_client = None
+
+
+def _get_gemini_client():
+    """Lazily initialize Gemini client using API-key auth."""
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    # Keep ADC env noise from interfering with explicit API-key auth.
+    saved = {
+        k: os.environ.pop(k)
+        for k in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")
+        if k in os.environ
+    }
+    try:
+        _gemini_client = genai.Client(api_key=api_key)
+    finally:
+        os.environ.update(saved)
+    return _gemini_client
+
+
+def _make_gemini_config(
+    system_instruction: Optional[str] = None,
+    *,
+    include_tools: bool = True,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if include_tools:
+        config["tools"] = [{"function_declarations": GEMINI_TOOL_DECLARATIONS}]
+    if system_instruction:
+        config["system_instruction"] = system_instruction
+    return config
+
+
+def _part_text(part: Any) -> str:
+    if isinstance(part, dict):
+        return part.get("text") or ""
+    return getattr(part, "text", "") or ""
+
+
+def _part_function_call(part: Any) -> Optional[Dict[str, Any]]:
+    # Handles both SDK objects and plain dict parts used in tests/follow-up payloads.
+    raw = part.get("function_call") if isinstance(part, dict) else getattr(part, "function_call", None)
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        return {"name": raw.get("name"), "args": raw.get("args") or {}}
+    return {"name": getattr(raw, "name", None), "args": getattr(raw, "args", {}) or {}}
+
+
+def _extract_gemini_parts(response: Any) -> List[Any]:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return []
+    content = getattr(candidates[0], "content", None)
+    return getattr(content, "parts", None) or []
+
+
+def _extract_gemini_reply_and_tool_calls(response: Any) -> tuple[str, List[Dict[str, Any]], List[Any]]:
+    parts = _extract_gemini_parts(response)
+    text_reply = "".join(_part_text(part) for part in parts)
+    tool_calls = []
+    for part in parts:
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            tool_calls.append(call)
+    return text_reply, tool_calls, parts
+
+
+def _serialize_parts(parts: List[Any]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for part in parts:
+        text = _part_text(part)
+        if text:
+            serialized.append({"text": text})
+        call = _part_function_call(part)
+        if call and call.get("name"):
+            serialized.append(
+                {"function_call": {"name": call["name"], "args": call.get("args") or {}}}
+            )
+    return serialized
+
+
+def _gemini_generate_content(
+    *,
+    contents: Any,
+    system_instruction: Optional[str] = None,
+    include_tools: bool = True,
+):
+    client = _get_gemini_client()
+    return client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=contents,
+        config=_make_gemini_config(system_instruction, include_tools=include_tools),
+    )
 
 # ============================================================================
 # PYDANTIC MODELS (Voice Assistant)
@@ -441,6 +542,22 @@ def init_chat_db() -> Optional[sqlite3.Connection]:
         return None
 
 
+def _cached_favorites_contacts() -> List[str]:
+    """Return a defensive copy of the cached favorites list."""
+    return list(_FAVORITES_CACHE["contacts"])
+
+
+def _clear_favorites_cache() -> None:
+    """Reset the favorites cache to an uninitialized state."""
+    _FAVORITES_CACHE["contacts"] = []
+    _FAVORITES_CACHE["mtime_ns"] = -1
+
+
+def _db_retry_backoff(attempt: int) -> float:
+    """Return the exponential backoff delay for chat.db retries."""
+    return DB_RETRY_BACKOFF * (2 ** attempt)
+
+
 def _probe_deepseek() -> Dict[str, Any]:
     """Make a minimal (~1-token) HTTP call to DeepSeek and map the result to
     {configured, authenticated, reachable, role, status, reason}."""
@@ -503,9 +620,12 @@ def _probe_gemini() -> Dict[str, Any]:
             "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
         }
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        model.generate_content("hi", generation_config={"max_output_tokens": 1})
+        client = genai.Client(api_key=api_key)
+        client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents="hi",
+            config={"max_output_tokens": 1},
+        )
         return {
             "configured": True, "authenticated": True, "reachable": True,
             "role": "failover", "status": "ready", "reason": None,
@@ -598,6 +718,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        close_chat_db_connection()
         logger.info("Gateway shutdown complete.")
 
 
@@ -605,6 +726,7 @@ app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", life
 
 PROCESS_STARTED_AT = datetime.now()
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+FAVORITES_FILENAME = "favorites.json"
 
 # ============================================================================
 # SECURITY: Authentication Middleware
@@ -1101,24 +1223,22 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
             tool_declarations=GEMINI_TOOL_DECLARATIONS,
         )
-        if messages is None:
+        if not messages:
             logger.warning("Caching failed, falling back to non-cached request")
-            messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+            messages = [{"role": "user", "parts": [{"text": text}]}]
             use_caching = False
     else:
-        messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+        messages = [{"role": "user", "parts": [{"text": text}]}]
 
     # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
     # The cache_manager already includes it in the message stream
     if use_caching:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
         )
     else:
-        response = gemini_model.generate_content(
-            messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+        response = _gemini_generate_content(
+            contents=messages,
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
         )
 
@@ -1128,20 +1248,7 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
             response, endpoint="background_imessage_worker", model="gemini-2.5-flash"
         )
 
-    if not (response.candidates and response.candidates[0].content):
-        return None
-
-    parts = response.candidates[0].content.parts
-    text_reply = ""
-    tool_calls = []
-    for part in parts:
-        if hasattr(part, "text") and part.text:
-            text_reply += part.text
-        # part.function_call is always a present attribute (protobuf oneof
-        # field) even on text-only parts — checking truthiness, not hasattr,
-        # is what actually detects a real tool call.
-        if getattr(part, "function_call", None):
-            tool_calls.append(part.function_call)
+    text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
 
     if not tool_calls:
         return text_reply.strip() or None
@@ -1149,8 +1256,8 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
     logger.info("🛠️ Gemini returned %d tool operations", len(tool_calls))
     tool_results = []
     for call in tool_calls:
-        tool_name = call.name
-        tool_args = call.args
+        tool_name = call["name"]
+        tool_args = dict(call.get("args") or {})
         # Enforce Household list for reminders
         if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
             tool_args["list_name"] = "Household"
@@ -1161,14 +1268,10 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
 
     # Follow-up call with the *real* tool results (previously always sent
     # back an empty {} regardless of what the tool actually returned).
-    follow_up_kwargs = {"tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
-    if not use_caching:
-        follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
-
-    follow_up_response = gemini_model.generate_content(
-        [
+    follow_up_response = _gemini_generate_content(
+        contents=[
             *messages,
-            {"role": "model", "parts": parts},
+            {"role": "model", "parts": _serialize_parts(parts)},
             {
                 "role": "function",
                 "parts": [
@@ -1177,12 +1280,11 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
                 ],
             },
         ],
-        **follow_up_kwargs,
+        system_instruction=None if use_caching else GEMINI_SYSTEM_INSTRUCTION,
+        include_tools=False,
     )
-    if follow_up_response.candidates:
-        follow_up_parts = follow_up_response.candidates[0].content.parts
-        return "".join(p.text for p in follow_up_parts if hasattr(p, "text")).strip() or None
-    return None
+    follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+    return follow_up_text.strip() or None
 
 
 def query_llm_with_tools(prompt_text: str) -> str:
@@ -1697,6 +1799,290 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
         logger.error("Error executing job command '%s': %s", canonical_job_name, e)
         return "❌ An error occurred while starting that job. Please try again."
 
+# OPERATIONS COMMAND HANDLER (deterministic — no LLM)
+# ============================================================================
+
+
+def get_tailscale_status() -> str:
+    """Return a concise, iMessage-safe Tailscale status summary.
+
+    Uses ``tailscale status --json`` via subprocess (no shell=True).
+    Never exposes auth keys, node keys, machine keys, or control URLs.
+    """
+    cli = _shutil.which("tailscale")
+    if not cli:
+        return "🔴 Tailscale unavailable\nThe tailscale CLI was not found on the iMac."
+
+    try:
+        result = subprocess.run(
+            [cli, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "🟠 Tailscale status could not be read.\n(CLI timed out after 5 s)"
+    except Exception as exc:
+        logger.warning("tailscale status error: %s", exc)
+        return "🟠 Tailscale status could not be read."
+
+    if result.returncode != 0:
+        return "🟠 Tailscale status could not be read."
+
+    try:
+        data = json.loads(result.stdout)
+    except Exception:
+        return "🟠 Tailscale status could not be read."
+
+    # --- Extract safe fields only ---
+    backend_state: str = data.get("BackendState", "Unknown")
+    self_node: Dict[str, Any] = data.get("Self", {})
+
+    hostname: str = self_node.get("HostName") or self_node.get("DNSName", "unknown")
+    # Strip trailing dot and domain suffix from DNSName if present
+    if "." in hostname:
+        hostname = hostname.split(".")[0]
+
+    ts_ip: str = ""
+    tailscale_ips = self_node.get("TailscaleIPs") or []
+    for ip in tailscale_ips:
+        # Prefer IPv4
+        if ":" not in str(ip):
+            ts_ip = str(ip)
+            break
+    if not ts_ip and tailscale_ips:
+        ts_ip = str(tailscale_ips[0])
+
+    running = backend_state in ("Running", "Starting")
+    state_label = "Running" if running else backend_state
+
+    # Exit node
+    exit_node_status = data.get("ExitNodeStatus") or {}
+    exit_node_id = exit_node_status.get("ID", "")
+    exit_node_name = "None"
+    if exit_node_id:
+        # Try to resolve name from peer list
+        for peer in (data.get("Peer") or {}).values():
+            if peer.get("ID") == exit_node_id:
+                peer_host = peer.get("HostName") or peer.get("DNSName", "")
+                if "." in peer_host:
+                    peer_host = peer_host.split(".")[0]
+                exit_node_name = peer_host or exit_node_id
+                break
+        if exit_node_name == "None":
+            exit_node_name = exit_node_id[:16]
+
+    # Online peers
+    peers: Dict[str, Any] = data.get("Peer") or {}
+    online_peers = []
+    for peer in peers.values():
+        if peer.get("Online"):
+            name = peer.get("HostName") or peer.get("DNSName", "")
+            if "." in name:
+                name = name.split(".")[0]
+            if name:
+                online_peers.append(name)
+    online_peers.sort()
+
+    # Build summary
+    icon = "🟢" if running else "🟠"
+    lines = [
+        f"{icon} Tailscale Status",
+        "",
+        f"Local device: {hostname}",
+        f"Tailscale IP: {ts_ip or 'N/A'}",
+        f"Backend: {state_label}",
+        f"Exit node: {exit_node_name}",
+        f"Online peers: {len(online_peers)}",
+    ]
+    for p in online_peers:
+        lines.append(f"• {p}")
+
+    return "\n".join(lines)
+
+
+def _get_ivy_status_text() -> str:
+    """Return a brief, deterministic status of the Ivy gateway."""
+    uptime = datetime.now() - PROCESS_STARTED_AT
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes = remainder // 60
+    uptime_str = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+    statuses = compute_tool_statuses()
+    ready_count = sum(1 for s in statuses if s["status"] == "ready")
+    total_count = len(statuses)
+
+    jobs_available = 0
+    jobs_total = 0
+    if JOB_RUNNER_AVAILABLE:
+        all_jobs = job_runner.list_jobs()
+        jobs_total = len(all_jobs)
+        jobs_available = sum(1 for j in all_jobs if j["available"])
+
+    lines = [
+        "🟢 Ivy Gateway — Online",
+        "",
+        f"Uptime: {uptime_str}",
+        f"Poller: {'active' if ENABLE_IMESSAGE_POLLER else 'disabled'}",
+        f"Tools ready: {ready_count}/{total_count}",
+        f"Jobs available: {jobs_available}/{jobs_total}",
+        f"Caching: {'on' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'off'}",
+        f"Host: {socket.gethostname()}",
+    ]
+    return "\n".join(lines)
+
+
+def _get_capabilities_text() -> str:
+    """Return a human-readable list of all tools and jobs."""
+    statuses = compute_tool_statuses()
+    lines = ["📋 Ivy Skills & Capabilities", ""]
+    lines.append("Tools:")
+    for s in statuses:
+        if s["status"] == "ready":
+            lines.append(f"  ✅ {s['tool_name']}")
+        elif s["status"] == "disabled":
+            lines.append(f"  ⊘ {s['tool_name']} (disabled)")
+        else:
+            lines.append(f"  ❌ {s['tool_name']} (unavailable)")
+
+    if JOB_RUNNER_AVAILABLE:
+        lines.append("")
+        lines.append("Jobs:")
+        for job in job_runner.list_jobs():
+            if job["available"]:
+                sched = job.get("schedule") or "on-demand"
+                lines.append(f"  ✅ {job['display_name']} — {sched}")
+            else:
+                lines.append(f"  ❌ {job['display_name']} (unavailable)")
+
+    return "\n".join(lines)
+
+
+def _get_job_status_text(job_name: Optional[str] = None) -> str:
+    """Return recent execution history for a job (or all jobs)."""
+    try:
+        recent = receipts.list_recent(limit=5, job_name=job_name)
+    except Exception as exc:
+        logger.warning("receipts.list_recent error: %s", exc)
+        return "⚠️ Could not read execution history."
+
+    label = job_name.replace("_", " ").title() if job_name else "All Jobs"
+    if not recent:
+        return f"📋 {label} — no recent executions found."
+
+    lines = [f"📋 {label} — recent runs:", ""]
+    for rec in recent:
+        started = rec.get("started_at", "")[:16].replace("T", " ")
+        status = rec.get("status", "?")
+        name = rec.get("job_name", "?")
+        icon = "✅" if status == "success" else ("🔄" if status == "started" else "❌")
+        lines.append(f"{icon} {name} @ {started} — {status}")
+    return "\n".join(lines)
+
+
+# Phrase → category mapping for deterministic operations routing.
+# Phrases are matched after stripping a leading "ivy" or "ivy," token and
+# collapsing whitespace.  Order does not matter; exact set-membership lookup.
+_OPS_TAILSCALE: frozenset = frozenset({
+    "tailscale status",
+    "check tailscale",
+    "is tailscale online",
+    "tailscale",
+    "vpn status",
+    "network status",
+})
+
+_OPS_IVY_STATUS: frozenset = frozenset({
+    "ivy status",
+    "status",
+    "health check",
+    "system health",
+    "gateway status",
+    "poller status",
+    "is ivy online",
+    "are you working",
+})
+
+_OPS_CAPABILITIES: frozenset = frozenset({
+    "skills",
+    "ivy skills",
+    "list skills",
+    "tell me all your skills",
+    "tell me all of your skills",
+    "what can you do",
+    "capabilities",
+    "list capabilities",
+    "what is turned on",
+    "what things are turned on",
+    "are all your skills active",
+    "advise if all your skills are active",
+    # variants with "of your" wording (seen in real messages)
+    "advise if all of your skills are active",
+    "tell me what are all of the things that are turned on",
+})
+
+_OPS_JOB_STATUS: frozenset = frozenset({
+    "sharp picks status",
+    "last sharp picks",
+    "last job",
+    "recent jobs",
+    "execution status",
+})
+
+
+def _normalize_ops_text(text: str) -> str:
+    """Normalize text for operations command recognition only.
+
+    - Strips leading/trailing whitespace.
+    - Collapses repeated whitespace to a single space.
+    - Lowercases.
+    - Optionally removes a leading ``ivy`` or ``ivy,`` token.
+    """
+    normalized = " ".join(text.strip().split()).lower()
+    # Strip optional leading "ivy," or "ivy " prefix
+    for prefix in ("ivy, ", "ivy,", "ivy "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip()
+            break
+    return normalized
+
+
+def handle_operations_command(text: str, sender: str) -> Optional[str]:  # noqa: ARG001
+    """Deterministic operations command handler — never calls an LLM.
+
+    Returns a user-facing reply string when the text matches a known
+    operations command, or ``None`` to let the caller fall through to the
+    LLM provider chain.
+
+    Routing order handled here (after auth & resend, before LLM):
+      tailscale status  →  get_tailscale_status()
+      ivy/gateway status  →  _get_ivy_status_text()
+      skills/capabilities  →  _get_capabilities_text()
+      job status  →  _get_job_status_text()
+    """
+    key = _normalize_ops_text(text)
+
+    if key in _OPS_TAILSCALE:
+        logger.info("OPS: tailscale status request from %s", sender)
+        return get_tailscale_status()
+
+    if key in _OPS_IVY_STATUS:
+        logger.info("OPS: ivy status request from %s", sender)
+        return _get_ivy_status_text()
+
+    if key in _OPS_CAPABILITIES:
+        logger.info("OPS: capabilities request from %s", sender)
+        return _get_capabilities_text()
+
+    if key in _OPS_JOB_STATUS:
+        logger.info("OPS: job status request from %s", sender)
+        # "sharp picks status" → filter to that job
+        job_filter: Optional[str] = "sharp_picks" if "sharp picks" in key else None
+        return _get_job_status_text(job_filter)
+
+    return None
+
 
 # ============================================================================
 # BACKGROUND IMESSAGE WORKER: DeepSeek Primary + Gemini Backup with CACHING
@@ -1705,12 +2091,12 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
 
 def background_imessage_worker() -> None:
     """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
-    
+
     🆕 Now with prompt caching enabled for 80-90% token savings!
     """
     logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
     logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
-    
+
     last_id = get_last_message_id()
     if last_id is None:
         logger.error(
@@ -1743,14 +2129,16 @@ def background_imessage_worker() -> None:
             if sender.lower() == "me":
                 is_authorized = True
             else:
+                favorites_path = IVY_FAVORITES_FILE
                 # 🚀 Use cached favorites (reloads only if file changes)
                 allowed_contacts = load_favorites_cached()
                 if sender in allowed_contacts:
                     is_authorized = True
                 elif not allowed_contacts:
                     logger.warning(
-                        "⚠️ Security Alert: No contacts loaded from favorites.json! "
+                        "⚠️ Security Alert: No contacts loaded from favorites allowlist at %s! "
                         "Blocking external sender %s.",
+                        favorites_path,
                         sender,
                     )
 
@@ -1776,6 +2164,13 @@ def background_imessage_worker() -> None:
             job_reply = handle_job_command(text, sender)
             if job_reply is not None:
                 run_local_applescript_send(sender, job_reply)
+                consecutive_failures = 0
+                continue
+
+            # ========== OPERATIONS COMMAND (deterministic, no LLM) ==========
+            ops_reply = handle_operations_command(text, sender)
+            if ops_reply is not None:
+                run_local_applescript_send(sender, ops_reply)
                 consecutive_failures = 0
                 continue
 
@@ -1981,7 +2376,7 @@ def get_cache_stats(authenticated: bool = Depends(verify_api_key)):
     """🆕 View prompt caching performance and cost savings."""
     if not CACHING_AVAILABLE:
         return {"error": "Caching not available", "caching_enabled": False}
-    
+
     stats = cache_manager.get_cache_statistics()
     return {
         "caching_enabled": ENABLE_PROMPT_CACHING,
@@ -2046,9 +2441,8 @@ def voice_query(
                     system_instruction=GEMINI_SYSTEM_INSTRUCTION,
                     tool_declarations=GEMINI_TOOL_DECLARATIONS
                 )
-                response = gemini_model.generate_content(
-                    messages,
-                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                response = _gemini_generate_content(
+                    contents=messages,
                 )
 
                 if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
@@ -2056,30 +2450,22 @@ def voice_query(
                         response, endpoint="voice_query", model="gemini-2.5-flash"
                     )
 
-                if response.candidates and response.candidates[0].content:
-                    parts = response.candidates[0].content.parts
-                    text_reply = ""
-                    tool_calls = []
-                    for part in parts:
-                        if hasattr(part, "text") and part.text:
-                            text_reply += part.text
-                        # Truthiness, not hasattr — see _gemini_backup_reply.
-                        if getattr(part, "function_call", None):
-                            tool_calls.append(part.function_call)
+                text_reply, tool_calls, parts = _extract_gemini_reply_and_tool_calls(response)
+                if text_reply or tool_calls:
 
                     if tool_calls:
                         tool_results = []
                         for call in tool_calls:
-                            tool_name = call.name
-                            tool_args = call.args
+                            tool_name = call["name"]
+                            tool_args = dict(call.get("args") or {})
                             if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
                                 tool_args["list_name"] = "Household"
                             tool_results.append((tool_name, _execute_tool_call(tool_name, tool_args)))
 
-                        follow_up_response = gemini_model.generate_content(
-                            [
+                        follow_up_response = _gemini_generate_content(
+                            contents=[
                                 *messages,
-                                {"role": "model", "parts": parts},
+                                {"role": "model", "parts": _serialize_parts(parts)},
                                 {
                                     "role": "function",
                                     "parts": [
@@ -2088,13 +2474,10 @@ def voice_query(
                                     ],
                                 },
                             ],
-                            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                            include_tools=False,
                         )
-                        if follow_up_response.candidates:
-                            follow_up_parts = follow_up_response.candidates[0].content.parts
-                            reply = "".join(
-                                p.text for p in follow_up_parts if hasattr(p, "text")
-                            ).strip() or None
+                        follow_up_text, _, _ = _extract_gemini_reply_and_tool_calls(follow_up_response)
+                        reply = follow_up_text.strip() or None
                     else:
                         reply = text_reply.strip() or None
             except Exception as gemini_err:

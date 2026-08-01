@@ -1,4 +1,4 @@
-#!/Users/lexi/openclaw-admin/.venv/bin/python
+#!/usr/bin/env python3
 import sys
 import os
 from pathlib import Path
@@ -22,8 +22,8 @@ aligns their calls to that slate, merges duplicate picks into consensus plays
 (2+ sharps → 🔥 HIGH LIKELIHOOD 🔥), enriches them with live Grok context, and
 generates a PDF report and sends it to Henry as a real iMessage attachment.
 
-Run by launchd (com.ivy.sharppicks) on a 30-minute cadence across four daily
-windows, so it deliberately texts only *net-new* reports: a content fingerprint
+Run by launchd (com.ivy.sharppicks) 3x daily (9am/3pm/9pm CT), so it
+deliberately texts only *net-new* reports: a content fingerprint
 of the picks is compared against the last report and an unchanged slate is
 skipped (see _report_signature / sports_last_report.json). If the X sweep
 returns no usable picks, run() returns a "no_picks" result without sending
@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 import requests
 from filelock import FileLock, Timeout
 
+import config
 from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
@@ -66,7 +67,7 @@ except ImportError:
 
 
 # ========================= CONFIG =========================
-HENRY_PHONE = "+12147334061"
+HENRY_PHONE = config.HENRY_PHONE
 XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
 # The Odds API (https://the-odds-api.com) — live Vegas lines + scheduled games.
@@ -251,9 +252,9 @@ def _summarize_book(bookmaker):
 
 def _fetch_league_odds_task(league: str, sport_key: str, frm: str, to: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Fetch odds for a single league (runs in thread pool).
-    
+
     🚀 Performance: Runs in parallel with other leagues
-    
+
     Raises:
         ProviderAuthenticationError: If API returns 401/403
         RetryableProviderError: If API returns 429 or 5xx
@@ -343,7 +344,7 @@ def _fetch_league_odds_task(league: str, sport_key: str, frm: str, to: str) -> T
 
 def fetch_live_odds(window_hours=WINDOW_HOURS) -> List[Dict[str, Any]]:
     """Pull scheduled games + live lines across all leagues for the next N hours.
-    
+
     🚀 Now runs all league fetches in parallel (3-4x faster than sequential)
     
     Failure Policy:
@@ -1087,7 +1088,7 @@ def format_picks_text(merged):
 
 def format_picks_by_sport(merged):
     """Format picks as a text message grouped by sport with emoji separators.
-    
+
     Replaces PDF generation with a clean text format that groups picks by sport,
     uses emojis to separate sections, and includes key details per pick.
     """
@@ -1098,7 +1099,7 @@ def format_picks_by_sport(merged):
         if sport not in by_sport:
             by_sport[sport] = []
         by_sport[sport].append(pick)
-    
+
     # Sport emojis
     sport_emoji = {
         "MLB": "⚾",
@@ -1111,14 +1112,14 @@ def format_picks_by_sport(merged):
         "Golf": "⛳",
         "Other": "📊"
     }
-    
+
     lines = [f"🔒 Ivy's Sharp Picks — {datetime.now():%b %-d, %I:%M %p}"]
     lines.append("")
-    
+
     # Separate consensus and regular picks
     consensus_picks = [p for p in merged if p.get("is_consensus")]
     regular_picks = [p for p in merged if not p.get("is_consensus")]
-    
+
     # Show consensus plays first
     if consensus_picks:
         lines.append("🔥 HIGH LIKELIHOOD 🔥 (Consensus Plays)")
@@ -1131,16 +1132,16 @@ def format_picks_by_sport(merged):
             odds = f" ({pick['odds']})" if pick.get("odds") else ""
             handicappers = pick.get("handicappers", [])
             count = len(handicappers) if handicappers else 1
-            
+
             line = f"{emoji} {matchup} — {side}{odds}"
             line += f"\n   🔥 {count} sharps agree"
-            
+
             if handicappers:
                 line += f": {', '.join(handicappers)}"
-            
+
             lines.append(line)
             lines.append("")
-    
+
     # Group regular picks by sport
     if regular_picks:
         if consensus_picks:
@@ -1148,39 +1149,42 @@ def format_picks_by_sport(merged):
         else:
             lines.append("Today's Picks by Sport:")
         lines.append("")
-        
+
         for sport in sorted(by_sport.keys()):
             sport_picks = [p for p in by_sport[sport] if not p.get("is_consensus")]
             if not sport_picks:
                 continue
-            
+
             emoji = sport_emoji.get(sport, "📊")
             lines.append(f"{emoji} {sport.upper()}")
-            
+
             for pick in sport_picks:
                 matchup = pick.get("matchup", "")
                 side = pick.get("side", "")
                 odds = f" ({pick['odds']})" if pick.get("odds") else ""
                 handicapper = pick.get("handicapper") or "Sharp"
                 confidence = pick.get("confidence", "Medium")
-                
+
                 line = f"  • {matchup}"
                 line += f"\n    {side}{odds}"
                 line += f" | {handicapper} ({confidence})"
-                
+
                 lines.append(line)
-            
+
             lines.append("")
-    
+
     # Footer with summary
     lines.append("—")
     lines.append(f"Total: {len(merged)} picks ({len(consensus_picks)} consensus)")
-    lines.append("Check the dashboard: https://docs.google.com/spreadsheets/d/1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ/")
-    
+    if config.GOOGLE_SHEETS_SPREADSHEET_ID:
+        lines.append(
+            "Check the dashboard: "
+            f"https://docs.google.com/spreadsheets/d/{config.GOOGLE_SHEETS_SPREADSHEET_ID}/"
+        )
+
     return "\n".join(lines)
 
 
-# ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
 
@@ -1189,7 +1193,7 @@ def _report_signature(merged):
     The daily date header and volatile enrichment prose are deliberately excluded
     so that an unchanged slate hashes identically across runs (a repeat), while a
     changed pick or a moved line (odds differ) hashes differently (net-new).
-    
+
     🚀 Performance: Pre-allocate list, sort once, then join (avoid generator overhead)
     """
     items = []
@@ -1202,7 +1206,7 @@ def _report_signature(merged):
             str(e.get("consensus_count", 0)),
         ))
         items.append(item)
-    
+
     items.sort()  # Sort list once
     return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
 
@@ -1248,10 +1252,17 @@ def run(
 
     force=True bypasses the duplicate-suppression gate (used for ad-hoc/
     on-demand requests, so "run picks now" always delivers even if the slate
-    hasn't changed since the last scheduled report). send=False runs the
-    full sweep and generates the PDF without texting anything (dry-run).
+    hasn't changed since the last scheduled report) — message suppression
+    only, not pick identity: persistence always upserts through the same
+    canonical picks_tracker.save_picks() either way. send=False runs the
+    full sweep without texting anything or writing Google Sheets (dry-run).
 
-    A non-blocking filelock prevents overlapping scheduled + ad-hoc executions.
+    A non-blocking filelock prevents overlapping scheduled + ad-hoc
+    executions. Result reconciliation (ivy_core.result_updater) runs once
+    per lock-holding invocation, after the pipeline, on every real (send=True)
+    run — even when this run found no new picks or was a duplicate report —
+    so changed results are always synced. This is the only place reconciliation
+    is invoked automatically; do not add a second launchd job for it.
     """
     _lock_path = os.path.join(PROJECT_ROOT, "data", "sharp_picks.lock")
     os.makedirs(os.path.dirname(_lock_path), exist_ok=True)
@@ -1265,7 +1276,15 @@ def run(
         return {"result_type": "skipped", "reason": msg}
 
     try:
-        return _run_pipeline(force=force, send=send, requester=requester, request_id=request_id)
+        result = _run_pipeline(force=force, send=send, requester=requester, request_id=request_id)
+        if send:
+            from ivy_core import result_updater
+            try:
+                result["result_reconciliation"] = result_updater.auto_update_results()
+            except Exception as exc:
+                print(f"⚠️ Result reconciliation failed: {exc}")
+                result["result_reconciliation"] = {"status": "error", "reason": str(exc)}
+        return result
     finally:
         _lock.release()
 
@@ -1278,17 +1297,17 @@ def _run_pipeline(
     request_id: Optional[str] = None,
 ) -> dict:
     """Internal pipeline — called only when the run() filelock is held.
-    
+
     Tracks source health and pipeline status explicitly. Only marks a run as
     SUCCESS when all required sources are healthy and minimum pick thresholds
     are met. Otherwise, reports the true status (AUTH_FAILURE, DEGRADED, etc.).
     """
     print("🚀 Starting 48-Hour X-Sourced Sports Picks Loop...")
-    
+
     result = PipelineResult(status=PipelineStatus.SUCCESS)
     odds_source = result.add_source("The Odds API", is_required=False)
     grok_source = result.add_source("Grok X Search", is_required=True)
-    
+
     # Fetch live odds (handle auth/upstream errors explicitly)
     try:
         games = fetch_live_odds()
@@ -1320,7 +1339,7 @@ def _run_pipeline(
         odds_source.mark_failure(e)
         result.status = PipelineStatus.INTERNAL_ERROR
         return result.to_dict()
-    
+
     # Sweep for picks (Grok/X search)
     try:
         picks = sweep_with_retry(games)
@@ -1345,43 +1364,49 @@ def _run_pipeline(
             )
             print("📨 Sent 'no picks' notice to Henry (ad-hoc run).")
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        return result.to_dict()
+        d = result.to_dict()
+        d["result_type"] = "no_picks"
+        return d
 
     merged = merge_picks(picks)
     attach_odds(merged, games)
     enrich_picks(merged, games)
-    
+
     # Filter picks by minimum quality threshold
     # A valid pick should have:
     #   - confidence level (not just 55% single-sharp noise)
     #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
-    
     filtered_picks = []
     for p in merged:
-        confidence = (p.get("enrichment", {}).get("confidence") or "").lower()
+        confidence = (p.get("enrichment", {}).get("confidence") or p.get("confidence") or "").lower()
         is_consensus = p.get("is_consensus", False)
         sharp_count = p.get("consensus_count", 1)
-        
+
         # Accept if: consensus (2+ sharps) OR single-sharp with medium/high confidence
         if is_consensus or (sharp_count == 1 and confidence in ("medium", "high")):
             filtered_picks.append(p)
-    
+
     if not filtered_picks:
         print(f"⚠️  {len(merged)} pick(s) found but none meet minimum quality threshold.")
         print("   (Require: 2+ sharps for consensus OR 1 sharp with medium/high confidence)")
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        return result.to_dict()
-    
-    consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
+        d = result.to_dict()
+        d["result_type"] = "no_picks"
+        return d
+
+    consensus_n = sum(1 for p in filtered_picks if p.get("is_consensus"))
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique → {len(filtered_picks)} qualifying ({consensus_n} consensus).")
-    
+
     result.picks_count = len(filtered_picks)
     result.consensus_count = consensus_n
-    
+
     # Only now save picks that passed validation
-    save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    try:
+        save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    except Exception as _sp_err:
+        print(f"⚠️  save_picks failed (non-fatal): {_sp_err}")
 
     # Build the outbound body and its content fingerprint.
     signature = _report_signature(filtered_picks)
@@ -1413,17 +1438,16 @@ def _run_pipeline(
 
     # Send text report directly
     delivered_text = send_imessage(HENRY_PHONE, report_text)
-    
+
     if delivered_text:
-        save_last_report(signature, signature)
+        save_last_report(signature, report_text)
         print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
         result.sent = True
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent successfully."
         return result.to_dict()
 
-    # Fallback if text send failed
-    print("⚠️  Text delivery failed")
+    print("⚠️  Text delivery also failed")
     print(f"Report ID {report_id} queued for retry")
     result.sent = False
     result.status = PipelineStatus.INTERNAL_ERROR
