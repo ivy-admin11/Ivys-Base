@@ -398,34 +398,39 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
             attach_results = {}
             for recipient_name, phone in ALERT_RECIPIENTS.items():
                 try:
-                    # Assign a report ID and persist to durable outbox.
+                    # Assign a report ID for tracking.
                     report_id = _outbox.make_report_id("happy_hour")
                     content_summary = (
                         f"{result['discovery_count']} special(s) — {datetime.utcnow():%b %-d}"
                     )
-                    _outbox.save_report(
-                        report_id, pdf_path,
-                        job_name="happy_hour",
-                        recipient=phone,
-                        content_summary=content_summary,
-                    )
+
+                    receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
+                    try:
+                        _outbox.save_report(
+                            report_id, pdf_path,
+                            job_name="happy_hour",
+                            recipient=phone,
+                            content_summary=content_summary,
+                        )
+                        _r_status = getattr(receipt, "status", "submitted_unverified")
+                        _r_attempts = getattr(receipt, "attempts", 1)
+                        _outbox.update_report_status(report_id, _r_status, attempts=_r_attempts)
+                    except Exception as _oe:
+                        logger.debug("Outbox tracking skipped: %s", _oe)
 
                     stats_line = (
                         f"🍹 Happy Hour Scout Report\n\n"
                         f"{result['discovery_count']} specials across Frisco/Dallas\n"
                         f"Includes: wine, oysters, martinis, upscale dining\n\n"
                     )
-                    receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
-                    _outbox.update_report_status(report_id, receipt.status, attempts=receipt.attempts)
-
                     if receipt:
                         final_text = stats_line + "Full report attached (PDF)."
                         success = send_imessage(phone, final_text)
                         send_results[recipient_name] = success
-                        attach_results[recipient_name] = receipt.status
+                        attach_results[recipient_name] = getattr(receipt, "status", "submitted_unverified")
                         logger.info(
                             "✅ Sent to %s: text=%s attachment=%s",
-                            recipient_name, "SUCCESS" if success else "FAILED", receipt.status,
+                            recipient_name, "SUCCESS" if success else "FAILED", attach_results[recipient_name],
                         )
                     else:
                         # Explicit failure — two-message fallback.

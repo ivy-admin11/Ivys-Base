@@ -139,6 +139,7 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
+        self.attached = False
         self.report_id: Optional[str] = None
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
@@ -154,6 +155,7 @@ class PipelineResult:
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
+            "attached": self.attached,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,
