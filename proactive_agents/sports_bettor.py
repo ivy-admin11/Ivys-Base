@@ -161,7 +161,10 @@ def get_last_odds_fetch_diagnostics() -> Dict[str, Any]:
     Does NOT contain API keys, URLs, raw responses, or mutable state.
     """
     with _ODDS_DIAGNOSTICS_LOCK:
-        return dict(_ODDS_DIAGNOSTICS)
+        return {
+            k: list(v) if isinstance(v, list) else v
+            for k, v in _ODDS_DIAGNOSTICS.items()
+        }
 
 
 # ===================== ODDS API UTILITIES =====================

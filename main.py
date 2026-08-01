@@ -1349,50 +1349,50 @@ def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
         (rowid, text, sender_id) tuple or None if not found/error.
     """
     for attempt in range(DB_RETRY_ATTEMPTS):
+        _backoff = 0
         with _CHAT_DB_LOCK:
             conn = init_chat_db()
             if not conn:
                 logger.warning("Could not establish chat.db connection (attempt %d/%d)", 
                              attempt + 1, DB_RETRY_ATTEMPTS)
                 if attempt < DB_RETRY_ATTEMPTS - 1:
-                    # Sleep before retry, outside the lock
-                    backoff_seconds = DB_RETRY_BACKOFF * (2 ** attempt)
-                    time.sleep(backoff_seconds)
-                continue
-            
-            cursor = None
-            try:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
-                    FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-                    WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
-                    ORDER BY m.ROWID ASC LIMIT 1
-                    """,
-                    (last_id,),
-                )
-                result = cursor.fetchone()
-                return result
-            
-            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-                # Recoverable database error; close connection and retry
-                logger.debug("Database query error (attempt %d/%d): %s",
-                           attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
-                _close_chat_db_locked()
+                    _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            else:
+                cursor = None
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
+                        FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
+                        WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
+                        ORDER BY m.ROWID ASC LIMIT 1
+                        """,
+                        (last_id,),
+                    )
+                    result = cursor.fetchone()
+                    return result
                 
-                if attempt < DB_RETRY_ATTEMPTS - 1:
-                    # Sleep before retry, outside the lock
-                    backoff_seconds = DB_RETRY_BACKOFF * (2 ** attempt)
-                    time.sleep(backoff_seconds)
-            
-            finally:
-                # Always close cursor explicitly
-                if cursor:
-                    try:
-                        cursor.close()
-                    except Exception:
-                        pass
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                    # Recoverable database error; close connection and retry
+                    logger.debug("Database query error (attempt %d/%d): %s",
+                               attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
+                    _close_chat_db_locked()
+                    
+                    if attempt < DB_RETRY_ATTEMPTS - 1:
+                        _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+                
+                finally:
+                    # Always close cursor explicitly
+                    if cursor:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+        
+        # Backoff sleep after releasing the lock
+        if _backoff:
+            time.sleep(_backoff)
     
     # Exhausted retries
     logger.warning("Failed to fetch message after %d retries", DB_RETRY_ATTEMPTS)
@@ -1414,38 +1414,40 @@ def get_last_message_id() -> Optional[int]:
         int (possibly 0 if table empty) or None if error after retries exhausted.
     """
     for attempt in range(DB_RETRY_ATTEMPTS):
+        _backoff = 0
         with _CHAT_DB_LOCK:
             conn = init_chat_db()
             if not conn:
                 logger.warning("Could not establish chat.db connection (attempt %d/%d)",
                              attempt + 1, DB_RETRY_ATTEMPTS)
                 if attempt < DB_RETRY_ATTEMPTS - 1:
-                    backoff_seconds = DB_RETRY_BACKOFF * (2 ** attempt)
-                    time.sleep(backoff_seconds)
-                continue
-            
-            cursor = None
-            try:
-                cursor = conn.cursor()
-                cursor.execute("SELECT MAX(ROWID) FROM message")
-                row = cursor.fetchone()
-                return row[0] if row and row[0] else 0
-            
-            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-                logger.debug("Database query error (attempt %d/%d): %s",
-                           attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
-                _close_chat_db_locked()
+                    _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+            else:
+                cursor = None
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT MAX(ROWID) FROM message")
+                    row = cursor.fetchone()
+                    return row[0] if row and row[0] else 0
                 
-                if attempt < DB_RETRY_ATTEMPTS - 1:
-                    backoff_seconds = DB_RETRY_BACKOFF * (2 ** attempt)
-                    time.sleep(backoff_seconds)
-            
-            finally:
-                if cursor:
-                    try:
-                        cursor.close()
-                    except Exception:
-                        pass
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                    logger.debug("Database query error (attempt %d/%d): %s",
+                               attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
+                    _close_chat_db_locked()
+                    
+                    if attempt < DB_RETRY_ATTEMPTS - 1:
+                        _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+                
+                finally:
+                    if cursor:
+                        try:
+                            cursor.close()
+                        except Exception:
+                            pass
+        
+        # Backoff sleep after releasing the lock
+        if _backoff:
+            time.sleep(_backoff)
     
     logger.warning("Failed to get last message ID after %d retries", DB_RETRY_ATTEMPTS)
     return None

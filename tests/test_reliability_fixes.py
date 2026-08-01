@@ -506,17 +506,49 @@ class TestOddsAPIReliability:
         with pytest.raises(sb.RetryableProviderError):
             sb.fetch_live_odds(window_hours=48)
     
-    def test_malformed_json_raises_provider_unavailable(self, reset_odds_state):
+    def test_malformed_json_raises_provider_unavailable(self, reset_odds_state, monkeypatch):
         """Malformed JSON raises ProviderUnavailableError."""
-        
-        # This is tested implicitly in _fetch_league_odds_task
-        pass
-    
-    def test_non_list_json_raises_provider_unavailable(self, reset_odds_state):
+        import proactive_agents.sports_bettor as sb
+        import requests
+
+        class _MockResponse:
+            status_code = 200
+            url = "https://api.the-odds-api.com/v4/sports/nfl/odds"
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("No JSON object could be decoded")
+
+        monkeypatch.setattr(requests, "get", lambda *a, **kw: _MockResponse())
+        monkeypatch.setattr(sb, "ODDS_API_KEY", "test-key")
+
+        with pytest.raises(sb.ProviderUnavailableError):
+            sb._fetch_league_odds_task("NFL", "americanfootball_nfl", "2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z")
+
+    def test_non_list_json_raises_provider_unavailable(self, reset_odds_state, monkeypatch):
         """Non-list JSON raises ProviderUnavailableError."""
-        
-        # This is tested implicitly in _fetch_league_odds_task
-        pass
+        import proactive_agents.sports_bettor as sb
+        import requests
+
+        class _MockResponse:
+            status_code = 200
+            url = "https://api.the-odds-api.com/v4/sports/nfl/odds"
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"error": "unexpected dict instead of list"}
+
+        monkeypatch.setattr(requests, "get", lambda *a, **kw: _MockResponse())
+        monkeypatch.setattr(sb, "ODDS_API_KEY", "test-key")
+
+        with pytest.raises(sb.ProviderUnavailableError):
+            sb._fetch_league_odds_task("NFL", "americanfootball_nfl", "2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z")
     
     def test_api_key_not_in_exceptions(self, reset_odds_state):
         """API keys do not appear in exceptions."""
