@@ -37,7 +37,7 @@ def test_admin_secret_escape_hatch_allows_import(tmp_path):
     isolated_dir = _isolated_config_dir(tmp_path)
     env = {
         "PATH": os.environ.get("PATH", ""),
-        "ALLOW_INSECURE_ADMIN_SECRET": "true",
+        "ALLOW_INSECURE_ADMIN_SECRET": "true",  # pragma: allowlist secret
         "HENRY_PHONE": "+15555550100",
         "LEXI_PHONE": "+15555550101",
     }

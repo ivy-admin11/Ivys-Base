@@ -68,7 +68,7 @@ def test_private_key_marker_detected_without_printing_the_key(tmp_path, capsys):
     offender = repo_root / "leaked.pem"
     # Split the marker across concatenation so this source file doesn't
     # itself trigger the [private-key-marker] hygiene rule.
-    offender.write_text("-----BEGIN RSA PRIVATE KEY" + "-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")
+    offender.write_text("-----BEGIN RSA PRIVATE KEY" + "-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n")  # pragma: allowlist secret
     safe = repo_root / "clean.py"
     safe.write_text("print('hello world')\n")
 
