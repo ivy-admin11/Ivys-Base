@@ -149,8 +149,6 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
-        # Set to True if results were delivered via attachment (PDF, file, etc.)
-        # Currently always False for Sharp Picks; other agents should set appropriately
         self.attached = False
         self.report_id: Optional[str] = None
         self.result_type: Optional[str] = None  # Backward compatibility: old result type

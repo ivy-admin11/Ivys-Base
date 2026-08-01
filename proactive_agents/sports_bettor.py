@@ -938,7 +938,6 @@ def format_picks_by_sport(merged):
     return "\n".join(lines)
 
 
-# ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
 
@@ -1118,7 +1117,9 @@ def _run_pipeline(
             )
             print("📨 Sent 'no picks' notice to Henry (ad-hoc run).")
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        return result.to_dict()
+        d = result.to_dict()
+        d["result_type"] = "no_picks"
+        return d
 
     merged = merge_picks(picks)
     attach_odds(merged, games)
@@ -1144,16 +1145,21 @@ def _run_pipeline(
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        return result.to_dict()
+        d = result.to_dict()
+        d["result_type"] = "no_picks"
+        return d
 
-    consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
+    consensus_n = sum(1 for p in filtered_picks if p.get("is_consensus"))
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique → {len(filtered_picks)} qualifying ({consensus_n} consensus).")
 
     result.picks_count = len(filtered_picks)
     result.consensus_count = consensus_n
 
     # Only now save picks that passed validation
-    save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    try:
+        save_picks(filtered_picks, report_date=datetime.now().strftime("%Y-%m-%d"))
+    except Exception as _sp_err:
+        print(f"⚠️  save_picks failed (non-fatal): {_sp_err}")
 
     # Build the outbound body and its content fingerprint.
     signature = _report_signature(filtered_picks)
@@ -1194,8 +1200,7 @@ def _run_pipeline(
         result.message = f"Report {report_id} sent successfully."
         return result.to_dict()
 
-    # Fallback if text send failed
-    print("⚠️  Text delivery failed")
+    print("⚠️  Text delivery also failed")
     print(f"Report ID {report_id} queued for retry")
     result.sent = False
     result.status = PipelineStatus.INTERNAL_ERROR
