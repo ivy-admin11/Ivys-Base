@@ -47,17 +47,9 @@ from zoneinfo import ZoneInfo
 import requests
 from filelock import FileLock, Timeout
 
-<<<<<<< HEAD
-from ivy_core import require_env, send_imessage, send_imessage_attachment
-=======
 import config
 from ivy_core import require_env, send_imessage
->>>>>>> origin/copilot/mock-macos-messages-tests
 from ivy_core import outbox as _outbox
-
-# PDF formatter for professional reports
-sys.path.insert(0, PROJECT_ROOT)
-from picks_formatter import PicksReportFormatter  # noqa: E402
 from ivy_core.picks_tracker import save_picks
 from ivy_core.pipeline_status import (
     PipelineStatus,
@@ -946,64 +938,6 @@ def format_picks_by_sport(merged):
     return "\n".join(lines)
 
 
-def format_picks_pdf(merged) -> str:
-    """Generate a professional PDF report of sharp picks.
-
-    Args:
-        merged: List of merged pick dicts from the sweep pipeline.
-
-    Returns:
-        str: Path to the generated PDF file.
-    """
-    import tempfile
-
-    consensus_picks = [p for p in merged if p.get("is_consensus")]
-    other_picks = [p for p in merged if not p.get("is_consensus")]
-
-    formatter = PicksReportFormatter(
-        title="Ivy's Sharp Picks",
-        subtitle=f"Sharp Picks Report | {datetime.now():%A, %B %d, %Y}",
-        color_scheme="picks",
-    )
-
-    def _to_row(pick):
-        return {
-            "sport": pick.get("sport", ""),
-            "matchup": pick.get("matchup", ""),
-            "side": pick.get("side", ""),
-            "odds": pick.get("odds", ""),
-            "reasoning": (pick.get("enrichment") or {}).get("summary", ""),
-        }
-
-    summary = (
-        f"{len(merged)} pick(s) sourced from X handicappers — "
-        f"{len(consensus_picks)} consensus play(s) with 2+ sharps agreeing."
-    )
-    metadata = {
-        "pick_count": f"{len(merged)} pick(s) ({len(consensus_picks)} consensus)",
-        "source": "X Sharp Picks",
-        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
-    }
-
-    pdf_path = os.path.join(
-        tempfile.gettempdir(),
-        f"sharp_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf",
-    )
-    formatter.generate_pdf(
-        filename=pdf_path,
-        summary=summary,
-        consensus_picks=[_to_row(p) for p in consensus_picks],
-        other_picks=[_to_row(p) for p in other_picks],
-        metadata=metadata,
-        headers=["Sport", "Matchup", "Side", "Odds", "Context"],
-        col_widths=[0.6, 1.8, 1.0, 0.7, 3.4],
-        consensus_heading="🔥 HIGH LIKELIHOOD 🔥 (Consensus Plays)",
-        other_heading="Additional Picks",
-    )
-    return pdf_path
-
-
-
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
 
@@ -1191,11 +1125,6 @@ def _run_pipeline(
     attach_odds(merged, games)
     enrich_picks(merged, games)
 
-<<<<<<< HEAD
-    filtered_picks = merged
-
-    consensus_n = sum(1 for p in filtered_picks if p.get("is_consensus"))
-=======
     # Filter picks by minimum quality threshold
     # A valid pick should have:
     #   - confidence level (not just 55% single-sharp noise)
@@ -1216,10 +1145,11 @@ def _run_pipeline(
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        return result.to_dict()
+        d = result.to_dict()
+        d["result_type"] = "no_picks"
+        return d
 
-    consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
->>>>>>> origin/copilot/mock-macos-messages-tests
+    consensus_n = sum(1 for p in filtered_picks if p.get("is_consensus"))
     print(f"🧮 {len(picks)} raw pick(s) → {len(merged)} unique → {len(filtered_picks)} qualifying ({consensus_n} consensus).")
 
     result.picks_count = len(filtered_picks)
@@ -1243,6 +1173,11 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
+    # Generate text-only report
+    print("📝 Generating text-only picks report...")
+    report_text = format_picks_by_sport(filtered_picks)
+    print(f"✅ Report formatted ({len(filtered_picks)} picks)")
+
     # Assign a report ID
     report_id = _outbox.make_report_id("sharp_picks")
     result.report_id = report_id
@@ -1254,54 +1189,15 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-<<<<<<< HEAD
-    # Generate PDF report and send as attachment
-    print("📄 Generating PDF picks report...")
-    pdf_path = format_picks_pdf(filtered_picks)
-    print(f"✅ PDF generated: {pdf_path}")
-
-    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
-    try:
-        _outbox.save_report(
-            report_id, pdf_path,
-            job_name="sharp_picks",
-            recipient=HENRY_PHONE,
-            content_summary=f"{len(filtered_picks)} pick(s) — {datetime.now():%b %-d}",
-        )
-        _status = getattr(receipt, "status", "submitted_unverified")
-        _attempts = getattr(receipt, "attempts", 1)
-        _outbox.update_report_status(report_id, _status, attempts=_attempts)
-    except Exception as _oe:
-        print(f"⚠️  Outbox tracking skipped: {_oe}")
-
-    if receipt:
-        save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via PDF.")
-=======
     # Send text report directly
     delivered_text = send_imessage(HENRY_PHONE, report_text)
 
     if delivered_text:
         save_last_report(signature, report_text)
         print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
->>>>>>> origin/copilot/mock-macos-messages-tests
         result.sent = True
-        result.attached = True
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent successfully."
-        return result.to_dict()
-
-    # Fallback: PDF attachment failed — send text report
-    print("⚠️  PDF attachment failed — falling back to text")
-    report_text = format_picks_by_sport(filtered_picks)
-    delivered_text = send_imessage(HENRY_PHONE, report_text)
-
-    if delivered_text:
-        save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via text.")
-        result.sent = True
-        result.status = PipelineStatus.SUCCESS
-        result.message = f"Report {report_id} sent (text fallback)."
         return result.to_dict()
 
     print("⚠️  Text delivery also failed")
