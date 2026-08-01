@@ -1358,6 +1358,7 @@ def get_tailscale_status() -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            shell=False,
         )
     except subprocess.TimeoutExpired:
         return "🟠 Tailscale status could not be read.\n(CLI timed out after 5 s)"
@@ -1421,6 +1422,7 @@ def get_tailscale_status() -> str:
                 name = name.split(".")[0]
             if name:
                 online_peers.append(name)
+    online_peers.sort()
 
     # Build summary
     icon = "🟢" if running else "🟠"
