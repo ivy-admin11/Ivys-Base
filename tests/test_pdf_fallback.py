@@ -3,8 +3,9 @@
 Covers the 17 acceptance criteria from the spec plus a DeepSeek-primary
 routing test.
 
-macOS-specific tests that actually touch Messages.app are guarded by
-PYTEST_IVY_MACOS_ATTACHMENT=1 so CI never operates the app.
+macOS-specific tests that actually touch Messages.app are guarded by the
+@pytest.mark.macos_integration marker and skipped by default. They require
+PYTEST_MACOS_INTEGRATION=1 to run locally on macOS; CI never runs them.
 """
 
 from __future__ import annotations
