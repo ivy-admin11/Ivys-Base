@@ -261,7 +261,7 @@ class TestExecuteDeepseekCallExceptions:
             mock_response.text = '{"error": "Invalid request"}'
             mock_post.return_value = mock_response
             
-            with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test_key'}, clear=False):
+            with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test_key'}, clear=False):  # pragma: allowlist secret
                 with pytest.raises(ProviderHTTPError) as exc_info:
                     execute_deepseek_call("test prompt", "test system")
                 
@@ -299,7 +299,7 @@ class TestExecuteDeepseekCallExceptions:
             }
             mock_post.return_value = mock_response
             
-            with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test_key'}, clear=False):
+            with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test_key'}, clear=False):  # pragma: allowlist secret
                 result = execute_deepseek_call("test prompt", "test system")
                 
                 assert result == "Test response"
@@ -321,7 +321,7 @@ class TestExecuteOpenaiCallExceptions:
             mock_response.text = '{"error": {"message": "Invalid API key"}}'
             mock_post.return_value = mock_response
             
-            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):
+            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):  # pragma: allowlist secret
                 with pytest.raises(ProviderHTTPError) as exc_info:
                     execute_openai_call("test prompt", "test system")
                 
@@ -359,7 +359,7 @@ class TestExecuteOpenaiCallExceptions:
             }
             mock_post.return_value = mock_response
             
-            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):
+            with patch.dict(os.environ, {'OPENAI_API_KEY': 'test_key'}, clear=False):  # pragma: allowlist secret
                 result = execute_openai_call("test prompt", "test system")
                 
                 assert result == "OpenAI response"
@@ -477,4 +477,3 @@ class TestProviderFailover:
             mock_openai.assert_called_once()
             mock_gemini.assert_called_once()
             assert reply == "Gemini response"
-
