@@ -33,6 +33,12 @@ load_dotenv(dotenv_path=Path(parent_dir) / ".env", override=False)
 
 from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 from ivy_core import outbox as _outbox
+from ivy_core.agent_delivery import (
+    aggregate_delivery_status,
+    attachment_delivery_status,
+    is_delivery_submitted,
+    text_delivery_status,
+)
 from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     format_happy_hour_text,
@@ -45,6 +51,10 @@ from picks_formatter import PicksReportFormatter
 from config import HENRY_PHONE, LEXI_PHONE  # required env vars — raise at startup if unset
 
 logger = logging.getLogger("ivy.happy_hour_scout")
+
+
+class DiscoveryUnavailableError(RuntimeError):
+    """Raised when no Happy Hour discovery query completed reliably."""
 
 # ============================================================================
 # SCOUT TARGET PARAMETERS (Frisco, TX)
@@ -110,6 +120,7 @@ def fetch_local_specials() -> Dict[str, Any]:
         "specials": [],
         "updates": datetime.now(timezone.utc).isoformat(),
         "source_confidence": 0.0,
+        "source_status": "success",
     }
 
     try:
@@ -136,6 +147,8 @@ def fetch_local_specials() -> Dict[str, Any]:
         venues_found = []
         specials_found = []
 
+        successful_queries = 0
+        failed_queries = 0
         for query in search_queries:
             logger.debug(f"Searching: {query}")
             try:
@@ -149,10 +162,12 @@ def fetch_local_specials() -> Dict[str, Any]:
                     temperature=0.3,
                 )
 
-                if search_result and search_result.strip().lower() != "none":
+                normalized_result = str(search_result or "").strip()
+                if normalized_result.lower() == "none":
+                    successful_queries += 1
+                    continue
+                if normalized_result:
                     # Parse LLM response for venues and specials
-                    logger.debug(f"Search result: {search_result[:200]}")
-
                     # Extract venue data — both providers routinely wrap it
                     # in a markdown code fence even when told not to.
                     try:
@@ -178,12 +193,23 @@ def fetch_local_specials() -> Dict[str, Any]:
                                     specials_found.append(
                                         {"venue": venue_name, "detail": special}
                                     )
+                        successful_queries += 1
                     except (json.JSONDecodeError, ValueError):
-                        logger.debug("Could not parse structured response, continuing")
+                        failed_queries += 1
+                        logger.debug("Discovery query returned malformed structured data")
+                else:
+                    failed_queries += 1
+                    logger.debug("Discovery query returned an empty response")
 
             except Exception as e:
-                logger.debug(f"Search query '{query}' encountered: {e}")
+                failed_queries += 1
+                logger.debug("Discovery query failed error=%s", type(e).__name__)
                 continue
+
+        if successful_queries == 0:
+            raise DiscoveryUnavailableError(
+                "No Happy Hour discovery query completed successfully."
+            )
 
         # Deduplicate venues and specials
         seen_venues = set()
@@ -206,14 +232,19 @@ def fetch_local_specials() -> Dict[str, Any]:
         discovery_payload["source_confidence"] = (
             0.7 if deduped_specials else 0.0
         )  # Confidence score
+        if failed_queries:
+            discovery_payload["source_status"] = "degraded"
 
         logger.info(
             f"✅ Discovery complete: {len(deduped_venues)} venues, "
             f"{len(deduped_specials)} specials found"
         )
 
+    except DiscoveryUnavailableError:
+        raise
     except Exception as e:
-        logger.error(f"❌ fetch_local_specials failed: {e}", exc_info=True)
+        logger.error("Happy Hour discovery failed error=%s", type(e).__name__)
+        raise DiscoveryUnavailableError("Happy Hour discovery could not complete.") from e
 
     logger.debug(f"Discovery payload: {len(discovery_payload['specials'])} specials")
     return discovery_payload
@@ -367,6 +398,9 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
         "alert_sent": False,
         "alert_text": "",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "delivery_status": "not_attempted",
+        "deliveries": [],
+        "report_ids": [],
     }
 
     try:
@@ -392,16 +426,30 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
         elif send_alert:
             send_results = {}
             attach_results = {}
+            deliveries = []
+            report_ids = []
             for recipient_name, phone in ALERT_RECIPIENTS.items():
+                report_id = None
+                attachment_attempted = False
+                attachment_status = "not_attempted"
+                report_status = "not_attempted"
+                delivery = {
+                    "recipient": recipient_name,
+                    "channel": "imessage_attachment",
+                }
                 try:
                     # Assign a report ID for tracking.
                     report_id = _outbox.make_report_id("happy_hour")
+                    report_ids.append(report_id)
+                    delivery["report_id"] = report_id
                     local_now = datetime.now(timezone.utc).astimezone()
                     content_summary = (
                         f"{result['discovery_count']} special(s) — {local_now:%b} {local_now.day}"
                     )
 
+                    attachment_attempted = True
                     receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
+                    attachment_status = attachment_delivery_status(receipt)
                     try:
                         _outbox.save_report(
                             report_id, pdf_path,
@@ -409,25 +457,32 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                             recipient=phone,
                             content_summary=content_summary,
                         )
-                        _r_status = getattr(receipt, "status", "submitted_unverified")
+                        _r_status = attachment_status
                         _r_attempts = getattr(receipt, "attempts", 1)
                         _outbox.update_report_status(report_id, _r_status, attempts=_r_attempts)
                     except Exception as _oe:
-                        logger.debug("Outbox tracking skipped: %s", _oe)
+                        logger.debug(
+                            "Outbox tracking skipped error=%s", type(_oe).__name__
+                        )
 
                     stats_line = (
                         f"🍹 Happy Hour Scout Report\n\n"
                         f"{result['discovery_count']} specials across Frisco/Dallas\n"
                         f"Includes: wine, oysters, martinis, upscale dining\n\n"
                     )
-                    if receipt:
+                    if is_delivery_submitted(attachment_status):
                         final_text = stats_line + "Full report attached (PDF)."
-                        success = send_imessage(phone, final_text)
-                        send_results[recipient_name] = success
-                        attach_results[recipient_name] = getattr(receipt, "status", "submitted_unverified")
+                        report_status = attachment_status
+                        delivery["notification_status"] = "unknown"
+                        notification_status = text_delivery_status(
+                            bool(send_imessage(phone, final_text))
+                        )
+                        delivery["notification_status"] = notification_status
                         logger.info(
                             "✅ Sent to %s: text=%s attachment=%s",
-                            recipient_name, "SUCCESS" if success else "FAILED", attach_results[recipient_name],
+                            recipient_name,
+                            "SUCCESS" if notification_status == "submitted_unverified" else "FAILED",
+                            attachment_status,
                         )
                     else:
                         # Explicit failure — two-message fallback.
@@ -437,39 +492,95 @@ def execute_scout_cycle(send_alert: bool = True) -> Dict[str, Any]:
                             resend_command="RESEND HAPPY HOUR",
                             retry_queued=True,
                         )
-                        notice_sent = send_imessage(phone, notice)
+                        delivery["notice_status"] = "unknown"
+                        notice_status = text_delivery_status(
+                            bool(send_imessage(phone, notice))
+                        )
+                        delivery["notice_status"] = notice_status
 
                         fallback_text = format_happy_hour_text(discovery_data)
                         bubbles = split_imessage_content(fallback_text)
-                        fallback_sent = all(send_imessage(phone, b) for b in bubbles)
-
-                        send_results[recipient_name] = notice_sent
-                        attach_results[recipient_name] = "failed"
+                        attempted = 0
+                        submitted = 0
+                        delivery.update({
+                            "fallback_status": "not_attempted",
+                            "fallback_messages_attempted": 0,
+                            "fallback_messages_submitted": 0,
+                        })
+                        for bubble in bubbles:
+                            attempted += 1
+                            delivery["fallback_messages_attempted"] = attempted
+                            delivery["fallback_status"] = "unknown"
+                            report_status = "unknown"
+                            if not send_imessage(phone, bubble):
+                                delivery["fallback_status"] = "failed"
+                                report_status = "failed"
+                                break
+                            submitted += 1
+                            delivery["fallback_messages_submitted"] = submitted
+                        if attempted and submitted == len(bubbles):
+                            fallback_status = "submitted_unverified"
+                        elif submitted:
+                            fallback_status = "partial"
+                        else:
+                            fallback_status = "failed"
+                        report_status = fallback_status
+                        delivery.update({
+                            "fallback_status": fallback_status,
+                            "fallback_messages_attempted": attempted,
+                            "fallback_messages_submitted": submitted,
+                        })
                         logger.warning(
                             "⚠️ Attachment failed for %s — text fallback %s",
-                            recipient_name, "sent" if fallback_sent else "also failed",
+                            recipient_name,
+                            "sent" if fallback_status == "submitted_unverified" else "also failed",
                         )
                 except Exception as e:
-                    send_results[recipient_name] = False
-                    attach_results[recipient_name] = False
-                    logger.error("❌ Failed to send to %s: %s", recipient_name, e)
+                    if attachment_attempted and attachment_status == "not_attempted":
+                        attachment_status = "unknown"
+                        report_status = "unknown"
+                    delivery["error_category"] = type(e).__name__
+                    logger.error(
+                        "❌ Failed to send to %s: error=%s",
+                        recipient_name,
+                        type(e).__name__,
+                    )
+                finally:
+                    delivery["attachment_status"] = attachment_status
+                    delivery["status"] = report_status
+                    deliveries.append(delivery)
+                    attach_results[recipient_name] = attachment_status
+                    send_results[recipient_name] = is_delivery_submitted(report_status)
 
-            result["alert_sent"] = any(send_results.values())
+            result["delivery_status"] = aggregate_delivery_status(
+                delivery["status"] for delivery in deliveries
+            )
+            result["alert_sent"] = is_delivery_submitted(result["delivery_status"])
             result["recipients_status"] = send_results
             result["attachment_status"] = attach_results
+            result["deliveries"] = deliveries
+            result["report_ids"] = report_ids
         else:
             logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
             result["alert_sent"] = False
 
-        result["status"] = "success"
+        result["status"] = (
+            "degraded" if discovery_data.get("source_status") == "degraded" else "success"
+        )
         logger.info("=" * 60)
         logger.info("🎯 Scout Cycle Complete")
         logger.info("=" * 60)
 
+    except DiscoveryUnavailableError as e:
+        result["status"] = "upstream_unavailable"
+        result["alert_text"] = "Happy Hour discovery source is temporarily unavailable."
+        result["error_type"] = type(e).__name__
+        logger.error("Happy Hour discovery unavailable error=%s", type(e).__name__)
     except Exception as e:
         result["status"] = "error"
-        result["alert_text"] = f"Scout Error: {str(e)}"
-        logger.error(f"❌ Scout execution failed: {e}", exc_info=True)
+        result["alert_text"] = "Happy Hour Scout could not complete."
+        result["error_type"] = type(e).__name__
+        logger.error("Happy Hour Scout execution failed error=%s", type(e).__name__)
 
     return result
 

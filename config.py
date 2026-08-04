@@ -17,12 +17,80 @@ from dotenv import load_dotenv
 # .env only fills in what isn't already set.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
+
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer from the environment.
+
+    Invalid values fail fast during startup instead of creating an unbounded
+    queue, a zero-length batch, or a timeout that can hang the poller.
+    """
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    """Read a bounded floating-point value from the environment."""
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be numeric") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
 # ============================================================================
 # POLLING & DATABASE CONFIGURATION
 # ============================================================================
 
 POLLING_INTERVAL: int = int(os.environ.get("POLLING_INTERVAL", "1"))
 """Seconds between iMessage database polls"""
+
+IMESSAGE_FETCH_BATCH_SIZE: int = _bounded_int(
+    "IMESSAGE_FETCH_BATCH_SIZE", 20, 1, 100
+)
+"""Maximum new Messages rows collected in one read-only chat.db query."""
+
+IMESSAGE_QUEUE_MAXSIZE: int = _bounded_int(
+    "IMESSAGE_QUEUE_MAXSIZE", 100, 10, 1000
+)
+"""Bounded collector-to-dispatcher queue capacity."""
+
+IMESSAGE_SLOW_QUEUE_MAXSIZE: int = _bounded_int(
+    "IMESSAGE_SLOW_QUEUE_MAXSIZE", 50, 5, 500
+)
+"""Bounded queue for provider, job, resend, and other potentially slow work."""
+
+IMESSAGE_DEBOUNCE_SECONDS: float = _bounded_float(
+    "IMESSAGE_DEBOUNCE_SECONDS", 2.0, 0.0, 10.0
+)
+"""Per-sender window for coalescing rapid conversational/status messages."""
+
+IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS: float = _bounded_float(
+    "IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS", 1.0, 0.1, 10.0
+)
+"""Maximum collector wait when the bounded inbound queue is full."""
+
+IMESSAGE_STALE_QUEUE_SECONDS: int = _bounded_int(
+    "IMESSAGE_STALE_QUEUE_SECONDS", 30, 5, 600
+)
+"""Queue age at which readiness is degraded."""
+
+IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS: int = _bounded_int(
+    "IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS", 5, 1, 30
+)
+"""Grace period for poller threads during application shutdown."""
+
+IMESSAGE_SLOW_ACK_SECONDS: float = _bounded_float(
+    "IMESSAGE_SLOW_ACK_SECONDS", 5.0, 1.0, 30.0
+)
+"""Delay before an in-progress conversational request receives one acknowledgement."""
 
 DB_TIMEOUT: float = float(os.environ.get("DB_TIMEOUT", "5"))
 """SQLite connection timeout (seconds)"""
@@ -44,6 +112,36 @@ CHAT_DB_PATH: str = os.path.expanduser(
 
 EXTERNAL_API_TIMEOUT: int = int(os.environ.get("EXTERNAL_API_TIMEOUT", "20"))
 """Timeout for external API calls (requests, Readwise, etc.) in seconds"""
+
+IMESSAGE_SEND_TIMEOUT_SECONDS: int = _bounded_int(
+    "IMESSAGE_SEND_TIMEOUT_SECONDS", 10, 1, 60
+)
+"""Maximum duration of one Messages.app text-send AppleEvent."""
+
+APPLE_CALENDAR_TIMEOUT_SECONDS: int = _bounded_int(
+    "APPLE_CALENDAR_TIMEOUT_SECONDS", 8, 1, 60
+)
+"""Maximum duration of one read-only Calendar AppleEvent."""
+
+APPLE_REMINDERS_TIMEOUT_SECONDS: int = _bounded_int(
+    "APPLE_REMINDERS_TIMEOUT_SECONDS", 8, 1, 60
+)
+"""Maximum duration of one Reminders AppleEvent."""
+
+STATUS_COMMAND_TIMEOUT_SECONDS: int = _bounded_int(
+    "STATUS_COMMAND_TIMEOUT_SECONDS", 5, 1, 30
+)
+"""Maximum duration of a local operational-status subprocess."""
+
+JOB_HEARTBEAT_SECONDS: int = _bounded_int(
+    "IVY_JOB_HEARTBEAT_SECONDS", 15, 1, 300
+)
+"""Interval between durable heartbeats from a detached job worker."""
+
+JOB_MAX_RUNTIME_SECONDS: int = _bounded_int(
+    "IVY_JOB_MAX_RUNTIME_SECONDS", 3600, 30, 21600
+)
+"""Hard deadline for a detached or scheduled job before forced termination."""
 
 PLAYWRIGHT_TIMEOUT_MS: int = 10000
 """Playwright step timeout in milliseconds"""

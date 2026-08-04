@@ -81,7 +81,10 @@ def query_llm(prompt_text: str, temperature: Optional[float] = None) -> str:
                 return text
             logger.warning("DeepSeek returned an empty response; falling back to Gemini.")
         except Exception as exc:
-            logger.warning("DeepSeek primary layer fault: %s. Falling back to Gemini.", exc)
+            logger.warning(
+                "DeepSeek primary layer fault error=%s; falling back to Gemini",
+                type(exc).__name__,
+            )
     else:
         logger.warning("DEEPSEEK_API_KEY missing; skipping primary layer.")
 
@@ -97,7 +100,7 @@ def query_llm(prompt_text: str, temperature: Optional[float] = None) -> str:
             )
             return (response.text or "").strip()
         except Exception as exc:
-            logger.warning("Gemini backup layer fault: %s", exc)
+            logger.warning("Gemini backup layer fault error=%s", type(exc).__name__)
     else:
         logger.warning("GEMINI_API_KEY missing; no backup available.")
 

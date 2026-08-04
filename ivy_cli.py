@@ -46,9 +46,14 @@ elif args and args[0] == "run":
     if len(args) < 2:
         sys.exit("usage: ivy run <job_name>")
     job_name = " ".join(args[1:])
-    status, message = job_runner.run_job(job_name)
-    print(f"\n{message}\n")
-    sys.exit(0 if status.name == "SUCCESS" else 1)
+    dispatch = job_runner.run_job_detailed(job_name, force=True)
+    reference = (
+        f"\nExecution: {dispatch.execution_id}"
+        if dispatch.execution_id and dispatch.execution_id not in dispatch.message
+        else ""
+    )
+    print(f"\n{dispatch.message}{reference}\n")
+    sys.exit(0 if dispatch.status.name == "SUCCESS" else 1)
 
 elif args and args[0] in ["help", "-h", "--help"]:
     print(__doc__)

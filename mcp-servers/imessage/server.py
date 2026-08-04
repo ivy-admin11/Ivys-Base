@@ -19,11 +19,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from config import IMESSAGE_SEND_TIMEOUT_SECONDS
+from utils.applescript import AppleScriptRunner
 
 BASE_DIR = Path(__file__).resolve().parent
 FAVORITES_PATH = Path(os.path.expanduser(os.environ.get("IVY_FAVORITES_FILE", str(BASE_DIR / "favorites.json"))))
@@ -31,6 +32,7 @@ CHAT_DB_PATH = Path.home() / "Library" / "Messages" / "chat.db"
 CHAT_DB_URI = f"file:{CHAT_DB_PATH}?mode=ro"
 
 mcp = FastMCP("imessage")
+_runner = AppleScriptRunner(timeout=IMESSAGE_SEND_TIMEOUT_SECONDS)
 
 
 def _check_full_disk_access() -> None:
@@ -119,34 +121,11 @@ def send_imessage(number: str, text: str) -> str:
     if not text:
         raise ValueError("text must be non-empty.")
 
-    # Pass values as argv so the AppleScript source itself is static — this
-    # prevents the message body from breaking out of the string literal.
-    script = (
-        'on run argv\n'
-        '    set targetNumber to item 1 of argv\n'
-        '    set messageText to item 2 of argv\n'
-        '    tell application "Messages"\n'
-        '        try\n'
-        '            set targetService to first service whose service type is iMessage\n'
-        '            set targetBuddy to buddy targetNumber of targetService\n'
-        '            send messageText to targetBuddy\n'
-        '            return "SUCCESS"\n'
-        '        on error errMsg\n'
-        '            return "ERROR: " & errMsg\n'
-        '        end try\n'
-        '    end tell\n'
-        'end run\n'
-    )
-    result = subprocess.run(
-        ["osascript", "-e", script, target, text],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
-    )
-    output = (result.stdout or "").strip() or (result.stderr or "").strip()
-    if result.returncode != 0 or output.startswith("ERROR"):
-        raise RuntimeError(output or "osascript failed without output.")
+    # The centralized runner owns the fixed source, argv transport, timeout,
+    # serialization, and privacy-safe failure mapping.
+    output = _runner.send_imessage_argv(target, text)
+    if output.startswith("ERROR"):
+        raise RuntimeError("iMessage submission failed.")
     return output or "SUCCESS"
 
 

@@ -34,6 +34,12 @@ load_dotenv(dotenv_path=Path(parent_dir) / ".env", override=False)
 
 from ivy_core import send_imessage, send_imessage_attachment, query_llm, strip_json_fence
 from ivy_core import outbox as _outbox
+from ivy_core.agent_delivery import (
+    aggregate_delivery_status,
+    attachment_delivery_status,
+    is_delivery_submitted,
+    text_delivery_status,
+)
 from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     format_meal_text,
@@ -115,14 +121,31 @@ def load_state() -> Dict[str, Any]:
         }
 
 
-def save_state(state: Dict[str, Any]) -> None:
-    """Save state to JSON file."""
+def save_state(state: Dict[str, Any]) -> bool:
+    """Atomically save state to JSON and report whether it was durable."""
+    temp_path = None
     try:
-        with open(STATE_FILE_PATH, 'w') as f:
+        STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".familia_state-",
+            dir=str(STATE_FILE_PATH.parent),
+        )
+        with os.fdopen(fd, 'w') as f:
             json.dump(state, f, indent=2)
-        logger.info(f"💾 State saved: {STATE_FILE_PATH}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, STATE_FILE_PATH)
+        logger.info("Familia state saved")
+        return True
     except Exception as e:
-        logger.error(f"Failed to save state: {e}")
+        logger.error("Familia state save failed error=%s", type(e).__name__)
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return False
 
 
 def check_48h_gate(force: bool = False) -> bool:
@@ -391,6 +414,9 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
         "alert_sent": False,
         "alert_text": "",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "delivery_status": "not_attempted",
+        "deliveries": [],
+        "report_ids": [],
     }
 
     # Step 1: Check 48-hour gate
@@ -422,8 +448,28 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
     pdf_path = format_meal_plan_pdf(meal_data)
     logger.info(f"✅ PDF generated: {pdf_path}")
 
-    # Step 4: Dispatch via iMessage with notification
-    logger.info("Step 4/5: Routing notification...")
+    # Persist the execution gate before the first outbound submission.  If
+    # durable duplicate/gate state is unavailable, fail closed rather than
+    # delivering a plan that a later scheduled run could repeat.
+    if send_alert:
+        logger.info("Step 4/5: Reserving durable execution state...")
+        state = load_state()
+        state["last_run_date"] = datetime.now(timezone.utc).astimezone().isoformat()
+        state["recipe_count"] = result["recipe_count"]
+        state.setdefault("execution_history", []).append({
+            "timestamp": result["timestamp"],
+            "recipe_count": result["recipe_count"],
+            "alert_sent": False,
+        })
+        state["execution_history"] = state["execution_history"][-10:]
+        if save_state(state) is False:
+            result["status"] = "error"
+            result["alert_text"] = "Meal plan was not sent because execution state could not be saved."
+            logger.error("Meal plan delivery skipped because state reservation failed")
+            return result
+
+    # Step 5: Dispatch via iMessage with notification
+    logger.info("Step 5/5: Routing notification...")
     if result["recipe_count"] == 0:
         logger.info("⏭️  No meal plan content; skipping notification")
         result["alert_sent"] = False
@@ -435,16 +481,30 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
         )
         send_results = {}
         attach_results = {}
+        deliveries = []
+        report_ids = []
         for recipient_name, phone in ALERT_RECIPIENTS.items():
+            report_id = None
+            attachment_attempted = False
+            attachment_status = "not_attempted"
+            report_status = "not_attempted"
+            delivery = {
+                "recipient": recipient_name,
+                "channel": "imessage_attachment",
+            }
             try:
                 # Assign a report ID for tracking.
                 report_id = _outbox.make_report_id("familia_meal_planner")
+                report_ids.append(report_id)
+                delivery["report_id"] = report_id
                 local_now = datetime.now(timezone.utc).astimezone()
                 content_summary = (
                     f"{result['recipe_count']} recipe(s) — {local_now:%b} {local_now.day}"
                 )
 
+                attachment_attempted = True
                 receipt = send_imessage_attachment(phone, pdf_path, report_id=report_id)
+                attachment_status = attachment_delivery_status(receipt)
                 try:
                     _outbox.save_report(
                         report_id, pdf_path,
@@ -452,20 +512,27 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
                         recipient=phone,
                         content_summary=content_summary,
                     )
-                    _r_status = getattr(receipt, "status", "submitted_unverified")
+                    _r_status = attachment_status
                     _r_attempts = getattr(receipt, "attempts", 1)
                     _outbox.update_report_status(report_id, _r_status, attempts=_r_attempts)
                 except Exception as _oe:
-                    logger.debug("Outbox tracking skipped: %s", _oe)
+                    logger.debug(
+                        "Outbox tracking skipped error=%s", type(_oe).__name__
+                    )
 
-                if receipt:
+                if is_delivery_submitted(attachment_status):
                     final_text = stats_line + "Full plan attached (PDF)."
-                    success = send_imessage(phone, final_text)
-                    send_results[recipient_name] = success
-                    attach_results[recipient_name] = getattr(receipt, "status", "submitted_unverified")
+                    report_status = attachment_status
+                    delivery["notification_status"] = "unknown"
+                    notification_status = text_delivery_status(
+                        bool(send_imessage(phone, final_text))
+                    )
+                    delivery["notification_status"] = notification_status
                     logger.info(
                         "✅ Sent to %s: text=%s attachment=%s",
-                        recipient_name, "SUCCESS" if success else "FAILED", attach_results[recipient_name],
+                        recipient_name,
+                        "SUCCESS" if notification_status == "submitted_unverified" else "FAILED",
+                        attachment_status,
                     )
                 else:
                     # Explicit failure — two-message fallback.
@@ -475,44 +542,77 @@ def execute_meal_plan_cycle(send_alert: bool = True, force: bool = False) -> Dic
                         resend_command="RESEND MEAL PLAN",
                         retry_queued=True,
                     )
-                    notice_sent = send_imessage(phone, notice)
+                    delivery["notice_status"] = "unknown"
+                    notice_status = text_delivery_status(
+                        bool(send_imessage(phone, notice))
+                    )
+                    delivery["notice_status"] = notice_status
 
                     fallback_text = format_meal_text(meal_data)
                     bubbles = split_imessage_content(fallback_text)
-                    fallback_sent = all(send_imessage(phone, b) for b in bubbles)
-
-                    send_results[recipient_name] = notice_sent
-                    attach_results[recipient_name] = "failed"
+                    attempted = 0
+                    submitted = 0
+                    delivery.update({
+                        "fallback_status": "not_attempted",
+                        "fallback_messages_attempted": 0,
+                        "fallback_messages_submitted": 0,
+                    })
+                    for bubble in bubbles:
+                        attempted += 1
+                        delivery["fallback_messages_attempted"] = attempted
+                        delivery["fallback_status"] = "unknown"
+                        report_status = "unknown"
+                        if not send_imessage(phone, bubble):
+                            delivery["fallback_status"] = "failed"
+                            report_status = "failed"
+                            break
+                        submitted += 1
+                        delivery["fallback_messages_submitted"] = submitted
+                    if attempted and submitted == len(bubbles):
+                        fallback_status = "submitted_unverified"
+                    elif submitted:
+                        fallback_status = "partial"
+                    else:
+                        fallback_status = "failed"
+                    report_status = fallback_status
+                    delivery.update({
+                        "fallback_status": fallback_status,
+                        "fallback_messages_attempted": attempted,
+                        "fallback_messages_submitted": submitted,
+                    })
                     logger.warning(
                         "⚠️ Attachment failed for %s — text fallback %s",
-                        recipient_name, "sent" if fallback_sent else "also failed",
+                        recipient_name,
+                        "sent" if fallback_status == "submitted_unverified" else "also failed",
                     )
             except Exception as e:
-                send_results[recipient_name] = False
-                attach_results[recipient_name] = False
-                logger.error("❌ Failed to send to %s: %s", recipient_name, e)
+                if attachment_attempted and attachment_status == "not_attempted":
+                    attachment_status = "unknown"
+                    report_status = "unknown"
+                delivery["error_category"] = type(e).__name__
+                logger.error(
+                    "❌ Failed to send to %s: error=%s",
+                    recipient_name,
+                    type(e).__name__,
+                )
+            finally:
+                delivery["attachment_status"] = attachment_status
+                delivery["status"] = report_status
+                deliveries.append(delivery)
+                attach_results[recipient_name] = attachment_status
+                send_results[recipient_name] = is_delivery_submitted(report_status)
 
-        result["alert_sent"] = any(send_results.values())
+        result["delivery_status"] = aggregate_delivery_status(
+            delivery["status"] for delivery in deliveries
+        )
+        result["alert_sent"] = is_delivery_submitted(result["delivery_status"])
         result["recipients_status"] = send_results
         result["attachment_status"] = attach_results
+        result["deliveries"] = deliveries
+        result["report_ids"] = report_ids
     else:
         logger.info("⏭️  Dry-run mode: skipping iMessage dispatch")
         result["alert_sent"] = False
-
-    # Step 5: Update state file
-    logger.info("Step 5/5: Updating state...")
-    state = load_state()
-    state["last_run_date"] = datetime.now(timezone.utc).astimezone().isoformat()
-    state["recipe_count"] = result["recipe_count"]
-    state["execution_history"].append({
-        "timestamp": result["timestamp"],
-        "recipe_count": result["recipe_count"],
-        "alert_sent": result["alert_sent"]
-    })
-    # Keep only last 10 executions
-    state["execution_history"] = state["execution_history"][-10:]
-    save_state(state)
-    logger.info("✅ State updated")
 
     result["status"] = "success"
     logger.info("=" * 60)

@@ -5,7 +5,8 @@ routing test.
 
 macOS-specific tests that actually touch Messages.app are guarded by the
 @pytest.mark.macos_integration marker and skipped by default. They require
-PYTEST_MACOS_INTEGRATION=1 to run locally on macOS; CI never runs them.
+PYTEST_MACOS_INTEGRATION=1 to run on macOS; dedicated macOS CI may run only
+explicitly selected, non-delivering integration cases.
 """
 
 from __future__ import annotations

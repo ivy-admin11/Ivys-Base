@@ -29,6 +29,7 @@ Cost Optimization:
 """
 
 import os
+import queue
 import shutil as _shutil
 import socket
 import sys
@@ -41,7 +42,9 @@ import re
 import requests
 import subprocess
 import atexit
+from dataclasses import dataclass
 from google import genai
+from google.genai import types as genai_types
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -52,11 +55,23 @@ from pydantic import BaseModel
 # Import centralized configuration
 from config import (
     POLLING_INTERVAL,
+    IMESSAGE_FETCH_BATCH_SIZE,
+    IMESSAGE_QUEUE_MAXSIZE,
+    IMESSAGE_SLOW_QUEUE_MAXSIZE,
+    IMESSAGE_DEBOUNCE_SECONDS,
+    IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS,
+    IMESSAGE_STALE_QUEUE_SECONDS,
+    IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS,
+    IMESSAGE_SLOW_ACK_SECONDS,
     DB_TIMEOUT,
     DB_RETRY_ATTEMPTS,
     DB_RETRY_BACKOFF,
     CHAT_DB_PATH,
     EXTERNAL_API_TIMEOUT,
+    IMESSAGE_SEND_TIMEOUT_SECONDS,
+    APPLE_CALENDAR_TIMEOUT_SECONDS,
+    APPLE_REMINDERS_TIMEOUT_SECONDS,
+    STATUS_COMMAND_TIMEOUT_SECONDS,
     ENABLE_IMESSAGE_POLLER,
     ENABLE_CALENDAR_INTEGRATION,
     ENABLE_REMINDERS_INTEGRATION,
@@ -81,8 +96,15 @@ from config import (
 from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 from ivy_core import receipts
 from ivy_core import outbox as _outbox
+from ivy_core.imessage_state import (
+    InboxStateStore,
+    InboundMessage,
+    runtime_metrics as _imessage_metrics,
+)
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import build_attachment_failure_notice
+from filelock import FileLock, Timeout as FileLockTimeout
+from utils.applescript import AppleScriptRunner
 
 # Import prompt caching manager
 try:
@@ -160,7 +182,12 @@ def _get_gemini_client():
         if k in os.environ
     }
     try:
-        _gemini_client = genai.Client(api_key=api_key)
+        _gemini_client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(
+                timeout=EXTERNAL_API_TIMEOUT * 1000,
+            ),
+        )
     finally:
         os.environ.update(saved)
     return _gemini_client
@@ -308,6 +335,12 @@ TOOLS_LIST = [
         "role": "primary",
     },
     {
+        "name": "openai",
+        "description": "First failover AI conversation engine via the OpenAI API.",
+        "required_env": [["OPENAI_API_KEY"]],
+        "role": "failover",
+    },
+    {
         "name": "gemini",
         "description": "Failover/backup AI engine via Google Gemini (prompt caching enabled).",
         "required_env": [["GEMINI_API_KEY"]],
@@ -374,6 +407,64 @@ _PROVIDER_PROBE_CACHE: Dict[str, Any] = {}
 _PROVIDER_PROBE_LOCK = threading.Lock()
 _PROVIDER_PROBE_TTL = 60  # seconds — avoid hammering APIs on every /health poll
 
+
+# ---------------------------------------------------------------------------
+# iMessage runtime state
+# ---------------------------------------------------------------------------
+
+_IMESSAGE_STOP_EVENT = threading.Event()
+_IMESSAGE_WORKER_THREAD: Optional[threading.Thread] = None
+_PROVIDER_PROBE_STOP_EVENT = threading.Event()
+_PROVIDER_PROBE_THREAD: Optional[threading.Thread] = None
+_IMESSAGE_INBOX_QUEUE: queue.Queue[InboundMessage] = queue.Queue(
+    maxsize=IMESSAGE_QUEUE_MAXSIZE
+)
+_IMESSAGE_SLOW_QUEUE: queue.Queue["ProcessingUnit"] = queue.Queue(
+    maxsize=IMESSAGE_SLOW_QUEUE_MAXSIZE
+)
+_IMESSAGE_STATE = InboxStateStore()
+_IMESSAGE_LATEST_BY_SENDER: Dict[str, int] = {}
+_IMESSAGE_LATEST_LOCK = threading.RLock()
+_IMESSAGE_SEND_LOCK = threading.RLock()
+_IMESSAGE_TOOL_CONTEXT = threading.local()
+_IMESSAGE_POLLER_LOCK_PATH = Path(__file__).resolve().parent / "logs" / "imessage-poller.lock"
+
+_CALENDAR_RUNNER = AppleScriptRunner(timeout=APPLE_CALENDAR_TIMEOUT_SECONDS)
+_REMINDERS_RUNNER = AppleScriptRunner(timeout=APPLE_REMINDERS_TIMEOUT_SECONDS)
+_IMESSAGE_RUNNER = AppleScriptRunner(timeout=IMESSAGE_SEND_TIMEOUT_SECONDS)
+
+
+@dataclass(frozen=True)
+class ProcessingUnit:
+    """One authorized, in-memory unit of iMessage work.
+
+    Sender identifiers and message text stay in memory only.  The durable
+    inbox journal stores ROWIDs and sanitized state categories, never content.
+    """
+
+    messages: tuple[InboundMessage, ...]
+    category: str
+
+    @property
+    def message_ids(self) -> tuple[int, ...]:
+        return tuple(message.message_id for message in self.messages)
+
+    @property
+    def newest_message_id(self) -> int:
+        return max(self.message_ids)
+
+    @property
+    def sender(self) -> str:
+        return self.messages[0].sender
+
+    @property
+    def text(self) -> str:
+        return "\n".join(message.text for message in self.messages)
+
+    @property
+    def collected_monotonic(self) -> float:
+        return min(message.collected_monotonic for message in self.messages)
+
 # ============================================================================
 # PERFORMANCE OPTIMIZATIONS (Thread-safe, Fail-Closed)
 # ============================================================================
@@ -397,18 +488,30 @@ _FAVORITES_CACHE_SIZE = None
 
 # Warning suppression — track which invalid paths have been warned about
 _FAVORITES_WARNED_INVALID_PATHS = set()
+_DEFAULT_FAVORITES_FILE = str(Path(__file__).resolve().parent / "favorites.json")
 
 
-def _warn_once_favorites(message: str, path: str) -> None:
-    """Log a warning once per path to avoid spam on repeated invalid/missing files."""
-    if path not in _FAVORITES_WARNED_INVALID_PATHS:
+def _warn_once_favorites(message: str, identity: object) -> None:
+    """Log a sanitized warning once per unchanged file-state identity."""
+    if identity not in _FAVORITES_WARNED_INVALID_PATHS:
         logger.warning(message)
-        _FAVORITES_WARNED_INVALID_PATHS.add(path)
+        _FAVORITES_WARNED_INVALID_PATHS.add(identity)
 
 
 def _get_project_root() -> Path:
     """Get the project root directory independent of current working directory."""
     return Path(__file__).resolve().parent
+
+
+def _get_favorites_path() -> Path:
+    """Return the configured allowlist path without depending on the CWD.
+
+    The default follows the application directory; keeping that lookup dynamic
+    also preserves test isolation when the project-root helper is patched.
+    """
+    if os.path.abspath(IVY_FAVORITES_FILE) == os.path.abspath(_DEFAULT_FAVORITES_FILE):
+        return _get_project_root() / "favorites.json"
+    return Path(IVY_FAVORITES_FILE).expanduser().resolve()
 
 
 # ---- SQLite Connection Lifecycle ----
@@ -435,8 +538,10 @@ def _create_chat_db_connection() -> Optional[sqlite3.Connection]:
             check_same_thread=False,  # Safe because all access serialized with _CHAT_DB_LOCK
         )
         return conn
-    except Exception as e:
-        logger.error("Failed to create chat.db connection: %s", e)
+    except Exception as exc:
+        logger.error(
+            "Failed to create chat.db connection error=%s", type(exc).__name__
+        )
         return None
 
 
@@ -475,8 +580,10 @@ def _close_chat_db_locked() -> None:
     if _CHAT_DB_CONN:
         try:
             _CHAT_DB_CONN.close()
-        except Exception as e:
-            logger.debug("Error closing chat.db connection: %s", e)
+        except Exception as exc:
+            logger.debug(
+                "Error closing chat.db connection error=%s", type(exc).__name__
+            )
     
     _CHAT_DB_CONN = None
 
@@ -588,15 +695,96 @@ def _probe_deepseek() -> Dict[str, Any]:
             "configured": True, "authenticated": False, "reachable": False,
             "role": "primary", "status": "unreachable", "reason": "Request timed out",
         }
-    except requests.exceptions.ConnectionError as exc:
+    except requests.exceptions.ConnectionError:
         return {
             "configured": True, "authenticated": False, "reachable": False,
-            "role": "primary", "status": "unreachable", "reason": str(exc)[:120],
+            "role": "primary", "status": "unreachable", "reason": "Connection failed",
         }
     except Exception as exc:
         return {
             "configured": True, "authenticated": False, "reachable": True,
-            "role": "primary", "status": "error", "reason": str(exc)[:120],
+            "role": "primary", "status": "error", "reason": type(exc).__name__,
+        }
+
+
+def _probe_openai() -> Dict[str, Any]:
+    """Make a minimal bounded OpenAI call and return sanitized health fields."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "configured": False,
+            "authenticated": False,
+            "reachable": False,
+            "role": "failover",
+            "status": "unconfigured",
+            "reason": "OPENAI_API_KEY not set",
+        }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            },
+            timeout=8,
+        )
+        if response.status_code == 200:
+            return {
+                "configured": True,
+                "authenticated": True,
+                "reachable": True,
+                "role": "failover",
+                "status": "ready",
+                "reason": None,
+            }
+        if response.status_code in (401, 403):
+            return {
+                "configured": True,
+                "authenticated": False,
+                "reachable": True,
+                "role": "failover",
+                "status": "degraded",
+                "reason": f"Provider returned HTTP {response.status_code}",
+            }
+        return {
+            "configured": True,
+            "authenticated": False,
+            "reachable": True,
+            "role": "failover",
+            "status": "error",
+            "reason": f"Unexpected HTTP {response.status_code}",
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "configured": True,
+            "authenticated": False,
+            "reachable": False,
+            "role": "failover",
+            "status": "unreachable",
+            "reason": "Request timed out",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "configured": True,
+            "authenticated": False,
+            "reachable": False,
+            "role": "failover",
+            "status": "unreachable",
+            "reason": "Connection failed",
+        }
+    except Exception as exc:
+        return {
+            "configured": True,
+            "authenticated": False,
+            "reachable": True,
+            "role": "failover",
+            "status": "error",
+            "reason": type(exc).__name__,
         }
 
 
@@ -609,7 +797,10 @@ def _probe_gemini() -> Dict[str, Any]:
             "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
         }
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=8000),
+        )
         client.models.generate_content(
             model=_GEMINI_MODEL,
             contents="hi",
@@ -629,7 +820,7 @@ def _probe_gemini() -> Dict[str, Any]:
             }
         return {
             "configured": True, "authenticated": False, "reachable": True,
-            "role": "failover", "status": "error", "reason": msg[:120],
+            "role": "failover", "status": "error", "reason": type(exc).__name__,
         }
 
 
@@ -645,14 +836,35 @@ def probe_providers(*, force: bool = False) -> Dict[str, Any]:
         if not force and (now - cached_at) < _PROVIDER_PROBE_TTL:
             return {k: v for k, v in _PROVIDER_PROBE_CACHE.items() if k != "_ts"}
 
-        result: Dict[str, Any] = {
-            "deepseek": _probe_deepseek(),
-            "gemini": _probe_gemini(),
-            "_ts": now,
-        }
+    result: Dict[str, Any] = {
+        "deepseek": _probe_deepseek(),
+        "openai": _probe_openai(),
+        "gemini": _probe_gemini(),
+        "_ts": now,
+    }
+    with _PROVIDER_PROBE_LOCK:
         _PROVIDER_PROBE_CACHE.clear()
         _PROVIDER_PROBE_CACHE.update(result)
         return {k: v for k, v in result.items() if k != "_ts"}
+
+
+def _cached_provider_snapshot() -> Dict[str, Any]:
+    """Return cached probe state without performing network I/O."""
+    with _PROVIDER_PROBE_LOCK:
+        return {
+            key: dict(value)
+            for key, value in _PROVIDER_PROBE_CACHE.items()
+            if key != "_ts" and isinstance(value, dict)
+        }
+
+
+def _provider_probe_worker(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            probe_providers(force=True)
+        except Exception as exc:
+            logger.warning("Provider probe cycle failed error=%s", type(exc).__name__)
+        stop_event.wait(_PROVIDER_PROBE_TTL)
 
 
 
@@ -689,6 +901,8 @@ def print_startup_banner() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Print banner, initialize persistent connections, start iMessage poller."""
+    global _IMESSAGE_WORKER_THREAD, _PROVIDER_PROBE_THREAD
+
     print_startup_banner()
     
     # Initialize persistent chat.db connection (registers atexit cleanup)
@@ -697,21 +911,53 @@ async def lifespan(app: FastAPI):
     # Initialize voice session manager if available
     if VOICE_ASSISTANT_AVAILABLE:
         logger.info("Voice session manager initialized and ready.")
+
+    _PROVIDER_PROBE_STOP_EVENT.clear()
+    _PROVIDER_PROBE_THREAD = threading.Thread(
+        target=_provider_probe_worker,
+        args=(_PROVIDER_PROBE_STOP_EVENT,),
+        name="ivy-provider-health-probe",
+        daemon=True,
+    )
+    _PROVIDER_PROBE_THREAD.start()
     
     # Start iMessage poller if enabled
     if ENABLE_IMESSAGE_POLLER:
-        worker_thread = threading.Thread(target=background_imessage_worker, daemon=True)
-        worker_thread.start()
+        _IMESSAGE_STOP_EVENT.clear()
+        _IMESSAGE_WORKER_THREAD = threading.Thread(
+            target=background_imessage_worker,
+            name="ivy-imessage-collector",
+            daemon=True,
+        )
+        _IMESSAGE_WORKER_THREAD.start()
         logger.info("Background iMessage polling thread started.")
+    else:
+        _imessage_metrics.set_thread_state("collector", False)
     
     try:
         yield
     finally:
+        _IMESSAGE_STOP_EVENT.set()
+        _PROVIDER_PROBE_STOP_EVENT.set()
+        if _IMESSAGE_WORKER_THREAD is not None:
+            _IMESSAGE_WORKER_THREAD.join(timeout=IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS)
+            if _IMESSAGE_WORKER_THREAD.is_alive():
+                logger.warning("iMessage collector did not stop within the shutdown grace period")
+            _IMESSAGE_WORKER_THREAD = None
+        if _PROVIDER_PROBE_THREAD is not None:
+            _PROVIDER_PROBE_THREAD.join(timeout=IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS)
+            _PROVIDER_PROBE_THREAD = None
         close_chat_db()
         logger.info("Gateway shutdown complete.")
 
 
-app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", lifespan=lifespan)
+app = FastAPI(
+    title="Ivy Local Admin API Gateway v2.2 — Voice Assistant",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 PROCESS_STARTED_AT = datetime.now()
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -793,8 +1039,9 @@ def fetch_readwise_highlights() -> str:
 
         raw_output = "\n".join(compiled_items)
         return optimize_token_payload(raw_output, max_chars=READWISE_TOKEN_OPTIMIZATION_MAX_CHARS)
-    except Exception as e:
-        return f"❌ Readwise Integration Pipeline Error: {str(e)}"
+    except Exception as exc:
+        logger.warning("Readwise request failed error=%s", type(exc).__name__)
+        return "❌ Readwise is temporarily unavailable."
 
 
 # ============================================================================
@@ -802,34 +1049,19 @@ def fetch_readwise_highlights() -> str:
 # ============================================================================
 
 
+def _record_applescript_result(runner: AppleScriptRunner, result: str) -> bool:
+    """Record safe AppleEvent telemetry and return whether the call succeeded."""
+    if runner.last_error_category == "timeout":
+        _imessage_metrics.record_apple_event_timeout()
+    return not result.upper().startswith("ERROR")
+
+
 def check_apple_calendar(timeframe: str) -> str:
     """Scan local Mac Hilla Calendar for upcoming events."""
-    script_lines = [
-        "set totalEvents to \"\"",
-        "set midnightToday to (current date)",
-        "set hours of midnightToday to 0",
-        "set minutes of midnightToday to 0",
-        "set seconds of midnightToday to 0",
-        "tell application \"Calendar\"",
-        "    try",
-        "        set familyCal to calendar \"Hilla\"",
-        "        set upcomingEvents to (every event of familyCal whose start date is greater than or equal to midnightToday)",
-        "        repeat with e in upcomingEvents",
-        "            set d to start date of e",
-        "            set totalEvents to totalEvents & (summary of e) & \":::\" & (day of d as text) & \" \" & (month of d as text) & \" \" & (year of d as text) & \" at \" & (time string of d) & \"\\n\"",
-        "        end repeat",
-        "    on error err",
-        "        return \"Error: \" & err",
-        "    end try",
-        "end tell",
-        "return totalEvents",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
+    raw_output = _CALENDAR_RUNNER.fetch_calendar_events("Hilla").strip()
 
-    if "Error:" in raw_output:
-        return f"❌ AppleScript Database Error: {raw_output}"
+    if not _record_applescript_result(_CALENDAR_RUNNER, raw_output):
+        return "❌ Calendar is temporarily unavailable. Please try again."
     if not raw_output:
         return "Your Hilla calendar has no upcoming events listed."
 
@@ -887,21 +1119,10 @@ def check_apple_calendar(timeframe: str) -> str:
 
 def fetch_apple_reminders(list_name: str = "Household") -> str:
     """Read uncompleted tasks from Apple Reminders."""
-    script = f'''
-    tell application "Reminders"
-        try
-            tell list "{list_name}"
-                set remNames to name of every reminder whose completed is false
-                set AppleScript's text item delimiters to ", "
-                return remNames as text
-            end tell
-        on error errMsg
-            return "ERROR: " & errMsg
-        end try
-    end tell
-    '''
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip() if res.stdout.strip() else "No active reminders found."
+    raw_output = _REMINDERS_RUNNER.fetch_reminders(list_name).strip()
+    if not _record_applescript_result(_REMINDERS_RUNNER, raw_output):
+        return "❌ Reminders is temporarily unavailable. Please try again."
+    return raw_output or "No active reminders found."
 
 
 def add_apple_reminder(title: str, list_name: str = "Household") -> str:
@@ -912,29 +1133,11 @@ def add_apple_reminder(title: str, list_name: str = "Household") -> str:
     elif any(word in list_name.lower() for word in ["house", "chore", "clean", "task"]):
         list_name = "Household"
 
-    script_lines = [
-        'tell application "Reminders"',
-        "    try",
-        f'        if not (exists list "{list_name}") then',
-        f'            make new list with properties {{name:"{list_name}"}}',
-        "        end if",
-        f'        set targetList to list "{list_name}"',
-        "        tell targetList",
-        f'            make new reminder with properties {{name:"{title}"}}',
-        "        end tell",
-        '        return "SUCCESS"',
-        "    on error err",
-        '        return "Error: " & err',
-        "    end try",
-        "end tell",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
+    raw_output = _REMINDERS_RUNNER.add_reminder(list_name, title).strip()
 
-    if "SUCCESS" in raw_output:
+    if _record_applescript_result(_REMINDERS_RUNNER, raw_output) and raw_output == "SUCCESS":
         return f"✅ Added to your '{list_name}' list: {title}"
-    return f"❌ Reminders Integration Error: {raw_output}"
+    return "❌ Reminders is temporarily unavailable. Please try again."
 
 
 def run_job(job_name: str) -> str:
@@ -949,10 +1152,16 @@ def run_job(job_name: str) -> str:
     if not JOB_RUNNER_AVAILABLE:
         return "❌ Job execution system unavailable."
 
-    status, message = job_runner.run_job(job_name, force=True)
+    dispatch = job_runner.run_job_detailed(job_name, force=True)
+    status, message = dispatch.status, dispatch.message
+    reference = (
+        f" (execution {dispatch.execution_id[:8]})"
+        if dispatch.execution_id
+        else ""
+    )
 
     if status == JobStatus.SUCCESS:
-        return message
+        return f"{message}{reference}"
     elif status == JobStatus.ALREADY_RUNNING:
         return f"⏳ {message}"
     elif status == JobStatus.NOT_FOUND:
@@ -974,6 +1183,7 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
     "add_apple_reminder": add_apple_reminder,
     "run_job": run_job,
 }
+_MUTATING_TOOL_NAMES = frozenset({"add_apple_reminder", "run_job"})
 
 
 def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
@@ -983,10 +1193,57 @@ def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Function {tool_name} is undefined."
+    if tool_name in _MUTATING_TOOL_NAMES:
+        # The slow-worker thread uses this bit to avoid suppressing a reply
+        # after an irreversible action may already have started.
+        _IMESSAGE_TOOL_CONTEXT.mutation_started = True
     try:
         return handler(**tool_args)
     except Exception as exec_err:
-        return f"Error: {exec_err}"
+        logger.warning(
+            "Tool execution failed tool=%s error=%s",
+            tool_name,
+            type(exec_err).__name__,
+        )
+        return f"Error: {tool_name} could not complete the request."
+
+
+def _execute_native_tool_calls(tool_calls: Any, provider: str) -> str:
+    """Run every valid native tool call in provider order.
+
+    Provider APIs may return several independent tool calls in one assistant
+    message.  Silently executing only the first one reports a request as done
+    while dropping later reminder/job actions, so execute each registered call
+    deterministically and return their bounded user-facing outcomes.
+    """
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return ""
+
+    outcomes: List[str] = []
+    for index, call in enumerate(tool_calls, start=1):
+        if not isinstance(call, dict):
+            outcomes.append(f"Error: {provider} returned an invalid tool call.")
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            outcomes.append(f"Error: {provider} returned an invalid tool call.")
+            continue
+        func_name = function.get("name")
+        if not isinstance(func_name, str) or not func_name:
+            outcomes.append(f"Error: {provider} returned an unnamed tool call.")
+            continue
+        raw_arguments = function.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+        except json.JSONDecodeError:
+            outcomes.append(f"Error: {func_name} received invalid arguments.")
+            continue
+        if not isinstance(args, dict):
+            outcomes.append(f"Error: {func_name} received invalid arguments.")
+            continue
+        logger.info("%s triggered native tool=%s call=%d", provider, func_name, index)
+        outcomes.append(_execute_tool_call(func_name, args))
+    return "\n".join(outcome for outcome in outcomes if outcome)
 
 
 # ============================================================================
@@ -995,23 +1252,15 @@ def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
 
 
 def run_local_applescript_send(target: str, body: str) -> str:
-    """Send iMessage via AppleScript."""
-    recipient = "me" if target.lower() == "me" else target
-    script_lines = [
-        'tell application "Messages"',
-        "    try",
-        '        set targetService to first service whose service type is iMessage',
-        f'        set targetBuddy to buddy "{recipient}" of targetService',
-        f'        send "{body}" to targetBuddy',
-        '        return "SUCCESS"',
-        "    on error errMsg",
-        '        return "ERROR: " & errMsg',
-        "    end try",
-        "end tell",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip()
+    """Send iMessage through the fixed argv AppleScript path.
+
+    Messages.app automation is serialized and bounded.  Dynamic recipient and
+    body values are process arguments, never interpolated into AppleScript.
+    """
+    with _IMESSAGE_SEND_LOCK:
+        result = _IMESSAGE_RUNNER.send_imessage_argv(target, body).strip()
+    _record_applescript_result(_IMESSAGE_RUNNER, result)
+    return result
 
 
 # ============================================================================
@@ -1056,17 +1305,14 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
         
         if response.status_code != 200:
-            # Sanitize and truncate response body for logging (never include secrets)
-            sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
             logger.error(
-                "DeepSeek API returned %s: %s",
+                "DeepSeek API returned HTTP %s",
                 response.status_code,
-                sanitized_response,
             )
             raise ProviderHTTPError(
                 provider="deepseek",
                 status_code=response.status_code,
-                detail=sanitized_response,
+                detail="provider request rejected",
             )
 
         res_data = response.json()
@@ -1077,30 +1323,16 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
         # every registered tool (including run_job, which it previously
         # could request via its schema but never actually got dispatched).
         if "tool_calls" in message_node and message_node["tool_calls"]:
-            call = message_node["tool_calls"][0]
-            func_name = call["function"]["name"]
-            args = (
-                json.loads(call["function"].get("arguments", "{}"))
-                if call["function"].get("arguments")
-                else {}
-            )
-
-            logger.info(
-                "DeepSeek Core triggered native tool: %s with arguments: %s",
-                func_name,
-                args,
-            )
-
-            return _execute_tool_call(func_name, args)
+            return _execute_native_tool_calls(message_node["tool_calls"], "DeepSeek")
 
         return message_node.get("content", "").strip()
     except ProviderHTTPError:
         raise
-    except requests.RequestException as e:
-        logger.error("DeepSeek request failed: %s", str(e))
+    except requests.RequestException as exc:
+        logger.error("DeepSeek request failed error=%s", type(exc).__name__)
         raise
-    except Exception as e:
-        logger.error("DeepSeek execution error: %s", str(e))
+    except Exception as exc:
+        logger.error("DeepSeek execution failed error=%s", type(exc).__name__)
         raise
 
 
@@ -1144,16 +1376,15 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
     }
 
     try:
-       logger.info("📡 OpenAI API request: %s", url)
+       logger.info("OpenAI API request started")
        response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
         
        if response.status_code != 200:
-           sanitized_response = response.text[:500] if response.text else f"HTTP {response.status_code}"
-           logger.error("OpenAI API error (status %d): %s", response.status_code, sanitized_response)
+           logger.error("OpenAI API returned HTTP %d", response.status_code)
            raise ProviderHTTPError(
                provider="openai",
                status_code=response.status_code,
-               detail=sanitized_response,
+               detail="provider request rejected",
            )
         
        response_json = response.json()
@@ -1164,29 +1395,15 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
        tool_calls = message.get("tool_calls", [])
         
        if tool_calls:
-           logger.info("🔧 OpenAI tool execution triggered")
-           call = tool_calls[0]
-           func_name = call.get("function", {}).get("name", "")
-           args = (
-               json.loads(call.get("function", {}).get("arguments", "{}"))
-               if call.get("function", {}).get("arguments")
-               else {}
-           )
-            
-           logger.info(
-               "OpenAI triggered tool: %s with arguments: %s",
-               func_name,
-               args,
-           )
-            
-           return _execute_tool_call(func_name, args)
+           logger.info("OpenAI native tool execution triggered count=%d", len(tool_calls))
+           return _execute_native_tool_calls(tool_calls, "OpenAI")
         
        # Return text response if no tool was called
        text_response = message.get("content", "")
        return text_response if text_response else "No response from OpenAI."
         
-    except Exception as e:
-       logger.error("OpenAI execution error: %s", str(e))
+    except Exception as exc:
+       logger.error("OpenAI execution failed error=%s", type(exc).__name__)
        raise
 
 
@@ -1250,9 +1467,9 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
         # Enforce Household list for reminders
         if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
             tool_args["list_name"] = "Household"
-        logger.info("🛠️ Executing Tool: %s with arguments %s", tool_name, tool_args)
+        logger.info("Gemini executing tool=%s", tool_name)
         tool_result = _execute_tool_call(tool_name, tool_args)
-        logger.info("📤 Tool Output: %s", tool_result)
+        logger.info("Gemini tool completed tool=%s", tool_name)
         tool_results.append((tool_name, tool_result))
 
     # Follow-up call with the *real* tool results (previously always sent
@@ -1277,7 +1494,7 @@ def _gemini_backup_reply(text: str) -> Optional[str]:
 
 
 def query_llm_with_tools(prompt_text: str) -> str:
-    """One-shot DeepSeek-primary/Gemini-backup query with real tool execution.
+    """One-shot DeepSeek/OpenAI/Gemini query with real tool execution.
 
     Used by the `ivy` CLI's query mode. Unlike the iMessage poller and
     /voice/query, this has no session state — just a single question, a
@@ -1292,14 +1509,26 @@ def query_llm_with_tools(prompt_text: str) -> str:
             ),
         )
     except Exception as exc:
-        logger.error("CLI query: DeepSeek primary layer fault: %s", exc)
+        logger.error("CLI query DeepSeek failed error=%s", type(exc).__name__)
         reply = None
+
+    if not reply:
+        try:
+            reply = execute_openai_call(
+                prompt_text,
+                DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+                    current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+                ),
+            )
+        except Exception as exc:
+            logger.error("CLI query OpenAI failed error=%s", type(exc).__name__)
+            reply = None
 
     if not reply:
         try:
             reply = _gemini_backup_reply(prompt_text)
         except Exception as exc:
-            logger.error("CLI query: Gemini backup layer fault: %s", exc)
+            logger.error("CLI query Gemini failed error=%s", type(exc).__name__)
             reply = None
 
     return reply or "No response."
@@ -1332,7 +1561,7 @@ def load_favorites_cached() -> frozenset:
     global _FAVORITES_CACHE_STATE, _FAVORITES_CACHE_CONTACTS
     global _FAVORITES_CACHE_MTIME_NS, _FAVORITES_CACHE_SIZE
     
-    favorites_path = _get_project_root() / "favorites.json"
+    favorites_path = _get_favorites_path()
     
     with _FAVORITES_CACHE_LOCK:
         # Try to stat the file
@@ -1342,52 +1571,62 @@ def load_favorites_cached() -> frozenset:
             current_size = stat.st_size
         except (OSError, FileNotFoundError):
             # File doesn't exist or is unreadable
-            if _FAVORITES_CACHE_STATE is False:
+            if (
+                _FAVORITES_CACHE_STATE is False
+                and _FAVORITES_CACHE_MTIME_NS is None
+                and _FAVORITES_CACHE_SIZE is None
+            ):
                 # Already marked invalid; return cached empty set without re-warning
                 return frozenset()
             
             # First time seeing this error; warn once
             _warn_once_favorites(
-                f"favorites.json missing or unreadable: {favorites_path}",
-                str(favorites_path)
+                "favorites allowlist is missing or unreadable; external senders are blocked",
+                ("missing", str(favorites_path)),
             )
             _FAVORITES_CACHE_STATE = False
             _FAVORITES_CACHE_CONTACTS = frozenset()
+            _FAVORITES_CACHE_MTIME_NS = None
+            _FAVORITES_CACHE_SIZE = None
             return frozenset()
         
         # File exists. Check if it's changed.
         if (
-            _FAVORITES_CACHE_STATE is True
+            _FAVORITES_CACHE_STATE is not None
             and _FAVORITES_CACHE_MTIME_NS == current_mtime_ns
             and _FAVORITES_CACHE_SIZE == current_size
         ):
-            # File unchanged since last load
+            # File unchanged since the last valid OR invalid load.
             return _FAVORITES_CACHE_CONTACTS or frozenset()
         
         # File is new, modified, or first load attempt
         try:
-            with open(favorites_path, "r") as f:
+            with open(favorites_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             # Validate: root must be a list
             if not isinstance(data, list):
                 _warn_once_favorites(
-                    f"favorites.json root is not a list: {type(data).__name__}",
-                    str(favorites_path)
+                    "favorites allowlist has an invalid root type; external senders are blocked",
+                    ("schema-root", current_mtime_ns, current_size),
                 )
                 _FAVORITES_CACHE_STATE = False
                 _FAVORITES_CACHE_CONTACTS = frozenset()
+                _FAVORITES_CACHE_MTIME_NS = current_mtime_ns
+                _FAVORITES_CACHE_SIZE = current_size
                 return frozenset()
             
             # Validate: every entry must be a string
             for i, entry in enumerate(data):
                 if not isinstance(entry, str):
                     _warn_once_favorites(
-                        f"favorites.json entry {i} is not a string: {type(entry).__name__}",
-                        str(favorites_path)
+                        "favorites allowlist contains a non-string entry; external senders are blocked",
+                        ("schema-entry", current_mtime_ns, current_size),
                     )
                     _FAVORITES_CACHE_STATE = False
                     _FAVORITES_CACHE_CONTACTS = frozenset()
+                    _FAVORITES_CACHE_MTIME_NS = current_mtime_ns
+                    _FAVORITES_CACHE_SIZE = current_size
                     return frozenset()
             
             # Valid; store immutable contacts
@@ -1402,92 +1641,138 @@ def load_favorites_cached() -> frozenset:
             )
             return _FAVORITES_CACHE_CONTACTS
         
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             _warn_once_favorites(
-                f"favorites.json JSON parse error: {e}",
-                str(favorites_path)
+                "favorites allowlist contains malformed JSON; external senders are blocked",
+                ("malformed", current_mtime_ns, current_size),
             )
             _FAVORITES_CACHE_STATE = False
             _FAVORITES_CACHE_CONTACTS = frozenset()
+            _FAVORITES_CACHE_MTIME_NS = current_mtime_ns
+            _FAVORITES_CACHE_SIZE = current_size
             return frozenset()
         
-        except Exception as e:
+        except Exception:
             _warn_once_favorites(
-                f"Failed to read favorites.json: {e}",
-                str(favorites_path)
+                "favorites allowlist could not be read; external senders are blocked",
+                ("unreadable", current_mtime_ns, current_size),
             )
             _FAVORITES_CACHE_STATE = False
             _FAVORITES_CACHE_CONTACTS = frozenset()
+            _FAVORITES_CACHE_MTIME_NS = current_mtime_ns
+            _FAVORITES_CACHE_SIZE = current_size
             return frozenset()
 
 
-def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
-    """Fetch next message from chat.db with retry logic and proper cursor cleanup.
-    
-    Retries up to DB_RETRY_ATTEMPTS on recoverable OperationalError.
-    
-    Behavior:
-    - Serializes access with _CHAT_DB_LOCK
-    - Explicitly closes cursor in finally block
-    - On recovery error: closes conn, clears _CHAT_DB_CONN, sleeps, retries
-    - After retries exhausted: returns None
-    - Never logs message text or sender data
-    
-    Args:
-        last_id: Last processed ROWID; fetch next message > this ID
-    
-    Returns:
-        (rowid, text, sender_id) tuple or None if not found/error.
-    """
+def _fetch_chat_rows_with_retry(
+    sql: str,
+    parameters: tuple[Any, ...],
+    *,
+    operation: str,
+) -> Optional[List[tuple]]:
+    """Execute one fixed read query with connection reset and bounded retry."""
     for attempt in range(DB_RETRY_ATTEMPTS):
-        _backoff = 0
+        backoff = 0.0
         with _CHAT_DB_LOCK:
             conn = init_chat_db()
             if not conn:
-                logger.warning("Could not establish chat.db connection (attempt %d/%d)", 
-                             attempt + 1, DB_RETRY_ATTEMPTS)
+                logger.warning(
+                    "chat.db unavailable operation=%s attempt=%d/%d",
+                    operation,
+                    attempt + 1,
+                    DB_RETRY_ATTEMPTS,
+                )
                 if attempt < DB_RETRY_ATTEMPTS - 1:
-                    _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
+                    backoff = _db_retry_backoff(attempt)
             else:
                 cursor = None
                 try:
                     cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        SELECT m.ROWID, m.text, COALESCE(h.id, 'Me')
-                        FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
-                        WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
-                        ORDER BY m.ROWID ASC LIMIT 1
-                        """,
-                        (last_id,),
+                    cursor.execute(sql, parameters)
+                    if hasattr(cursor, "fetchall"):
+                        return list(cursor.fetchall())
+                    # Compatibility with small cursor doubles in older tests.
+                    row = cursor.fetchone()
+                    return [] if row is None else [row]
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                    logger.debug(
+                        "chat.db read failed operation=%s attempt=%d/%d error=%s",
+                        operation,
+                        attempt + 1,
+                        DB_RETRY_ATTEMPTS,
+                        type(exc).__name__,
                     )
-                    result = cursor.fetchone()
-                    return result
-                
-                except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-                    # Recoverable database error; close connection and retry
-                    logger.debug("Database query error (attempt %d/%d): %s",
-                               attempt + 1, DB_RETRY_ATTEMPTS, type(e).__name__)
                     _close_chat_db_locked()
-                    
                     if attempt < DB_RETRY_ATTEMPTS - 1:
-                        _backoff = DB_RETRY_BACKOFF * (2 ** attempt)
-                
+                        backoff = _db_retry_backoff(attempt)
                 finally:
-                    # Always close cursor explicitly
-                    if cursor:
+                    if cursor is not None:
                         try:
                             cursor.close()
                         except Exception:
                             pass
-        
-        # Backoff sleep after releasing the lock
-        if _backoff:
-            time.sleep(_backoff)
-    
-    # Exhausted retries
-    logger.warning("Failed to fetch message after %d retries", DB_RETRY_ATTEMPTS)
+
+        # Never sleep while holding the shared connection lock.
+        if backoff:
+            time.sleep(backoff)
+
+    logger.warning(
+        "chat.db read exhausted retries operation=%s attempts=%d",
+        operation,
+        DB_RETRY_ATTEMPTS,
+    )
     return None
+
+
+def safe_fetch_new_messages(
+    after_id: int,
+    limit: int = IMESSAGE_FETCH_BATCH_SIZE,
+) -> Optional[List[tuple]]:
+    """Fetch an ordered, bounded batch of inbound Messages rows.
+
+    ``[]`` means a successful idle poll. ``None`` means the database read
+    failed after bounded reconnect attempts.  The distinction feeds readiness
+    telemetry and avoids treating database failure as normal idleness.
+    """
+    try:
+        bounded_limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("message batch limit must be an integer") from exc
+    if not 1 <= bounded_limit <= 100:
+        raise ValueError("message batch limit must be between 1 and 100")
+
+    return _fetch_chat_rows_with_retry(
+        """
+        SELECT m.ROWID, m.text, COALESCE(h.id, '')
+        FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.ROWID > ? AND m.is_from_me = 0 AND m.text IS NOT NULL
+        ORDER BY m.ROWID ASC LIMIT ?
+        """,
+        (max(0, int(after_id)), bounded_limit),
+        operation="fetch_new_messages",
+    )
+
+
+def safe_fetch_messages_by_ids(message_ids: List[int]) -> Optional[List[tuple]]:
+    """Rehydrate never-started durable queue entries after a restart."""
+    normalized = sorted({max(0, int(value)) for value in message_ids})[:100]
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    return _fetch_chat_rows_with_retry(
+        "SELECT m.ROWID, m.text, COALESCE(h.id, '') "
+        "FROM message m LEFT JOIN handle h ON m.handle_id = h.ROWID "
+        f"WHERE m.ROWID IN ({placeholders}) "  # nosec B608 - placeholders only
+        "AND m.is_from_me = 0 AND m.text IS NOT NULL ORDER BY m.ROWID ASC",
+        tuple(normalized),
+        operation="rehydrate_messages",
+    )
+
+
+def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
+    """Backward-compatible one-row wrapper around the batch collector."""
+    rows = safe_fetch_new_messages(last_id, limit=1)
+    return rows[0] if rows else None
 
 
 def get_last_message_id() -> Optional[int]:
@@ -1646,7 +1931,7 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
     if not pdf_path:
         return f"The PDF for {report_id} is no longer available. You may need to run the job again."
 
-    logger.info("RESEND: retrying attachment for %s → %s", report_id, sender)
+    logger.info("RESEND: retrying preserved attachment report_id=%s", report_id)
     receipt = send_imessage_attachment(sender, str(pdf_path), report_id=report_id)
     attempts = (meta.get("send_attempts") or 0) + receipt.attempts
     _outbox.update_report_status(report_id, receipt.status, attempts=attempts)
@@ -1664,8 +1949,7 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
         resend_command=resend_cmd,
         retry_queued=False,
     )
-    run_local_applescript_send(sender, notice)
-    return f"PDF delivery failed again. The report ({report_id}) is preserved in the outbox."
+    return notice
 
 
 # ============================================================================
@@ -1716,6 +2000,27 @@ _JOB_ALIASES: Dict[str, str] = {
 }
 
 
+def _resolve_job_command(text: str) -> Optional[str]:
+    """Resolve a deterministic job command without dispatching it."""
+    normalized = " ".join(text.strip().lower().split())
+    match = _JOB_COMMAND_PATTERN.match(normalized)
+    if match:
+        job_query = match.group(1).strip().lower()
+    elif normalized in _JOB_ALIASES:
+        # Preserve the short commands users already send, e.g. "sharp picks".
+        job_query = normalized
+    else:
+        return None
+
+    canonical = _JOB_ALIASES.get(job_query)
+    if canonical:
+        return canonical
+    for alias, job_name in _JOB_ALIASES.items():
+        if job_query in alias or alias in job_query:
+            return job_name
+    return None
+
+
 def handle_job_command(text: str, sender: str) -> Optional[str]:
     """Deterministic JOB COMMAND handler — never calls an LLM.
 
@@ -1730,25 +2035,8 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
         - happy hour, hh scout
         - meals, meal plan, planner, familia meal planner
     """
-    m = _JOB_COMMAND_PATTERN.match(text.strip())
-    if not m:
-        return None
-
-    job_query = m.group(1).strip().lower()
-    
-    # Try exact alias match first
-    canonical_job_name = _JOB_ALIASES.get(job_query)
-    
-    # If no exact match, try to find a job by substring
+    canonical_job_name = _resolve_job_command(text)
     if not canonical_job_name:
-        # Check if any alias contains this as a substring
-        for alias, job_name in _JOB_ALIASES.items():
-            if job_query in alias or alias in job_query:
-                canonical_job_name = job_name
-                break
-    
-    if not canonical_job_name:
-        # Not a recognized job command
         return None
     
     # Dispatch the job using job_runner
@@ -1784,8 +2072,12 @@ def handle_job_command(text: str, sender: str) -> Optional[str]:
         else:  # ERROR or other status
             return f"❌ Could not start {canonical_job_name}. Please try again."
     
-    except Exception as e:
-        logger.error("Error executing job command '%s': %s", canonical_job_name, e)
+    except Exception as exc:
+        logger.error(
+            "Job command dispatch failed job=%s error=%s",
+            canonical_job_name,
+            type(exc).__name__,
+        )
         return "❌ An error occurred while starting that job. Please try again."
 
 # OPERATIONS COMMAND HANDLER (deterministic — no LLM)
@@ -1807,13 +2099,13 @@ def get_tailscale_status() -> str:
             [cli, "status", "--json"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=STATUS_COMMAND_TIMEOUT_SECONDS,
             shell=False,
         )
     except subprocess.TimeoutExpired:
-        return "🟠 Tailscale status could not be read.\n(CLI timed out after 5 s)"
+        return "🟠 Tailscale status could not be read.\nThe local status check timed out."
     except Exception as exc:
-        logger.warning("tailscale status error: %s", exc)
+        logger.warning("Tailscale status failed error=%s", type(exc).__name__)
         return "🟠 Tailscale status could not be read."
 
     if result.returncode != 0:
@@ -1891,8 +2183,33 @@ def get_tailscale_status() -> str:
     return "\n".join(lines)
 
 
+def get_imessage_runtime_snapshot() -> Dict[str, Any]:
+    """Return non-sensitive poller readiness and latency metrics."""
+    snapshot = _imessage_metrics.snapshot()
+    snapshot["enabled"] = ENABLE_IMESSAGE_POLLER
+    try:
+        snapshot["durable_states"] = _IMESSAGE_STATE.recent_counts()
+    except Exception as exc:
+        snapshot["durable_states"] = {}
+        snapshot["state_store_error"] = type(exc).__name__
+
+    last_poll_age = snapshot.get("last_poll_age_seconds")
+    oldest_age = snapshot.get("oldest_queued_age_seconds")
+    thread_ready = all(
+        snapshot.get(name)
+        for name in ("collector_alive", "dispatcher_alive", "slow_worker_alive")
+    )
+    poll_fresh = last_poll_age is not None and last_poll_age <= max(10, POLLING_INTERVAL * 5)
+    queue_fresh = oldest_age is None or oldest_age <= IMESSAGE_STALE_QUEUE_SECONDS
+    snapshot["ready"] = (
+        not ENABLE_IMESSAGE_POLLER
+        or (thread_ready and poll_fresh and queue_fresh)
+    )
+    return snapshot
+
+
 def _get_ivy_status_text() -> str:
-    """Return a brief, deterministic status of the Ivy gateway."""
+    """Return a deterministic status grounded in runtime telemetry."""
     uptime = datetime.now() - PROCESS_STARTED_AT
     hours, remainder = divmod(int(uptime.total_seconds()), 3600)
     minutes = remainder // 60
@@ -1909,11 +2226,48 @@ def _get_ivy_status_text() -> str:
         jobs_total = len(all_jobs)
         jobs_available = sum(1 for j in all_jobs if j["available"])
 
+    runtime = get_imessage_runtime_snapshot()
+    chat_readable = os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK)
+    providers = _cached_provider_snapshot()
+    provider_ready = sum(1 for value in providers.values() if value.get("authenticated"))
+    configured_providers = sum(
+        1
+        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")
+        if os.environ.get(name, "").strip()
+    )
+
+    critical_failure = (
+        not chat_readable
+        or (ENABLE_IMESSAGE_POLLER and not runtime.get("collector_alive"))
+    )
+    degraded = (
+        not runtime.get("ready", True)
+        or configured_providers == 0
+        or runtime.get("last_error_category") is not None
+    )
+    if critical_failure:
+        icon, overall = "🔴", "UNAVAILABLE"
+    elif degraded:
+        icon, overall = "🟠", "DEGRADED"
+    else:
+        icon, overall = "🟢", "READY"
+
     lines = [
-        "🟢 Ivy Gateway — Online",
+        f"{icon} Ivy Gateway — {overall}",
         "",
         f"Uptime: {uptime_str}",
-        f"Poller: {'active' if ENABLE_IMESSAGE_POLLER else 'disabled'}",
+        "Poller: " + (
+            "disabled"
+            if not ENABLE_IMESSAGE_POLLER
+            else "active" if runtime.get("collector_alive") else "stopped"
+        ),
+        f"chat.db: {'readable' if chat_readable else 'unavailable'}",
+        f"Queue: {runtime.get('queue_depth', 0)} inbound / "
+        f"{runtime.get('slow_queue_depth', 0)} processing",
+        f"Oldest queued: {runtime.get('oldest_queued_age_seconds') or 0:.1f}s",
+        f"Last response: {runtime.get('last_response_latency_ms') or 0}ms",
+        f"AppleEvent timeouts: {runtime.get('apple_event_timeouts', 0)}",
+        f"Providers authenticated: {provider_ready}/{configured_providers}",
         f"Tools ready: {ready_count}/{total_count}",
         f"Jobs available: {jobs_available}/{jobs_total}",
         f"Caching: {'on' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'off'}",
@@ -1953,7 +2307,7 @@ def _get_job_status_text(job_name: Optional[str] = None) -> str:
     try:
         recent = receipts.list_recent(limit=5, job_name=job_name)
     except Exception as exc:
-        logger.warning("receipts.list_recent error: %s", exc)
+        logger.warning("receipts.list_recent failed error=%s", type(exc).__name__)
         return "⚠️ Could not read execution history."
 
     label = job_name.replace("_", " ").title() if job_name else "All Jobs"
@@ -1965,8 +2319,32 @@ def _get_job_status_text(job_name: Optional[str] = None) -> str:
         started = rec.get("started_at", "")[:16].replace("T", " ")
         status = rec.get("status", "?")
         name = rec.get("job_name", "?")
-        icon = "✅" if status == "success" else ("🔄" if status == "started" else "❌")
-        lines.append(f"{icon} {name} @ {started} — {status}")
+        execution_ref = str(rec.get("execution_id", ""))[:8] or "unknown"
+        if status == "completed":
+            icon = "✅"
+        elif status in {"queued", "dispatched", "running"}:
+            icon = "🔄"
+        elif status in {"completion_unknown", "triggered_unobserved"}:
+            icon = "🟠"
+        elif status == "skipped":
+            icon = "⏭️"
+        else:
+            icon = "❌"
+        lines.append(f"{icon} {name} @ {started} — {status} ({execution_ref})")
+        delivery = rec.get("delivery_status")
+        if delivery:
+            lines.append(f"  Delivery: {delivery}")
+        report_ids = rec.get("report_ids") or []
+        if report_ids:
+            lines.append(f"  Report: {str(report_ids[0])[:40]}")
+        log_path = rec.get("log_path")
+        if log_path:
+            lines.append(f"  Log: {Path(str(log_path)).name}")
+        if status in {"completion_unknown", "triggered_unobserved"}:
+            lines.append("  Completion or delivery has not been confirmed.")
+        elif status in {"failed", "dispatch_failed", "timed_out"}:
+            outcome = str(rec.get("outcome") or "failed")[:80]
+            lines.append(f"  Outcome: {outcome}")
     return "\n".join(lines)
 
 
@@ -2019,6 +2397,8 @@ _OPS_JOB_STATUS: frozenset = frozenset({
     "execution status",
 })
 
+_OPS_HELP: frozenset = frozenset({"ivy", "help", "ivy help"})
+
 
 def _normalize_ops_text(text: str) -> str:
     """Normalize text for operations command recognition only.
@@ -2052,20 +2432,26 @@ def handle_operations_command(text: str, sender: str) -> Optional[str]:  # noqa:
     """
     key = _normalize_ops_text(text)
 
+    if key in _OPS_HELP:
+        return (
+            "Ivy is online. Try: Ivy status, Tailscale status, list skills, "
+            "recent jobs, or Run Sharp Picks."
+        )
+
     if key in _OPS_TAILSCALE:
-        logger.info("OPS: tailscale status request from %s", sender)
+        logger.info("OPS: tailscale status request")
         return get_tailscale_status()
 
     if key in _OPS_IVY_STATUS:
-        logger.info("OPS: ivy status request from %s", sender)
+        logger.info("OPS: ivy status request")
         return _get_ivy_status_text()
 
     if key in _OPS_CAPABILITIES:
-        logger.info("OPS: capabilities request from %s", sender)
+        logger.info("OPS: capabilities request")
         return _get_capabilities_text()
 
     if key in _OPS_JOB_STATUS:
-        logger.info("OPS: job status request from %s", sender)
+        logger.info("OPS: job status request")
         # "sharp picks status" → filter to that job
         job_filter: Optional[str] = "sharp_picks" if "sharp picks" in key else None
         return _get_job_status_text(job_filter)
@@ -2078,152 +2464,594 @@ def handle_operations_command(text: str, sender: str) -> Optional[str]:  # noqa:
 # ============================================================================
 
 
-def background_imessage_worker() -> None:
-    """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
+def _is_authorized_sender(sender: str) -> bool:
+    """Apply exact, fail-closed sender authorization."""
+    if not sender:
+        return False
+    if sender.casefold() == "me":
+        return True
+    return sender in load_favorites_cached()
 
-    🆕 Now with prompt caching enabled for 80-90% token savings!
-    """
-    logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
-    logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
 
-    last_id = get_last_message_id()
-    if last_id is None:
-        logger.error(
-            "❌ Security Warning: Cannot access chat.db files. "
-            "Verify Full Disk Access in System Preferences."
+def _operations_category(text: str) -> Optional[str]:
+    key = _normalize_ops_text(text)
+    if key in _OPS_TAILSCALE:
+        return "ops_tailscale"
+    if key in _OPS_IVY_STATUS:
+        return "ops_status"
+    if key in _OPS_CAPABILITIES:
+        return "ops_capabilities"
+    if key in _OPS_JOB_STATUS:
+        return "ops_jobs"
+    if key in _OPS_HELP:
+        return "ops_help"
+    return None
+
+
+_MUTATING_CONVERSATION_PATTERN = re.compile(
+    r"\b(add|create|delete|remove|send|text|message|schedule|book|cancel|"
+    r"update|write|set|remind|resend|run|launch|start|put|place|order|buy|"
+    r"pay|share|forward|complete|finish|move|rename|upload|download)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_imessage_text(text: str) -> str:
+    """Classify without executing a tool or calling a model."""
+    if _RESEND_PATTERN.match(text.strip()):
+        return "resend"
+    if _resolve_job_command(text):
+        return "job"
+    operations = _operations_category(text)
+    if operations:
+        return operations
+    if _MUTATING_CONVERSATION_PATTERN.search(text):
+        return "conversation_action"
+    return "conversation_read_only"
+
+
+def coalesce_imessage_messages(messages: List[InboundMessage]) -> ProcessingUnit:
+    """Build one ordered processing unit from same-sender rapid messages."""
+    if not messages:
+        raise ValueError("cannot coalesce an empty message list")
+    ordered = tuple(sorted(messages, key=lambda message: message.message_id))
+    categories = [classify_imessage_text(message.text) for message in ordered]
+    unique_categories = set(categories)
+    if all(category.startswith("ops_") for category in categories):
+        category = categories[0] if len(unique_categories) == 1 else "operations"
+    elif "conversation_action" in unique_categories:
+        category = "conversation_action"
+    elif unique_categories == {"conversation_read_only"}:
+        category = "conversation_read_only"
+    else:
+        # Dispatcher keeps jobs/resends separate; this is a defensive fallback.
+        category = categories[0]
+    return ProcessingUnit(messages=ordered, category=category)
+
+
+def _queue_oldest_monotonic() -> Optional[float]:
+    values: List[float] = []
+    with _IMESSAGE_INBOX_QUEUE.mutex:
+        values.extend(
+            item.collected_monotonic
+            for item in _IMESSAGE_INBOX_QUEUE.queue
+            if isinstance(item, InboundMessage)
+        )
+    with _IMESSAGE_SLOW_QUEUE.mutex:
+        values.extend(
+            item.collected_monotonic
+            for item in _IMESSAGE_SLOW_QUEUE.queue
+            if isinstance(item, ProcessingUnit)
+        )
+    return min(values) if values else None
+
+
+def _update_imessage_queue_metrics() -> None:
+    _imessage_metrics.update_queues(
+        _IMESSAGE_INBOX_QUEUE.qsize(),
+        _IMESSAGE_SLOW_QUEUE.qsize(),
+        _queue_oldest_monotonic(),
+    )
+
+
+def _is_superseded(unit: ProcessingUnit) -> bool:
+    if not _category_can_be_superseded(unit.category):
+        return False
+    with _IMESSAGE_LATEST_LOCK:
+        return _IMESSAGE_LATEST_BY_SENDER.get(unit.sender, 0) > unit.newest_message_id
+
+
+def _category_can_be_superseded(category: str) -> bool:
+    return category in {
+        "operations",
+        "ops_tailscale",
+        "ops_status",
+        "ops_capabilities",
+        "ops_jobs",
+        "ops_help",
+        "conversation_read_only",
+    }
+
+
+def _conversation_reply(text: str) -> str:
+    """Run the bounded DeepSeek → OpenAI → Gemini provider chain."""
+    instruction = DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+        current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+    )
+    reply: Optional[str] = None
+    for provider_name, provider_call in (
+        ("deepseek", lambda: execute_deepseek_call(text, instruction)),
+        ("openai", lambda: execute_openai_call(text, instruction)),
+        ("gemini", lambda: _gemini_backup_reply(text)),
+    ):
+        try:
+            reply = provider_call()
+        except Exception as exc:
+            logger.warning(
+                "Conversation provider failed provider=%s error=%s",
+                provider_name,
+                type(exc).__name__,
+            )
+            reply = None
+        if reply:
+            return str(reply)
+    return (
+        "Ivy's conversation engines are temporarily unavailable. "
+        "Local commands such as Run Sharp Picks still work."
+    )
+
+
+def _operations_reply(unit: ProcessingUnit) -> str:
+    replies: List[str] = []
+    seen: set[str] = set()
+    for message in unit.messages:
+        category = _operations_category(message.text)
+        if not category or category in seen:
+            continue
+        seen.add(category)
+        reply = handle_operations_command(message.text, message.sender)
+        if reply:
+            replies.append(reply)
+    return "\n\n".join(replies) or "Ivy is online. Text Ivy status for details."
+
+
+def _send_unit_reply(
+    unit: ProcessingUnit,
+    reply: str,
+    *,
+    outcome: str = "replied",
+    terminal_status: str = "completed",
+    allow_supersession: bool = True,
+) -> None:
+    if allow_supersession and _is_superseded(unit):
+        _IMESSAGE_STATE.mark_terminal(
+            unit.message_ids,
+            "superseded",
+            outcome="newer_request_received",
         )
         return
 
-    current_date_str = datetime.now().strftime("%A, %B %d, %Y")
-    deepseek_sys_instruction = DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
-        current_date_str=current_date_str
-    )
-
-    consecutive_failures = 0
-
-    while True:
+    _IMESSAGE_STATE.mark_sending(unit.message_ids)
+    result = run_local_applescript_send(unit.sender, reply)
+    elapsed_ms = int((time.monotonic() - unit.collected_monotonic) * 1000)
+    if result == "SUCCESS":
         try:
-            time.sleep(POLLING_INTERVAL)
-            row = safe_fetch_last_message(last_id)
-
-            if not row:
-                consecutive_failures = 0
-                continue
-
-            msg_id, text, sender = row
-            last_id = msg_id
-
-            # ========== Authorization Check ==========
-            is_authorized = False
-            if sender.lower() == "me":
-                is_authorized = True
-            else:
-                favorites_path = IVY_FAVORITES_FILE
-                # 🚀 Use cached favorites (reloads only if file changes)
-                allowed_contacts = load_favorites_cached()
-                if sender in allowed_contacts:
-                    is_authorized = True
-                elif not allowed_contacts:
-                    logger.warning(
-                        "⚠️ Security Alert: No contacts loaded from favorites allowlist at %s! "
-                        "Blocking external sender %s.",
-                        favorites_path,
-                        sender,
-                    )
-
-            if not is_authorized:
-                logger.info(
-                    "🛑 Security Exception: Trigger blocked. Unauthorized Contact ID: %s",
-                    sender,
-                )
-                consecutive_failures = 0
-                continue
-
-            logger.info("📩 Inbound Trigger Isolated: %s", text)
-            reply = None
-
-            # ========== RESEND COMMAND (deterministic, no LLM) ==========
-            resend_reply = handle_resend_command(text, sender)
-            if resend_reply is not None:
-                run_local_applescript_send(sender, resend_reply)
-                consecutive_failures = 0
-                continue
-
-            # ========== JOB COMMAND ROUTING (deterministic, no LLM) ==========
-            job_reply = handle_job_command(text, sender)
-            if job_reply is not None:
-                run_local_applescript_send(sender, job_reply)
-                consecutive_failures = 0
-                continue
-
-            # ========== OPERATIONS COMMAND (deterministic, no LLM) ==========
-            ops_reply = handle_operations_command(text, sender)
-            if ops_reply is not None:
-                run_local_applescript_send(sender, ops_reply)
-                consecutive_failures = 0
-                continue
-
-            # ========== PHASE 1: DEEPSEEK PRIMARY ==========
+            _IMESSAGE_STATE.mark_terminal(
+                unit.message_ids,
+                terminal_status,
+                outcome=outcome,
+            )
+        except Exception as exc:
+            # The reply was already submitted. Never turn a bookkeeping
+            # failure into a second contradictory iMessage. If a transient
+            # write failure clears, preserve the conservative ambiguous state
+            # for recovery; otherwise the original queued state remains.
+            logger.error(
+                "iMessage terminal receipt failed after send error=%s",
+                type(exc).__name__,
+            )
+            _imessage_metrics.record_error("inbox_state_after_send_failed")
             try:
-                logger.info("🧠 Querying Primary Engine (DeepSeek)...")
-                reply = execute_deepseek_call(text, deepseek_sys_instruction)
-            except Exception as deepseek_err:
-                logger.error(
-                    "❌ DeepSeek Primary Layer Fault: %s. Switching to Backup Protocol...",
-                    str(deepseek_err),
+                _IMESSAGE_STATE.mark_terminal(
+                    unit.message_ids,
+                    "completion_unknown",
+                    outcome="sent_receipt_unavailable",
                 )
-                reply = None
+            except Exception:
+                pass
+        _imessage_metrics.record_response(unit.category, elapsed_ms)
+    else:
+        try:
+            _IMESSAGE_STATE.mark_terminal(
+                unit.message_ids,
+                "failed",
+                outcome="outbound_send_failed",
+                detail=_IMESSAGE_RUNNER.last_error_category or "applescript_error",
+            )
+        except Exception as exc:
+            logger.error(
+                "iMessage failure receipt could not be persisted error=%s",
+                type(exc).__name__,
+            )
+        _imessage_metrics.record_error("outbound_send_failed")
 
-            # ========== PHASE 2: OPENAI FALLBACK ==========
-            if not reply:
+
+def _start_slow_ack_timer(
+    unit: ProcessingUnit,
+) -> tuple[threading.Timer, threading.Event, Any]:
+    finished = threading.Event()
+    send_gate = threading.Lock()
+
+    def send_ack() -> None:
+        with send_gate:
+            if finished.is_set() or _is_superseded(unit):
+                return
+            run_local_applescript_send(
+                unit.sender,
+                "Working on that now. I'll send the result when it finishes.",
+            )
+
+    timer = threading.Timer(IMESSAGE_SLOW_ACK_SECONDS, send_ack)
+    timer.name = f"ivy-imessage-ack-{unit.newest_message_id}"
+    timer.daemon = True
+    timer.start()
+    return timer, finished, send_gate
+
+
+def _stop_slow_ack_timer(
+    timer: Optional[threading.Timer],
+    finished: Optional[threading.Event],
+    send_gate: Optional[Any],
+) -> None:
+    """Prevent an acknowledgement from being sent after the final reply."""
+    if finished is not None:
+        finished.set()
+    if timer is not None:
+        timer.cancel()
+    # If the callback already passed its event check, wait until it has either
+    # sent its acknowledgement or observed completion before sending final text.
+    if send_gate is not None:
+        with send_gate:
+            pass
+
+
+def _process_imessage_unit(unit: ProcessingUnit) -> None:
+    if not _IMESSAGE_STATE.mark_processing(unit.message_ids, unit.category):
+        return
+    if _is_superseded(unit):
+        _IMESSAGE_STATE.mark_terminal(
+            unit.message_ids,
+            "superseded",
+            outcome="superseded_before_processing",
+        )
+        return
+
+    timer: Optional[threading.Timer] = None
+    ack_finished: Optional[threading.Event] = None
+    ack_send_gate: Optional[Any] = None
+    _IMESSAGE_TOOL_CONTEXT.mutation_started = False
+    try:
+        if unit.category.startswith("ops_") or unit.category == "operations":
+            reply = _operations_reply(unit)
+        elif unit.category == "resend":
+            reply = handle_resend_command(unit.text, unit.sender)
+        elif unit.category == "job":
+            reply = handle_job_command(unit.text, unit.sender)
+        else:
+            timer, ack_finished, ack_send_gate = _start_slow_ack_timer(unit)
+            reply = _conversation_reply(unit.text)
+
+        if not reply:
+            raise RuntimeError("handler produced no reply")
+        _stop_slow_ack_timer(timer, ack_finished, ack_send_gate)
+        timer = None
+        ack_finished = None
+        ack_send_gate = None
+        _send_unit_reply(
+            unit,
+            str(reply),
+            allow_supersession=not bool(
+                getattr(_IMESSAGE_TOOL_CONTEXT, "mutation_started", False)
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "iMessage processing failed category=%s error=%s",
+            unit.category,
+            type(exc).__name__,
+        )
+        _imessage_metrics.record_error(f"handler:{unit.category}")
+        _send_unit_reply(
+            unit,
+            "I couldn't complete that request. Please try again.",
+            outcome="handler_failed",
+            terminal_status="failed",
+            allow_supersession=not bool(
+                getattr(_IMESSAGE_TOOL_CONTEXT, "mutation_started", False)
+            ),
+        )
+    finally:
+        _stop_slow_ack_timer(timer, ack_finished, ack_send_gate)
+        _IMESSAGE_TOOL_CONTEXT.mutation_started = False
+        _update_imessage_queue_metrics()
+
+
+def _enqueue_slow_unit(unit: ProcessingUnit) -> None:
+    while not _IMESSAGE_STOP_EVENT.is_set():
+        try:
+            _IMESSAGE_SLOW_QUEUE.put(
+                unit,
+                timeout=IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS,
+            )
+            _update_imessage_queue_metrics()
+            return
+        except queue.Full:
+            _imessage_metrics.record_error("slow_queue_full")
+    # Durable status remains queued and can be rehydrated on restart.
+
+
+def _imessage_dispatcher_worker() -> None:
+    """Debounce by sender and keep deterministic status work off the slow lane."""
+    _imessage_metrics.set_thread_state("dispatcher", True)
+    pending: Dict[str, tuple[List[InboundMessage], str, float]] = {}
+
+    def flush(sender: str) -> None:
+        entry = pending.pop(sender, None)
+        if not entry:
+            return
+        messages, _group, _deadline = entry
+        unit = coalesce_imessage_messages(messages)
+        _IMESSAGE_STATE.update_category(unit.message_ids, unit.category)
+        if unit.category.startswith("ops_") or unit.category == "operations":
+            _process_imessage_unit(unit)
+        else:
+            _enqueue_slow_unit(unit)
+
+    try:
+        while not _IMESSAGE_STOP_EVENT.is_set() or not _IMESSAGE_INBOX_QUEUE.empty():
+            now = time.monotonic()
+            for sender, (_messages, _group, deadline) in list(pending.items()):
+                if deadline <= now:
+                    flush(sender)
+
+            next_deadline = min((entry[2] for entry in pending.values()), default=now + 0.2)
+            timeout = max(0.01, min(0.2, next_deadline - now))
+            try:
+                message = _IMESSAGE_INBOX_QUEUE.get(timeout=timeout)
+            except queue.Empty:
+                continue
+
+            try:
+                category = classify_imessage_text(message.text)
+                group = (
+                    "operations" if category.startswith("ops_")
+                    else category
+                )
+                if category in {"job", "resend"}:
+                    flush(message.sender)
+                    unit = coalesce_imessage_messages([message])
+                    _IMESSAGE_STATE.update_category(unit.message_ids, unit.category)
+                    if category == "job":
+                        # Dispatching a registered job is deterministic and
+                        # bounded; do not strand it behind a slow provider.
+                        _process_imessage_unit(unit)
+                    else:
+                        _enqueue_slow_unit(unit)
+                    continue
+
+                existing = pending.get(message.sender)
+                if existing and existing[1] != group:
+                    flush(message.sender)
+                    existing = None
+                messages = list(existing[0]) if existing else []
+                messages.append(message)
+                pending[message.sender] = (
+                    messages,
+                    group,
+                    time.monotonic() + IMESSAGE_DEBOUNCE_SECONDS,
+                )
+            finally:
+                _IMESSAGE_INBOX_QUEUE.task_done()
+                _update_imessage_queue_metrics()
+    finally:
+        for sender in list(pending):
+            flush(sender)
+        _imessage_metrics.set_thread_state("dispatcher", False)
+
+
+def _imessage_slow_worker() -> None:
+    _imessage_metrics.set_thread_state("slow_worker", True)
+    try:
+        while not _IMESSAGE_STOP_EVENT.is_set() or not _IMESSAGE_SLOW_QUEUE.empty():
+            try:
+                unit = _IMESSAGE_SLOW_QUEUE.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                _process_imessage_unit(unit)
+            finally:
+                _IMESSAGE_SLOW_QUEUE.task_done()
+                _update_imessage_queue_metrics()
+    finally:
+        _imessage_metrics.set_thread_state("slow_worker", False)
+
+
+def _enqueue_recovered_messages(message_ids: List[int]) -> List[int]:
+    """Rehydrate queued ROWIDs and return only IDs still awaiting recovery."""
+    for offset in range(0, len(message_ids), 100):
+        chunk = message_ids[offset:offset + 100]
+        rows = safe_fetch_messages_by_ids(chunk)
+        if rows is None:
+            _imessage_metrics.record_error("recovery_chat_db_failed")
+            return message_ids[offset:]
+        rows_by_id = {int(row[0]): row for row in rows}
+        for message_id in chunk:
+            row = rows_by_id.get(int(message_id))
+            if not row:
+                _IMESSAGE_STATE.mark_terminal(
+                    [message_id],
+                    "failed",
+                    outcome="source_row_unavailable_after_restart",
+                )
+                continue
+            msg_id, text, sender = row
+            if not _is_authorized_sender(str(sender)):
+                _IMESSAGE_STATE.mark_terminal([msg_id], "blocked", outcome="unauthorized")
+                continue
+            message = InboundMessage(
+                message_id=int(msg_id),
+                text=str(text),
+                sender=str(sender),
+                collected_monotonic=time.monotonic(),
+            )
+            while not _IMESSAGE_STOP_EVENT.is_set():
                 try:
-                    logger.info("🛡️ Primary Engine Offline. Engaging OpenAI Fallback...")
-                    reply = execute_openai_call(text, deepseek_sys_instruction)
-                except Exception as openai_err:
-                    logger.error(
-                        "❌ OpenAI Fallback Layer Fault: %s. Engaging Secondary Backup (Gemini)...",
-                        str(openai_err),
+                    _IMESSAGE_INBOX_QUEUE.put(
+                        message,
+                        timeout=IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS,
                     )
-                    reply = None
-
-            # ========== PHASE 3: GEMINI BACKUP (WITH CACHING) ==========
-            if not reply:
-                try:
-                    logger.info("🛡️ Primary and Secondary Engines Offline. Engaging Gemini Backup Core...")
-                    reply = _gemini_backup_reply(text)
-                except Exception as gemini_err:
-                    logger.error(
-                        "❌ Gemini Backup Layer Fault: %s\nException type: %s\nFull traceback: %s.",
-                        str(gemini_err),
-                        type(gemini_err).__name__,
-                        repr(gemini_err),
-                    )
-                    reply = None
-
-            # ========== DISPATCH RESPONSE ==========
-            if reply:
-                logger.info("📤 Clean prose payload dispatched back via local AppleScript link.")
-                run_local_applescript_send(sender, str(reply))
+                    break
+                except queue.Full:
+                    _imessage_metrics.record_error("recovery_queue_full")
             else:
-                # All providers failed — send a friendly message instead of exposing internal errors
-                fallback_msg = (
-                    "Ivy's conversation engines are temporarily unavailable. "
-                    "Local commands such as 'Run Sharp Picks' still work."
+                position = offset + chunk.index(message_id)
+                return message_ids[position:]
+            if _category_can_be_superseded(classify_imessage_text(message.text)):
+                with _IMESSAGE_LATEST_LOCK:
+                    _IMESSAGE_LATEST_BY_SENDER[message.sender] = max(
+                        message.message_id,
+                        _IMESSAGE_LATEST_BY_SENDER.get(message.sender, 0),
+                    )
+    return []
+
+
+def _collect_imessage_rows(rows: List[tuple], cursor: int) -> int:
+    """Authorize and reserve one ordered batch, returning the durable cursor."""
+    for row in rows:
+        try:
+            msg_id, text, sender = int(row[0]), str(row[1]), str(row[2])
+        except (IndexError, TypeError, ValueError):
+            _imessage_metrics.record_error("invalid_chat_db_row")
+            continue
+        if msg_id <= cursor:
+            continue
+        if not _IMESSAGE_STATE.reserve(msg_id):
+            cursor = msg_id
+            _IMESSAGE_STATE.advance_cursor(cursor)
+            continue
+        if not _is_authorized_sender(sender):
+            _IMESSAGE_STATE.mark_terminal([msg_id], "blocked", outcome="unauthorized")
+            cursor = msg_id
+            _IMESSAGE_STATE.advance_cursor(cursor)
+            continue
+
+        message = InboundMessage(
+            message_id=msg_id,
+            text=text,
+            sender=sender,
+            collected_monotonic=time.monotonic(),
+        )
+        try:
+            _IMESSAGE_INBOX_QUEUE.put(
+                message,
+                timeout=IMESSAGE_QUEUE_PUT_TIMEOUT_SECONDS,
+            )
+        except queue.Full:
+            _IMESSAGE_STATE.release_reservation(msg_id)
+            _imessage_metrics.record_error("inbox_queue_full")
+            break
+
+        if _category_can_be_superseded(classify_imessage_text(text)):
+            with _IMESSAGE_LATEST_LOCK:
+                _IMESSAGE_LATEST_BY_SENDER[sender] = max(
+                    msg_id,
+                    _IMESSAGE_LATEST_BY_SENDER.get(sender, 0),
                 )
-                logger.warning("❌ Both Primary and Backup layers produced no usable reply. Sending fallback.")
-                run_local_applescript_send(sender, fallback_msg)
+        cursor = msg_id
+        _IMESSAGE_STATE.advance_cursor(cursor)
+    _update_imessage_queue_metrics()
+    return cursor
+
+
+def background_imessage_worker() -> None:
+    """Collect chat.db rows in batches while bounded workers process them."""
+    _IMESSAGE_POLLER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    poller_lock = FileLock(str(_IMESSAGE_POLLER_LOCK_PATH))
+    try:
+        poller_lock.acquire(timeout=0)
+    except FileLockTimeout:
+        _imessage_metrics.record_error("duplicate_poller_instance")
+        logger.error("Another iMessage collector already owns the runtime lock")
+        return
+    except Exception as exc:
+        _imessage_metrics.record_error("poller_lock_failed")
+        logger.error("iMessage runtime lock failed error=%s", type(exc).__name__)
+        return
+
+    dispatcher: Optional[threading.Thread] = None
+    slow_worker: Optional[threading.Thread] = None
+    _imessage_metrics.set_thread_state("collector", True)
+    try:
+        current_max = get_last_message_id()
+        if current_max is None:
+            _imessage_metrics.record_error("chat_db_unavailable")
+            logger.error("Cannot initialize iMessage collection; chat.db is unavailable")
+            return
+
+        cursor = _IMESSAGE_STATE.initialize_cursor(current_max)
+        if cursor > current_max:
+            # Messages replaced/rotated chat.db and ROWIDs restarted.  Start at
+            # the new high-water mark rather than remaining permanently stuck.
+            cursor = current_max
+            _IMESSAGE_STATE.reset_cursor(cursor)
+            _imessage_metrics.record_error("chat_db_rowid_reset")
+
+        dispatcher = threading.Thread(
+            target=_imessage_dispatcher_worker,
+            name="ivy-imessage-dispatcher",
+            daemon=True,
+        )
+        slow_worker = threading.Thread(
+            target=_imessage_slow_worker,
+            name="ivy-imessage-processor",
+            daemon=True,
+        )
+        dispatcher.start()
+        slow_worker.start()
+
+        recovery_ids = _IMESSAGE_STATE.recover_after_restart()
+        while recovery_ids and not _IMESSAGE_STOP_EVENT.is_set():
+            recovery_ids = _enqueue_recovered_messages(recovery_ids)
+            if not recovery_ids:
+                break
+            _IMESSAGE_STOP_EVENT.wait(_db_retry_backoff(0))
+        last_prune = time.monotonic()
+        consecutive_failures = 0
+
+        while not _IMESSAGE_STOP_EVENT.wait(POLLING_INTERVAL):
+            rows = safe_fetch_new_messages(cursor, IMESSAGE_FETCH_BATCH_SIZE)
+            if rows is None:
+                consecutive_failures += 1
+                _imessage_metrics.record_error("chat_db_poll_failed")
+                _IMESSAGE_STOP_EVENT.wait(min(30.0, 2 ** min(consecutive_failures, 5)))
+                continue
 
             consecutive_failures = 0
-
-        except Exception as database_err:
-            consecutive_failures += 1
-            logger.error("❌ Database polling loop exception: %s", str(database_err))
-            if consecutive_failures >= 5:
-                logger.error(
-                    "Database polling failed 5 times. Exiting worker to prevent cascade failures."
-                )
-                return
-            time.sleep(2 ** consecutive_failures)  # Exponential backoff
+            _imessage_metrics.record_poll()
+            cursor = _collect_imessage_rows(rows, cursor)
+            if time.monotonic() - last_prune >= 3600:
+                _IMESSAGE_STATE.prune_terminal()
+                last_prune = time.monotonic()
+    except Exception as exc:
+        _imessage_metrics.record_error("collector_unhandled_error")
+        logger.error("iMessage collector stopped error=%s", type(exc).__name__)
+    finally:
+        _IMESSAGE_STOP_EVENT.set()
+        for thread in (dispatcher, slow_worker):
+            if thread is not None:
+                thread.join(timeout=IMESSAGE_WORKER_JOIN_TIMEOUT_SECONDS)
+        _imessage_metrics.set_thread_state("collector", False)
+        poller_lock.release()
 
 
 # ============================================================================
@@ -2233,21 +3061,11 @@ def background_imessage_worker() -> None:
 
 @app.get("/health")
 def health_endpoint(authenticated: bool = Depends(verify_api_key)):
-    """Liveness check with per-provider auth status.
-
-    Reports configured/authenticated/reachable for each LLM provider so the
-    difference between a missing key and a rejected key is always visible.
-    Results are cached for 60 s to avoid hammering external APIs on every poll.
-    """
-    providers = probe_providers()
+    """Pure process-liveness check; never waits on an external provider."""
     return {
         "status": "ok",
-        "providers": providers,
-        "tools": compute_tool_statuses(),
-        "caching": {
-            "enabled": ENABLE_PROMPT_CACHING and CACHING_AVAILABLE,
-            "cache_ttl_seconds": 3600 if ENABLE_PROMPT_CACHING else None,
-        },
+        "pid": os.getpid(),
+        "uptime_seconds": get_imessage_runtime_snapshot()["uptime_seconds"],
     }
 
 
@@ -2275,24 +3093,43 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     """
     checks: Dict[str, Any] = {
         "chat_db_readable": os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK),
+        "messages_runtime_available": (
+            sys.platform == "darwin" and _shutil.which("osascript") is not None
+        ),
     }
     try:
-        receipts.list_recent(limit=1)
+        # Readiness is a read-only observation.  Watchdog reconciliation runs
+        # in job dispatch/status flows, not inside a monitoring GET.
+        receipts.list_recent(limit=1, reconcile=False)
         checks["receipts_db_writable"] = True
     except Exception as exc:
-        logger.warning("Receipts DB check failed: %s", exc)
+        logger.warning("Receipts DB check failed error=%s", type(exc).__name__)
         checks["receipts_db_writable"] = False
 
-    # Use cached probe result so /ready doesn't trigger a new network call.
-    providers = probe_providers()
+    # Read only the background probe cache; readiness itself never performs
+    # network I/O or waits for a provider.
+    providers = _cached_provider_snapshot()
     any_authenticated = any(p.get("authenticated") for p in providers.values())
     checks["llm_provider_authenticated"] = any_authenticated
+
+    runtime = get_imessage_runtime_snapshot()
+    checks["imessage_worker_ready"] = runtime["ready"]
 
     ready = all(checks.values())
     payload: Dict[str, Any] = {"ready": ready, "checks": checks}
     if not ready:
         raise HTTPException(status_code=503, detail=payload)
     return payload
+
+
+@app.get("/runtime")
+def runtime_endpoint(authenticated: bool = Depends(verify_api_key)):
+    """Authenticated, privacy-minimizing operational metrics snapshot."""
+    return {
+        "imessage": get_imessage_runtime_snapshot(),
+        "providers": _cached_provider_snapshot(),
+        "tools": compute_tool_statuses(),
+    }
 
 
 @app.get("/version")
@@ -2334,15 +3171,56 @@ def list_executions_endpoint(
 ):
     """Recent job execution receipts — the runtime's own record of what was
     actually dispatched, not something a model gets to assert."""
-    return {"executions": receipts.list_recent(limit=limit, job_name=job_name)}
+    return {
+        "executions": [
+            _public_execution_record(record)
+            for record in receipts.list_recent(
+                limit=limit,
+                job_name=job_name,
+                reconcile=False,
+            )
+        ]
+    }
 
 
 @app.get("/executions/{execution_id}")
 def get_execution_endpoint(execution_id: str, authenticated: bool = Depends(verify_api_key)):
-    record = receipts.get_execution(execution_id)
+    record = receipts.get_execution(execution_id, reconcile=False)
     if not record:
         raise HTTPException(status_code=404, detail=f"Execution '{execution_id}' not found")
-    return record
+    return _public_execution_record(record)
+
+
+def _public_execution_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove requester identifiers, raw results, and private paths."""
+    fields = (
+        "execution_id",
+        "job_name",
+        "status",
+        "started_at",
+        "finished_at",
+        "worker_started_at",
+        "heartbeat_at",
+        "updated_at",
+        "pid",
+        "exit_code",
+        "outcome",
+        "delivery_status",
+        "report_ids",
+        "terminal",
+    )
+    public = {field: record.get(field) for field in fields}
+    public["log_name"] = (
+        Path(str(record["log_path"])).name if record.get("log_path") else None
+    )
+    status = record.get("status")
+    if status == "completion_unknown":
+        public["detail"] = "Execution ended without a confirmed terminal result."
+    elif status == "timed_out":
+        public["detail"] = "Execution exceeded its configured runtime limit."
+    elif status in {"failed", "dispatch_failed"}:
+        public["detail"] = "Execution failed; inspect the protected local log."
+    return public
 
 
 def get_capabilities() -> str:
@@ -2418,10 +3296,27 @@ def voice_query(
                 ),
             )
         except Exception as deepseek_err:
-            logger.warning(f"Voice: DeepSeek primary layer fault: {deepseek_err}")
+            logger.warning(
+                "Voice DeepSeek failed error=%s", type(deepseek_err).__name__
+            )
             reply = None
 
-        # ---- Phase 2: Gemini backup (cache-optimized, with tool execution) ----
+        # ---- Phase 2: OpenAI fallback ----
+        if not reply:
+            try:
+                reply = execute_openai_call(
+                    req.query,
+                    DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
+                        current_date_str=datetime.now().strftime("%A, %B %d, %Y")
+                    ),
+                )
+            except Exception as openai_err:
+                logger.warning(
+                    "Voice OpenAI failed error=%s", type(openai_err).__name__
+                )
+                reply = None
+
+        # ---- Phase 3: Gemini backup (cache-optimized, with tool execution) ----
         if not reply:
             try:
                 messages = voice_processor.create_voice_prompt(
@@ -2470,7 +3365,9 @@ def voice_query(
                     else:
                         reply = text_reply.strip() or None
             except Exception as gemini_err:
-                logger.warning(f"Voice: Gemini backup layer fault: {gemini_err}")
+                logger.warning(
+                    "Voice Gemini failed error=%s", type(gemini_err).__name__
+                )
                 reply = None
 
         if not reply:
@@ -2489,9 +3386,9 @@ def voice_query(
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Voice query error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error("Voice query failed error=%s", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Voice request failed") from exc
 
 
 @app.post("/voice/session")
@@ -2600,10 +3497,13 @@ def run_job_endpoint(
             detail="Job runner not available"
         )
 
-    result = run_job(job_name)
+    dispatch = job_runner.run_job_detailed(job_name, force=True)
     return {
-        "job": job_name,
-        "result": result
+        "job": dispatch.canonical_job_name,
+        "result": dispatch.message,
+        "dispatch_status": dispatch.status.value,
+        "lifecycle_status": dispatch.lifecycle_status,
+        "execution_id": dispatch.execution_id,
     }
 
 

@@ -99,7 +99,7 @@ def sync_canonical_snapshot() -> Dict:
             "summary_status": summary_result.get("status", "error"),
         }
     except Exception as exc:
-        logger.error("sync_canonical_snapshot failed: %s", exc)
+        logger.error("sync_canonical_snapshot failed error=%s", type(exc).__name__)
         return {"status": "error", "reason": "unexpected_exception"}
     finally:
         lock.release()

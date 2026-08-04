@@ -2,19 +2,22 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Replaces the old com.ivy.weeklyplanner label, which pointed at
-         proactive_agents/weekly_planner.py — a file that has never existed
-         in any committed branch, so this schedule never actually ran
-         anything. Points at the real, working Familia_meal_planner.py.
-         --scheduled preserves the 48-hour gate; --send actually delivers. -->
+    <!-- The receipt-aware worker owns the full scheduled execution lifecycle.
+         Omitting the force flag preserves Familia's 48-hour duplicate gate;
+         the send flag keeps the reviewed Sunday schedule as a real delivery. -->
     <key>Label</key>
     <string>com.ivy.familia_meal_planner</string>
     <key>ProgramArguments</key>
     <array>
         <string>__VENV_PYTHON__</string>
         <string>-m</string>
-        <string>proactive_agents.Familia_meal_planner</string>
-        <string>--scheduled</string>
+        <string>ivy_core.job_worker</string>
+        <string>--job-name</string>
+        <string>familia_meal_planner</string>
+        <string>--entrypoint</string>
+        <string>proactive_agents.Familia_meal_planner:run</string>
+        <string>--timeout-seconds</string>
+        <string>1800</string>
         <string>--send</string>
     </array>
     <key>WorkingDirectory</key>

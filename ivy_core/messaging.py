@@ -13,12 +13,13 @@ import time
 import uuid
 from typing import Optional
 
+from config import IMESSAGE_SEND_TIMEOUT_SECONDS
 from utils.applescript import AppleScriptRunner
 from ivy_core.report_fallback import AttachmentDeliveryReceipt
 
 logger = logging.getLogger("ivy.messaging")
 
-_runner = AppleScriptRunner()
+_runner = AppleScriptRunner(timeout=IMESSAGE_SEND_TIMEOUT_SECONDS)
 
 # Messages.app is sandboxed and silently refuses (chat.db error 25, never sent)
 # to attach AppleScript-supplied files from most of the home dir — including
@@ -36,7 +37,7 @@ def send_imessage(phone_number: str, message_text: str) -> bool:
     result = _runner.send_imessage_argv(phone_number, message_text)
     if result == "SUCCESS":
         return True
-    logger.warning("send_imessage failed for %s: %s", phone_number, result)
+    logger.warning("send_imessage failed category=%s", _runner.last_error_category or "unknown")
     return False
 
 
@@ -68,7 +69,7 @@ def send_imessage_attachment(
     file_size = 0
 
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-        logger.warning("Attachment missing or empty: %s", file_path)
+        logger.warning("Attachment missing or empty")
         return AttachmentDeliveryReceipt.make_failed(
             report_id=report_id,
             attachment_path=file_path,
@@ -82,17 +83,26 @@ def send_imessage_attachment(
     file_size = os.path.getsize(file_path)
 
     if caption and not send_imessage(phone_number, caption):
-        logger.warning("Caption failed to send before attachment for %s", phone_number)
+        logger.warning("Caption failed to send before attachment")
 
     staged = file_path
     try:
-        os.makedirs(_IMSG_ATTACH_STAGE, exist_ok=True)
-        staged = os.path.join(_IMSG_ATTACH_STAGE, os.path.basename(file_path))
+        # Never reuse a basename here. Two jobs can legitimately generate
+        # `report.pdf` at the same time; a shared staged filename could make
+        # Messages paste one recipient's report into another conversation.
+        os.makedirs(_IMSG_ATTACH_STAGE, mode=0o700, exist_ok=True)
+        os.chmod(_IMSG_ATTACH_STAGE, 0o700)
+        staged = os.path.join(
+            _IMSG_ATTACH_STAGE,
+            f"{uuid.uuid4().hex}-{os.path.basename(file_path)}",
+        )
         shutil.copyfile(file_path, staged)
-        logger.info("Staged attachment for delivery: %s → %s", file_path, staged)
+        os.chmod(staged, 0o600)
+        logger.info("Staged attachment for delivery")
     except OSError as exc:
         logger.warning(
-            "Could not stage attachment into ~/Pictures (%s); sending from source.", exc
+            "Could not stage attachment; sending from source error=%s",
+            type(exc).__name__,
         )
         staged = file_path
 
@@ -108,7 +118,7 @@ def send_imessage_attachment(
         if last_result == "SUCCESS":
             # AppleScript UI automation completed. We cannot independently
             # verify phone delivery from Python, so we mark as unverified.
-            logger.info("send_imessage_attachment submitted (attempt %d): %s", attempt, phone_number)
+            logger.info("send_imessage_attachment submitted attempt=%d", attempt)
             return AttachmentDeliveryReceipt.make_unverified(
                 report_id=report_id,
                 attachment_path=file_path,
@@ -119,8 +129,10 @@ def send_imessage_attachment(
             )
 
         logger.warning(
-            "send_imessage_attachment attempt %d/%d failed for %s: %s",
-            attempt, _MAX_ATTEMPTS, phone_number, last_result,
+            "send_imessage_attachment attempt=%d/%d failed category=%s",
+            attempt,
+            _MAX_ATTEMPTS,
+            _runner.last_error_category or "unknown",
         )
 
     # All attempts exhausted.

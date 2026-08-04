@@ -12,24 +12,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install -r requirements-dev.lock
 
       - name: Repository hygiene + compile + lint + security + tests
         run: ./scripts/check_hygiene.sh
 
       - name: detect-secrets (pre-commit hook against baseline)
-        run: |
-          pip install pre-commit -q
-          pre-commit run detect-secrets --all-files --show-diff-on-failure
+        run: pre-commit run detect-secrets --all-files --show-diff-on-failure
 
       - name: Protect secrets baseline from silent modification
         if: github.event_name == 'pull_request'
@@ -45,3 +43,31 @@ jobs:
             exit 1
           fi
           echo "Baseline unchanged — no manual review required."
+
+  macos-safety:
+    name: macOS osascript + launchd safety
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      PYTEST_MACOS_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.lock
+
+      - name: Run the safe real-osascript argv test
+        run: >-
+          python -m pytest -v -rs
+          tests/test_ivy_core.py::test_argv_round_trip_with_tricky_characters_real_osascript
+
+      - name: Validate launchd templates and rendered plists
+        run: |
+          plutil -lint deploy/launchd/*.plist.template
+          ./deploy/install_launchd.sh --validate-only

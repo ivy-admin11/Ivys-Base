@@ -68,7 +68,11 @@ def _request_odds_api(path: str, params: Dict) -> Optional[list]:
             timeout=12,
         )
     except requests.exceptions.RequestException as exc:
-        logger.warning("Odds API request failed (%s): %s", path, exc)
+        logger.warning(
+            "Odds API request failed endpoint=%s error=%s",
+            path,
+            type(exc).__name__,
+        )
         return None
 
     if resp.status_code in (401, 403):
@@ -89,7 +93,7 @@ def get_completed_games(hours_back: int = 48) -> list:
     try:
         sports = _request_odds_api("/sports", {})
     except OddsApiAuthenticationError as exc:
-        logger.error("Odds API authentication failed: %s", exc)
+        logger.error("Odds API authentication failed error=%s", type(exc).__name__)
         return []
     if not sports:
         return []
@@ -102,7 +106,9 @@ def get_completed_games(hours_back: int = 48) -> list:
         try:
             games = _request_odds_api(f"/sports/{sport_key}/scores", {"daysFrom": 3}) or []
         except OddsApiAuthenticationError as exc:
-            logger.error("Odds API authentication failed: %s", exc)
+            logger.error(
+                "Odds API authentication failed error=%s", type(exc).__name__
+            )
             return completed_games
         for game in games:
             if game.get("completed"):
