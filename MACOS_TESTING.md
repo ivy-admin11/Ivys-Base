@@ -1,125 +1,105 @@
-# macOS Messages Integration Testing
+# macOS integration and production smoke testing
 
-This guide explains how to run macOS Messages integration tests locally on an iMac.
+Ivy has two deliberately separate macOS test layers:
 
-## Overview
+1. Hosted GitHub Actions proves that real `osascript` preserves hostile/tricky argv content and that every launchd template renders as a valid plist.
+2. A trusted, signed-in production Mac proves local permissions, Messages.app access, launchd state, provider readiness, and—only after a human confirmation—one live delivery.
 
-By default, tests that interact with macOS Messages.app via AppleScript are **skipped** both in CI and local development. They require:
-- macOS (Darwin platform)
-- Messages.app (Apple's default iMessage client)
-- `osascript` command-line tool
+## What hosted macOS CI runs
 
-These tests are opt-in to keep CI fast and to prevent failures in non-macOS environments.
+The `macos-safety` job in `.github/workflows/ci.yml` sets `PYTEST_MACOS_INTEGRATION=1` and runs:
 
-## Running macOS Integration Tests Locally
+```bash
+python -m pytest -v \
+  tests/test_ivy_core.py::test_argv_round_trip_with_tricky_characters_real_osascript
+plutil -lint deploy/launchd/*.plist.template
+./deploy/install_launchd.sh --validate-only
+```
 
-### Option 1: Run Only macOS Integration Tests
+The pytest case invokes the real system `osascript`, but its static AppleScript only joins two argv values and returns them. It never opens or addresses Messages.app. CI also uses placeholder contact/provider values, and no CI step passes `--live-delivery`.
+
+Hosted runners cannot prove any of the following:
+
+- that Messages.app is signed into the production Apple ID;
+- that the production user has Automation, Accessibility, or Full Disk Access permissions;
+- that `~/Library/Messages/chat.db` is readable by the launchd process;
+- that the production user's LaunchAgents are loaded or scheduled correctly;
+- that provider credentials authenticate or external APIs are reachable from production;
+- that a real iMessage reaches a destination device.
+
+A green hosted-macOS job is therefore a safe platform compatibility signal, not production certification.
+
+## Local integration test
+
+On a trusted Mac with the development dependencies installed:
 
 ```bash
 export PYTEST_MACOS_INTEGRATION=1
-pytest -v -m macos_integration
+python -m pytest -v -m macos_integration
 ```
 
-This runs **only** the tests marked with `@pytest.mark.macos_integration`.
-
-### Option 2: Run All Tests (Including macOS Integration)
+Or run only the real-osascript round-trip test:
 
 ```bash
 export PYTEST_MACOS_INTEGRATION=1
-pytest -v
+python -m pytest -v \
+  tests/test_ivy_core.py::test_argv_round_trip_with_tricky_characters_real_osascript
 ```
 
-This runs the entire test suite, including macOS integration tests.
+This test remains non-delivering.
 
-### Option 3: Run a Specific macOS Integration Test
+## Production Mac smoke test
+
+The default smoke test validates runtime prerequisites, renders and validates all launchd plists, diffs installed plists without writing them, and executes a safe real-osascript argv round trip:
 
 ```bash
-export PYTEST_MACOS_INTEGRATION=1
-pytest -v tests/test_ivy_core.py::test_argv_round_trip_with_tricky_characters_real_osascript
+./scripts/production_smoke_test.sh
 ```
 
-## Local Smoke Tests (iMac Only)
-
-For manual testing of the actual iMessage sending functionality, follow these steps:
-
-### Smoke Test 1: Send a Text Message
+To include authenticated local `/health`, `/ready`, and `/version` probes:
 
 ```bash
-python3 << 'EOF'
-import sys
-sys.path.insert(0, '/path/to/Ivys-Base')
-
-from ivy_core.messaging import send_imessage
-
-# Replace with a real phone number on your iMessage contact list
-result = send_imessage("+1-XXX-XXX-XXXX", "Test message from automated script")
-print(f"Result: {result}")
-EOF
+./scripts/production_smoke_test.sh --check-running
 ```
 
-Expected: Messages.app should receive the message in the specified conversation thread.
+The monitor reads `ADMIN_SECRET` without sourcing `.env`, supplies it to `curl` through a private temporary config file, and refuses non-loopback URLs.
 
-### Smoke Test 2: Send a PDF Attachment
+## Explicit live-delivery test
+
+Only an operator on the production Mac should run this:
 
 ```bash
-python3 << 'EOF'
-import sys
-sys.path.insert(0, '/path/to/Ivys-Base')
-
-from ivy_core.messaging import send_imessage_attachment
-from pathlib import Path
-
-# Create a minimal PDF for testing
-pdf_path = Path("/tmp/test_attachment.pdf")
-pdf_path.write_bytes(b"%PDF-1.4\n1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\nxref\ntrailer\n<</Size 2 /Root 1 0 R>>\n%%EOF")
-
-# Replace with a real phone number on your iMessage contact list
-receipt = send_imessage_attachment("+1-XXX-XXX-XXXX", str(pdf_path), caption="Test PDF")
-print(f"Receipt status: {receipt.status}")
-print(f"Delivery: {'✓' if receipt else '✗'}")
-EOF
+./scripts/production_smoke_test.sh \
+  --check-running \
+  --live-delivery \
+  --recipient '+1XXXXXXXXXX'
 ```
 
-Expected: Messages.app should receive the PDF in the specified conversation thread.
+The script will not send unless all of these are true:
 
-### Smoke Test 3: Run the Integration Test Suite
+- `--live-delivery` was supplied;
+- a recipient was supplied explicitly;
+- an interactive terminal is available;
+- the operator types the exact phrase `SEND IVY SMOKE MESSAGE`.
+
+There is no noninteractive confirmation flag. Test automation must never invoke this mode.
+
+## Production permission checks
+
+In System Settings, confirm the account that owns the LaunchAgent has the required privacy grants. After changing a grant, restart the gateway and rerun the authenticated smoke test. A shell granted Full Disk Access does not automatically grant the same access to a separate launchd-launched Python process.
+
+Useful read-only checks:
 
 ```bash
-export PYTEST_MACOS_INTEGRATION=1
-pytest -v -m macos_integration
+test -r "$HOME/Library/Messages/chat.db"
+launchctl print "gui/$(id -u)/com.ivy.gateway"
+./scripts/monitor_ivy.sh
 ```
-
-This runs all tests marked as `macos_integration`, which currently includes:
-- `test_argv_round_trip_with_tricky_characters_real_osascript` — verifies AppleScript argv escaping with real `osascript`
-
-## Notes
-
-- **CI Always Skips These Tests**: The GitHub Actions CI runner sets `PYTEST_MACOS_INTEGRATION=0` (or unset), so macOS integration tests are never run in CI.
-- **Mocking in Tests**: Most unit tests mock the `AppleScriptRunner` via `unittest.mock.patch`, so they work everywhere.
-- **Security**: AppleScript arguments are passed via process argv, not interpolated into source code, preventing string-literal injection attacks.
-- **Staging Directory**: Attachments are staged in `~/Pictures/.ivy_outbound/` because Messages.app's sandbox rejects files from most home directories (verified 2026-06-29).
 
 ## Troubleshooting
 
-### "osascript: command not found"
-
-You're not on macOS, or `osascript` is not in your PATH. These tests require macOS.
-
-### "Message not received"
-
-Check that:
-1. The phone number is in your iMessage contacts
-2. Messages.app is not in Do Not Disturb mode
-3. The iMessage service is available and signed in
-4. The recipient is also using iMessage
-
-### Attachment Fails with "FILE_MISSING"
-
-Ensure the PDF file path is absolute and the file exists and is non-empty.
-
-## CI Behavior
-
-The GitHub Actions workflow explicitly sets `PYTEST_MACOS_INTEGRATION=0`, so the `pytest_configure` hook in `conftest.py` removes the `macos_integration` marker from the test run. This ensures:
-- CI completes quickly
-- CI doesn't require macOS infrastructure
-- No false positives from mocked osascript calls
+- `osascript: command not found`: the test is not running on macOS or the system executable is unavailable.
+- plist validation failure: do not install anything; fix the corresponding template and rerun `./deploy/install_launchd.sh --validate-only`.
+- `401` from a probe: confirm `ADMIN_SECRET` in the production `.env`; never paste the value into a command or ticket.
+- `/ready` returns `503`: inspect the readiness checks. Typical causes are unreadable `chat.db`, an unwritable receipts database, or no authenticated LLM provider.
+- a live smoke returns success but the device receives nothing: AppleScript success is not end-to-end delivery proof. Check Messages.app sign-in, the destination address, network state, and the destination device before retrying to avoid duplicates.

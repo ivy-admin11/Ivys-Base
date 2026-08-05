@@ -1,8 +1,41 @@
 import os
-import subprocess
 import time
 from datetime import datetime
 from playwright.sync_api import sync_playwright
+from config import APPLE_CALENDAR_TIMEOUT_SECONDS, IMESSAGE_SEND_TIMEOUT_SECONDS
+from utils.applescript import AppleScriptRunner
+
+
+_CALENDAR_RUNNER = AppleScriptRunner(timeout=APPLE_CALENDAR_TIMEOUT_SECONDS)
+_MESSAGE_RUNNER = AppleScriptRunner(timeout=IMESSAGE_SEND_TIMEOUT_SECONDS)
+
+_TODAY_CALENDAR_SCRIPT = """
+on run argv
+    set calendarNameValue to item 1 of argv
+    set todayStart to (current date)
+    set hours of todayStart to 0
+    set minutes of todayStart to 0
+    set seconds of todayStart to 0
+    set todayEnd to todayStart + (24 * 60 * 60)
+    set eventList to {}
+    tell application "Calendar"
+        try
+            set targetCalendar to first calendar whose name is calendarNameValue
+            set todayEvents to (every event of targetCalendar whose start date is greater than or equal to todayStart and start date is less than todayEnd)
+            repeat with calendarEvent in todayEvents
+                copy summary of calendarEvent to end of eventList
+            end repeat
+            set previousDelimiters to AppleScript's text item delimiters
+            set AppleScript's text item delimiters to linefeed
+            set renderedEvents to eventList as text
+            set AppleScript's text item delimiters to previousDelimiters
+            return renderedEvents
+        on error
+            return "ERROR: APPLESCRIPT_FAILURE"
+        end try
+    end tell
+end run
+"""
 
 # Core household meal & grocery matrix
 MEAL_POOL = [
@@ -21,23 +54,8 @@ GROCERY_MAPPING = {
 
 def get_calendar_summary():
     """Extracts today's schedule from Apple Calendar."""
-    script = '''
-    tell application "Calendar"
-        set todayStart to (current date)
-        set hours of todayStart to 0; set minutes of todayStart to 0; set seconds of todayStart to 0
-        set todayEnd to todayStart + (24 * 60 * 60)
-        set eventList to {}
-        tell calendar "Calendar"
-            set todayEvents to (every event whose start date is greater than or equal to todayStart and start date is less than todayEnd)
-            repeat with idx from 1 to count of todayEvents
-                copy summary of item idx of todayEvents to end of eventList
-            </repeat with>
-        end tell
-        return eventList
-    end tell
-    '''
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip()
+    result = _CALENDAR_RUNNER.run_argv(_TODAY_CALENDAR_SCRIPT, ["Calendar"])
+    return "" if result.startswith("ERROR") else result.strip()
 
 def build_heb_cart(ingredients):
     """Launches your local Chrome profile, logs in via active session cookies, and adds items."""
@@ -74,14 +92,7 @@ def build_heb_cart(ingredients):
         browser_context.close()
 
 def send_iMessage_dispatch(body):
-    script = f'''
-    tell application "Messages"
-        set targetService to first service whose service type is iMessage
-        set targetBuddy to buddy "me" of targetService
-        send "{body}" to targetBuddy
-    end tell
-    '''
-    subprocess.run(["osascript", "-e", script], capture_output=True)
+    return _MESSAGE_RUNNER.send_imessage_argv("me", body)
 
 def main():
     events = get_calendar_summary()

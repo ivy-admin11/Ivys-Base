@@ -102,7 +102,7 @@ def write_snapshot(header: List[str], rows: List[List], tab_name: Optional[str] 
             range=f"'{tab}'!A{clear_from}:{last_col}",
         ).execute()
     except Exception as exc:
-        logger.error("Sheets snapshot write failed for tab %r: %s", tab, exc)
+        logger.error("Sheets snapshot write failed error=%s", type(exc).__name__)
         return {"status": "error", "reason": "sheets_write_failed"}
 
     return {"status": "success", "rows_written": len(rows), "tab": tab}
@@ -139,7 +139,7 @@ def write_summary(header: List[str], rows: List[List], tab_name: Optional[str] =
             range=f"'{tab}'!A{clear_from}:{last_col}",
         ).execute()
     except Exception as exc:
-        logger.error("Sheets summary write failed for tab %r: %s", tab, exc)
+        logger.error("Sheets summary write failed error=%s", type(exc).__name__)
         return {"status": "error", "reason": "sheets_write_failed"}
 
     return {"status": "success", "rows_written": len(rows), "tab": tab}

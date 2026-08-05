@@ -33,6 +33,7 @@ returns no usable picks, run() returns a "no_picks" result without sending
 import hashlib
 import json
 import re
+import tempfile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -634,17 +635,27 @@ def _sweep_chunk(accounts, slate_clause):
             )
             raw_text = response.output_text
     except Exception as e:
-        print(f"⚠️ Grok X Search failed for batch {accounts}: {e}.")
-        return []
+        print(f"⚠️ Grok X Search failed for one batch ({type(e).__name__}).")
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search could not complete the curated account sweep.",
+            cause=e,
+        ) from e
 
     try:
         picks = json.loads(raw_text)
     except json.JSONDecodeError:
-        print(f"⚠️ Grok returned non-JSON output for this batch; treating as empty.\n   Raw: {raw_text[:300]}")
-        return []
+        print("⚠️ Grok returned malformed output for one curated batch.")
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search returned malformed curated-sweep data.",
+        )
 
     if not isinstance(picks, list):
-        return []
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search returned an invalid curated-sweep response.",
+        )
     # Accept either 'side' (new) or 'pick' (legacy) as the wager field.
     cleaned = []
     for p in picks:
@@ -866,7 +877,10 @@ def enrich_picks(merged, games):
             )
             raw = resp.output_text
     except Exception as e:
-        print(f"⚠️ Grok enrichment failed: {e}. Texting picks without enrichment.")
+        print(
+            f"⚠️ Grok enrichment failed ({type(e).__name__}). "
+            "Texting picks without enrichment."
+        )
         return merged
 
     try:
@@ -934,15 +948,25 @@ def _sweep_unrestricted(games):
             )
             raw_text = resp.output_text
     except Exception as e:
-        print(f"⚠️ Unrestricted fallback sweep failed: {e}.")
-        return []
+        print(f"⚠️ Unrestricted fallback sweep failed ({type(e).__name__}).")
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search could not complete the fallback sweep.",
+            cause=e,
+        ) from e
     try:
         picks = json.loads(raw_text)
     except json.JSONDecodeError:
-        print("⚠️ Fallback returned non-JSON; treating as empty.")
-        return []
+        print("⚠️ Fallback returned malformed data.")
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search returned malformed fallback data.",
+        )
     if not isinstance(picks, list):
-        return []
+        raise ProviderUnavailableError(
+            "Grok X Search",
+            "Grok X Search returned an invalid fallback response.",
+        )
     cleaned = []
     for p in picks:
         if isinstance(p, dict):
@@ -960,10 +984,23 @@ SWEEP_RETRY_DELAY = 20  # seconds between attempts
 
 
 def sweep_with_retry(games, attempts=SWEEP_ATTEMPTS, delay=SWEEP_RETRY_DELAY):
-    """Run the X sweep up to `attempts` times; return the first non-empty result."""
+    """Run the X sweep up to `attempts` times; return the first non-empty result.
+
+    Empty, valid responses are distinct from provider failures.  A total Grok
+    outage must reach the pipeline as ``ProviderUnavailableError`` rather than
+    being reported as quiet handicappers and a successful empty slate.
+    """
     picks = []
+    last_error: Optional[ProviderUnavailableError] = None
     for attempt in range(1, attempts + 1):
-        picks = fetch_x_picks(games)
+        try:
+            picks = fetch_x_picks(games)
+        except ProviderUnavailableError as exc:
+            last_error = exc
+            print(f"   ⚠️ Sweep request failed on attempt {attempt}/{attempts}.")
+            if attempt < attempts:
+                time.sleep(delay)
+            continue
         if picks:
             if attempt > 1:
                 print(f"   ✅ Sweep hit on attempt {attempt}/{attempts}.")
@@ -972,7 +1009,12 @@ def sweep_with_retry(games, attempts=SWEEP_ATTEMPTS, delay=SWEEP_RETRY_DELAY):
             print(f"   ↻ Empty sweep {attempt}/{attempts}; retrying in {delay}s...")
             time.sleep(delay)
     print(f"   📭 All {attempts} curated sweep attempts empty — trying open X-search fallback...")
-    fb = _sweep_unrestricted(games)
+    try:
+        fb = _sweep_unrestricted(games)
+    except ProviderUnavailableError as exc:
+        # Preserve the final fallback cause; it is the most direct statement
+        # about the source being unavailable after the curated attempts.
+        raise exc from last_error
     if fb:
         print(f"   ✅ Fallback surfaced {len(fb)} pick(s) from open X search.")
     return fb
@@ -1220,14 +1262,26 @@ def load_last_report():
     except FileNotFoundError:
         return {}
     except Exception as e:
-        print(f"⚠️ Could not read last-report state ({e}); treating as first run.")
+        print(
+            f"⚠️ Could not read last-report state ({type(e).__name__}); "
+            "treating as first run."
+        )
         return {}
 
 
 def save_last_report(signature, message):
-    """Persist the fingerprint + verbatim body of the report just sent."""
+    """Durably reserve a report fingerprint before delivery.
+
+    The reservation is intentionally written before the outbound request.  If
+    delivery becomes ambiguous after Messages accepts the command, rerunning a
+    scheduled job must fail closed rather than duplicate a betting report.
+    """
+    temp_path = None
     try:
-        with open(LAST_REPORT_PATH, "w") as f:
+        state_dir = os.path.dirname(LAST_REPORT_PATH)
+        os.makedirs(state_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".sports_last_report-", dir=state_dir)
+        with os.fdopen(fd, "w") as f:
             json.dump(
                 {
                     "signature": signature,
@@ -1237,8 +1291,61 @@ def save_last_report(signature, message):
                 f,
                 indent=2,
             )
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, LAST_REPORT_PATH)
+        return True
     except Exception as e:
-        print(f"⚠️ Could not persist last-report state: {e}")
+        print(f"⚠️ Could not persist last-report state ({type(e).__name__}).")
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return False
+
+
+def clear_last_report_reservation(signature):
+    """Release a pre-send reservation only after an explicit failed send."""
+    try:
+        current = load_last_report()
+        if current.get("signature") == signature:
+            os.unlink(LAST_REPORT_PATH)
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception as exc:
+        print(f"⚠️ Could not clear last-report reservation ({type(exc).__name__}).")
+        return False
+
+
+def _result_with_delivery(
+    result: PipelineResult,
+    *,
+    delivery_status: str = "not_attempted",
+    deliveries: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Serialize a pipeline result with an explicit delivery contract.
+
+    ``PipelineResult.sent`` is retained for compatibility.  The additional
+    fields distinguish an intentional no-send from a failed attempt and give
+    the detached job observer enough information to report the outcome
+    without guessing.
+    """
+    serialized = result.to_dict()
+    delivery_records = list(deliveries or [])
+    report_ids: List[str] = []
+    if result.report_id:
+        report_ids.append(result.report_id)
+    for delivery in delivery_records:
+        report_id = delivery.get("report_id")
+        if isinstance(report_id, str) and report_id and report_id not in report_ids:
+            report_ids.append(report_id)
+    serialized["delivery_status"] = delivery_status
+    serialized["deliveries"] = delivery_records
+    serialized["report_ids"] = report_ids
+    return serialized
 
 
 def run(
@@ -1273,7 +1380,14 @@ def run(
     except Timeout:
         msg = "Another Sharp Picks execution is already running — skipped to prevent overlap."
         print(f"⏭️  {msg}")
-        return {"result_type": "skipped", "reason": msg}
+        return {
+            "result_type": "skipped",
+            "reason": msg,
+            "sent": False,
+            "delivery_status": "not_attempted",
+            "deliveries": [],
+            "report_ids": [],
+        }
 
     try:
         result = _run_pipeline(force=force, send=send, requester=requester, request_id=request_id)
@@ -1282,7 +1396,9 @@ def run(
             try:
                 result["result_reconciliation"] = result_updater.auto_update_results()
             except Exception as exc:
-                print(f"⚠️ Result reconciliation failed: {exc}")
+                print(
+                    f"⚠️ Result reconciliation failed ({type(exc).__name__})."
+                )
                 result["result_reconciliation"] = {"status": "error", "reason": str(exc)}
         return result
     finally:
@@ -1313,7 +1429,7 @@ def _run_pipeline(
         games = fetch_live_odds()
         odds_source.mark_success(pick_count=len(games))
     except ProviderAuthenticationError as e:
-        print(f"🔴 {e}")
+        print(f"🔴 Odds provider authentication failed ({type(e).__name__}).")
         odds_source.mark_failure(e, status_code=e.status_code)
         result.status = PipelineStatus.AUTH_FAILURE
         result.admin_message = (
@@ -1323,48 +1439,84 @@ def _run_pipeline(
             f"Admin action required: Verify ODDS_API_KEY is current and authorized."
         )
         print(result.admin_message)
-        return result.to_dict()
+        return _result_with_delivery(result)
     except RetryableProviderError as e:
-        print(f"⚠️  {e} — will retry on next scheduled run")
+        print(
+            f"⚠️ Odds provider request is retryable ({type(e).__name__}); "
+            "will retry on next scheduled run."
+        )
         odds_source.mark_failure(e, status_code=e.status_code)
         result.status = PipelineStatus.DEGRADED
         games = []
     except ProviderUnavailableError as e:
-        print(f"⚠️  {e} — temporarily unavailable")
+        print(f"⚠️ Odds provider temporarily unavailable ({type(e).__name__}).")
         odds_source.mark_failure(e)
         result.status = PipelineStatus.DEGRADED
         games = []
     except Exception as e:
-        print(f"🔴 Unexpected error fetching odds: {e}")
+        print(f"🔴 Unexpected odds error ({type(e).__name__}).")
         odds_source.mark_failure(e)
         result.status = PipelineStatus.INTERNAL_ERROR
-        return result.to_dict()
+        return _result_with_delivery(result)
 
     # Sweep for picks (Grok/X search)
     try:
         picks = sweep_with_retry(games)
         grok_source.mark_success(pick_count=len(picks))
-    except Exception as e:
-        print(f"⚠️  Grok X Search failed: {e}")
+    except ProviderUnavailableError as e:
+        print(f"⚠️ Grok X Search failed ({type(e).__name__}).")
         grok_source.mark_failure(e)
-        picks = []
-        # Grok is required, so downgrade status
-        if result.status == PipelineStatus.SUCCESS:
-            result.status = PipelineStatus.UPSTREAM_UNAVAILABLE
+        result.status = PipelineStatus.UPSTREAM_UNAVAILABLE
+        return _result_with_delivery(result)
+    except Exception as e:
+        print(f"⚠️ Grok X Search failed ({type(e).__name__}).")
+        grok_source.mark_failure(e)
+        result.status = PipelineStatus.INTERNAL_ERROR
+        return _result_with_delivery(result)
 
     if not picks:
         print("📭 No active picks pulled from X sweep.")
+        # A source degradation is not evidence that the handicappers are
+        # quiet. Preserve the real partial-provider state and avoid a false
+        # forced no-picks notice.
+        if result.status != PipelineStatus.SUCCESS:
+            return _result_with_delivery(result)
         # On an ad-hoc (forced) request, never fail silently
+        delivery_status = "not_attempted"
+        deliveries: List[Dict[str, Any]] = []
         if force and send:
-            send_imessage(
-                HENRY_PHONE,
-                "🔒 Ivy's Sharp Picks: no bettable picks surfaced right now — the "
-                "handicappers are quiet and the open sweep came up empty. I'll keep "
-                "watching and send them the moment there's a play.",
-            )
-            print("📨 Sent 'no picks' notice to Henry (ad-hoc run).")
+            delivery = {
+                "channel": "imessage_text",
+                "purpose": "no_picks_notice",
+                "status": "unknown",
+            }
+            try:
+                notice_sent = bool(send_imessage(
+                    HENRY_PHONE,
+                    "🔒 Ivy's Sharp Picks: no bettable picks surfaced right now — the "
+                    "handicappers are quiet and the open sweep came up empty. I'll keep "
+                    "watching and send them the moment there's a play.",
+                ))
+                delivery_status = "submitted_unverified" if notice_sent else "failed"
+            except Exception as exc:
+                notice_sent = False
+                delivery_status = "unknown"
+                delivery["error_category"] = type(exc).__name__
+            result.sent = notice_sent
+            delivery["status"] = delivery_status
+            deliveries.append(delivery)
+            if notice_sent:
+                print("📨 Submitted 'no picks' notice to Henry (ad-hoc run).")
+            elif delivery_status == "failed":
+                print("⚠️  'No picks' notice delivery failed (ad-hoc run).")
+            else:
+                print("⚠️  'No picks' notice delivery outcome is unknown (ad-hoc run).")
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        d = result.to_dict()
+        d = _result_with_delivery(
+            result,
+            delivery_status=delivery_status,
+            deliveries=deliveries,
+        )
         d["result_type"] = "no_picks"
         return d
 
@@ -1392,7 +1544,7 @@ def _run_pipeline(
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
-        d = result.to_dict()
+        d = _result_with_delivery(result)
         d["result_type"] = "no_picks"
         return d
 
@@ -1418,7 +1570,7 @@ def _run_pipeline(
     if not force and last.get("signature") == signature:
         print("🔁 Picks unchanged since last report (same fingerprint) — skipping duplicate report.")
         result.status = PipelineStatus.SUCCESS
-        return result.to_dict()
+        return _result_with_delivery(result)
 
     # Generate text-only report
     print("📝 Generating text-only picks report...")
@@ -1434,25 +1586,71 @@ def _run_pipeline(
         print("🧪 send=False — dry run, not sending.")
         result.sent = False
         result.status = PipelineStatus.SUCCESS
-        return result.to_dict()
+        return _result_with_delivery(result)
+
+    # Reserve duplicate suppression before delivery. If this cannot be
+    # persisted, do not send a report that a later scheduled run could repeat.
+    if save_last_report(signature, report_text) is False:
+        result.sent = False
+        result.status = PipelineStatus.INTERNAL_ERROR
+        result.message = "Report not sent because duplicate-suppression state could not be persisted."
+        return _result_with_delivery(result)
 
     # Send text report directly
-    delivered_text = send_imessage(HENRY_PHONE, report_text)
+    delivery = {
+        "channel": "imessage_text",
+        "purpose": "sharp_picks_report",
+        "report_id": report_id,
+        "status": "unknown",
+    }
+    try:
+        delivered_text = bool(send_imessage(HENRY_PHONE, report_text))
+        delivery_status = "submitted_unverified" if delivered_text else "failed"
+    except Exception as exc:
+        delivered_text = False
+        delivery_status = "unknown"
+        delivery["error_category"] = type(exc).__name__
+    delivery["status"] = delivery_status
 
     if delivered_text:
-        save_last_report(signature, report_text)
         print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
         result.sent = True
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent successfully."
-        return result.to_dict()
+        return _result_with_delivery(
+            result,
+            delivery_status=delivery_status,
+            deliveries=[delivery],
+        )
 
-    print("⚠️  Text delivery also failed")
-    print(f"Report ID {report_id} queued for retry")
+    if delivery_status == "failed":
+        print("⚠️  Text delivery also failed")
+    else:
+        print("⚠️  Text delivery outcome is unknown")
+    reservation_cleared = delivery_status == "failed" and clear_last_report_reservation(signature)
     result.sent = False
     result.status = PipelineStatus.INTERNAL_ERROR
-    result.message = f"Report {report_id} failed to send — queued for retry"
-    return result.to_dict()
+    if delivery_status != "failed":
+        # An exception or ambiguous send result may still have reached
+        # Messages. Keep the pre-send reservation so the scheduler cannot
+        # duplicate it; an operator can make an explicit resend decision.
+        result.message = (
+            f"Report {report_id} delivery outcome is unknown; duplicate suppression remains reserved. "
+            "Manual review is required before retrying."
+        )
+    elif not reservation_cleared:
+        result.message = (
+            f"Report {report_id} delivery did not complete and duplicate-suppression "
+            "state could not be cleared. Manual review is required before retrying."
+        )
+    else:
+        print(f"Report ID {report_id} queued for retry")
+        result.message = f"Report {report_id} failed to send — queued for retry"
+    return _result_with_delivery(
+        result,
+        delivery_status=delivery_status,
+        deliveries=[delivery],
+    )
 
 
 if __name__ == "__main__":

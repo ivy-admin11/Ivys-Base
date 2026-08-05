@@ -9,18 +9,58 @@ finishes).
 
 import logging
 import os
+import re
 import subprocess
-import time
+import sys
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from config import JOB_MAX_RUNTIME_SECONDS
 from ivy_core import receipts
 
 logger = logging.getLogger("ivy.jobs")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+# Detached workers must use the same reviewed interpreter as the dispatcher.
+# Production deploys use an immutable SHA-addressed venv, so hard-coding the
+# repository's developer `.venv` would otherwise run jobs outside the release
+# environment (or fail if that developer venv is absent).
+VENV_PYTHON = Path(sys.executable).resolve()
+
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)((?:api[_-]?key|access[_-]?token|token|secret|password)\s*[=:]\s*)[^&\s]+"
+)
+_BEARER_TOKEN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_URL_QUERY = re.compile(r"(https?://[^?\s]+)\?[^\s]+")
+
+
+def _sanitize_failure_detail(value: object, *, limit: int = 500) -> str:
+    text = str(value)
+    text = _SECRET_ASSIGNMENT.sub(r"\1[redacted]", text)
+    text = _BEARER_TOKEN.sub("Bearer [redacted]", text)
+    text = _URL_QUERY.sub(r"\1?[redacted]", text)
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    return text[:limit]
+
+
+def _record_terminal_safely(
+    execution_id: str,
+    status: str,
+    detail: str,
+    **metadata: object,
+) -> bool:
+    try:
+        return receipts.record_finish(execution_id, status, detail, **metadata)
+    except Exception as exc:
+        logger.error(
+            "Could not finalize execution %s as %s (%s)",
+            execution_id,
+            status,
+            type(exc).__name__,
+        )
+        return False
 
 
 class JobStatus(Enum):
@@ -30,6 +70,17 @@ class JobStatus(Enum):
     NOT_FOUND = "not_found"
     UNAVAILABLE = "unavailable"
     ERROR = "error"
+
+
+@dataclass(frozen=True)
+class JobDispatchResult:
+    """Detailed dispatch response for callers that need receipt correlation."""
+
+    status: JobStatus
+    message: str
+    execution_id: Optional[str]
+    lifecycle_status: str
+    canonical_job_name: str
 
 
 class Job:
@@ -47,6 +98,7 @@ class Job:
         schedule: Optional[str] = None,
         available: bool = True,
         unavailable_reason: Optional[str] = None,
+        max_runtime_seconds: int = JOB_MAX_RUNTIME_SECONDS,
     ):
         self.name = name
         self.display_name = display_name
@@ -58,6 +110,9 @@ class Job:
         self.schedule = schedule
         self.available = available
         self.unavailable_reason = unavailable_reason
+        if not 30 <= int(max_runtime_seconds) <= 21600:
+            raise ValueError("max_runtime_seconds must be between 30 and 21600")
+        self.max_runtime_seconds = int(max_runtime_seconds)
 
     def __repr__(self):
         return f"<Job {self.name}: {self.description}>"
@@ -79,6 +134,7 @@ JOB_REGISTRY = [
         target="com.ivy.sharppicks",  # scheduled cadence — still installed via launchd
         entrypoint="proactive_agents.sports_bettor:run",  # ad-hoc requests bypass launchd entirely
         schedule="3x daily at 9am / 3pm / 9pm CT",
+        max_runtime_seconds=3600,
     ),
     Job(
         name="happy_hour",
@@ -91,6 +147,7 @@ JOB_REGISTRY = [
         # deploy/launchd/com.ivy.happy_hour_scout.plist.template sets
         # Weekday=0, which is Sunday in launchd's convention (0/7=Sunday).
         schedule="Sundays 12pm CST",
+        max_runtime_seconds=1800,
     ),
     Job(
         name="bravo_scout",
@@ -122,6 +179,7 @@ JOB_REGISTRY = [
         target="com.ivy.familia_meal_planner",  # new scheduled label — see deploy/launchd/
         entrypoint="proactive_agents.Familia_meal_planner:run",
         schedule="Sundays 8am CST",
+        max_runtime_seconds=1800,
     ),
     Job(
         name="brain",
@@ -173,42 +231,165 @@ class JobRunner:
         send: bool = True,
         requester: Optional[str] = None,
     ) -> Tuple[JobStatus, str]:
+        """Backward-compatible two-value dispatch API.
+
+        ``SUCCESS`` means the dispatch was accepted.  For an entrypoint job the
+        durable receipt remains nonterminal until ``ivy_core.job_worker``
+        records the agent's eventual outcome.
         """
-        Execute a job by name and return status + message. Never fabricates
-        success — a missing plist, a nonexistent entrypoint module, or a
-        nonzero launchctl exit code all come back as an explicit failure.
-        """
-        # Record the receipt under the canonical job name once resolved, not
-        # the raw alias the caller typed — otherwise "picks", "sharppicks",
-        # and "sports picks" would each fragment execution history under a
-        # different job_name for what is really the same job.
+        result = self.run_job_detailed(
+            job_name,
+            force=force,
+            send=send,
+            requester=requester,
+        )
+        return result.status, result.message
+
+    def run_job_detailed(
+        self,
+        job_name: str,
+        *,
+        force: bool = False,
+        send: bool = True,
+        requester: Optional[str] = None,
+    ) -> JobDispatchResult:
+        """Dispatch a job and return its durable execution ID and lifecycle."""
+        receipts.reconcile_stale()
         job = self.find_job(job_name)
-        execution_id = receipts.record_start(job.name if job else job_name, requester=requester)
+        canonical_name = job.name if job else job_name.strip()
+        executor = job.executor if job else None
+        initial_delivery = "not_attempted" if send else "not_requested"
+
+        try:
+            execution_id = receipts.record_start(
+                canonical_name,
+                requester=requester,
+                executor=executor,
+                delivery_status=initial_delivery,
+            )
+        except receipts.ExecutionAlreadyActive as active:
+            try:
+                active_record = (
+                    receipts.get_execution(active.execution_id, reconcile=False) or {}
+                )
+            except Exception:
+                active_record = {}
+            display_name = job.display_name if job else canonical_name
+            return JobDispatchResult(
+                status=JobStatus.ALREADY_RUNNING,
+                message=(
+                    f"{display_name} is already running "
+                    f"(execution {active.execution_id})."
+                ),
+                execution_id=active.execution_id,
+                lifecycle_status=str(active_record.get("status", "running")),
+                canonical_job_name=canonical_name,
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            logger.error("Could not create execution receipt for %s (%s)", canonical_name, error_type)
+            return JobDispatchResult(
+                status=JobStatus.ERROR,
+                message=f"Could not queue {canonical_name} ({error_type}).",
+                execution_id=None,
+                lifecycle_status="dispatch_failed",
+                canonical_job_name=canonical_name,
+            )
 
         if not job:
-            available_names = ", ".join(j.display_name for j in self.registry.values() if j.available)
-            status, message = JobStatus.NOT_FOUND, f"Job '{job_name}' not found. Available jobs: {available_names}"
+            available_names = ", ".join(
+                candidate.display_name
+                for candidate in self.registry.values()
+                if candidate.available
+            )
+            status = JobStatus.NOT_FOUND
+            message = f"Job '{job_name}' not found. Available jobs: {available_names}"
+            lifecycle = "not_found"
+            _record_terminal_safely(
+                execution_id,
+                lifecycle,
+                message,
+                outcome="not_found",
+                delivery_status=initial_delivery,
+            )
         elif not job.available:
-            status, message = JobStatus.UNAVAILABLE, f"{job.display_name} is unavailable: {job.unavailable_reason}"
+            status = JobStatus.UNAVAILABLE
+            message = f"{job.display_name} is unavailable: {job.unavailable_reason}"
+            lifecycle = "unavailable"
+            _record_terminal_safely(
+                execution_id,
+                lifecycle,
+                message,
+                outcome="unavailable",
+                delivery_status=initial_delivery,
+            )
         else:
             try:
                 if job.executor == "entrypoint":
-                    status, message = self._run_entrypoint_job(job, force=force, send=send, requester=requester)
+                    status, message = self._run_entrypoint_job(
+                        job,
+                        force=force,
+                        send=send,
+                        requester=requester,
+                        execution_id=execution_id,
+                    )
+                    lifecycle = "dispatched" if status == JobStatus.SUCCESS else "dispatch_failed"
                 elif job.executor == "launchctl":
                     status, message = self._run_launchctl_job(job)
+                    lifecycle = (
+                        "triggered_unobserved"
+                        if status == JobStatus.SUCCESS
+                        else "unavailable" if status == JobStatus.UNAVAILABLE
+                        else "dispatch_failed"
+                    )
                 elif job.executor == "shell":
                     status, message = self._run_shell_job(job)
+                    lifecycle = (
+                        "triggered_unobserved"
+                        if status == JobStatus.SUCCESS
+                        else "dispatch_failed"
+                    )
                 else:
-                    status, message = JobStatus.ERROR, f"Unknown executor type: {job.executor}"
-            except Exception as e:
-                logger.error(f"Error running job {job.name}: {e}")
-                status, message = JobStatus.ERROR, f"Error running {job.display_name}: {str(e)}"
+                    status = JobStatus.ERROR
+                    message = f"Unknown executor type: {job.executor}"
+                    lifecycle = "dispatch_failed"
+            except Exception as exc:
+                error_type = type(exc).__name__
+                logger.error("Error dispatching %s (%s)", job.name, error_type)
+                status = JobStatus.ERROR
+                message = f"Could not start {job.display_name} ({error_type})."
+                lifecycle = "dispatch_failed"
 
-        # Records the dispatch outcome, not necessarily the detached
-        # subprocess's eventual completion (entrypoint jobs run
-        # independently after being launched — see _run_entrypoint_job).
-        receipts.record_finish(execution_id, status.value, message)
-        return status, message
+            if job.executor != "entrypoint" or status != JobStatus.SUCCESS:
+                delivery = (
+                    "unknown"
+                    if lifecycle == "triggered_unobserved"
+                    else initial_delivery
+                )
+                _record_terminal_safely(
+                    execution_id,
+                    lifecycle,
+                    message,
+                    outcome=lifecycle,
+                    delivery_status=delivery,
+                )
+
+        try:
+            current = receipts.get_execution(execution_id, reconcile=False) or {}
+        except Exception as exc:
+            logger.error(
+                "Could not reload execution %s (%s)",
+                execution_id,
+                type(exc).__name__,
+            )
+            current = {}
+        return JobDispatchResult(
+            status=status,
+            message=message,
+            execution_id=execution_id,
+            lifecycle_status=str(current.get("status", lifecycle)),
+            canonical_job_name=canonical_name,
+        )
 
     def _run_launchctl_job(self, job: Job) -> Tuple[JobStatus, str]:
         """Run a launchd agent, verifying every launchctl call's actual exit
@@ -235,7 +416,9 @@ class JobRunner:
                 timeout=5,
             )
             if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()
+                detail = _sanitize_failure_detail(
+                    (result.stderr or result.stdout or "").strip()
+                )
                 logger.warning("kickstart failed for %s: %s", job.target, detail)
                 return JobStatus.ERROR, f"Could not trigger {job.display_name}: {detail or 'unknown launchctl error'}"
             return JobStatus.SUCCESS, f"✓ {job.display_name} triggered. {job.description}"
@@ -248,7 +431,9 @@ class JobRunner:
             timeout=5,
         )
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
+            detail = _sanitize_failure_detail(
+                (result.stderr or result.stdout or "").strip()
+            )
             logger.warning("bootstrap failed for %s: %s", job.target, detail)
             return JobStatus.ERROR, f"Could not load {job.display_name}: {detail or 'unknown launchctl error'}"
         return JobStatus.SUCCESS, f"✓ {job.display_name} loaded and started. {job.description}"
@@ -260,8 +445,14 @@ class JobRunner:
         force: bool = False,
         send: bool = True,
         requester: Optional[str] = None,
+        execution_id: Optional[str] = None,
     ) -> Tuple[JobStatus, str]:
-        """Run a job as a detached `python -m <module> --force --send`
+        """Run a job through the detached lifecycle-owning worker.
+
+        The dispatcher records only spawn/PID/log metadata.  The worker marks
+        the eventual completed/failed/skipped result.
+
+        Historically this launched ``python -m <agent> --force --send``
         subprocess — no launchd involved, and no launchd job needs to be
         preloaded. Deliberately a subprocess, not an in-process thread: an
         in-process daemon thread would be killed the instant a short-lived
@@ -271,31 +462,76 @@ class JobRunner:
         whichever process requested it.
         """
         if not VENV_PYTHON.exists():
+            if execution_id:
+                _record_terminal_safely(
+                    execution_id,
+                    "dispatch_failed",
+                    "The current Python interpreter was not found.",
+                    outcome="venv_missing",
+                    delivery_status="not_attempted" if send else "not_requested",
+                )
             return JobStatus.ERROR, (
-                f"Could not run {job.display_name}: project venv python not found at {VENV_PYTHON}"
+                f"Could not run {job.display_name}: current Python interpreter was not found"
             )
 
-        module_name = job.entrypoint.split(":", 1)[0]
-        args = [str(VENV_PYTHON), "-m", module_name]
+        if not job.entrypoint or ":" not in job.entrypoint:
+            if execution_id:
+                _record_terminal_safely(
+                    execution_id,
+                    "dispatch_failed",
+                    "Registered entrypoint is invalid.",
+                    outcome="invalid_entrypoint",
+                    delivery_status="not_attempted" if send else "not_requested",
+                )
+            return JobStatus.ERROR, f"Could not run {job.display_name}: invalid entrypoint"
+
+        owns_receipt = execution_id is None
+        if execution_id is None:
+            try:
+                execution_id = receipts.record_start(
+                    job.name,
+                    requester=requester,
+                    executor="entrypoint",
+                    delivery_status="not_attempted" if send else "not_requested",
+                )
+            except receipts.ExecutionAlreadyActive:
+                return JobStatus.ALREADY_RUNNING, f"{job.display_name} is already running."
+
+        args = [
+            str(VENV_PYTHON),
+            "-m",
+            "ivy_core.job_worker",
+            "--execution-id",
+            execution_id,
+            "--job-name",
+            job.name,
+            "--entrypoint",
+            job.entrypoint,
+            "--timeout-seconds",
+            str(job.max_runtime_seconds),
+        ]
         if force:
             args.append("--force")
         if send:
             args.append("--send")
 
         log_dir = PROJECT_ROOT / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{job.name}_adhoc_{int(time.time())}.log"
+        log_path = log_dir / f"{job.name}_adhoc_{execution_id}.log"
 
         env = dict(os.environ)
         env["PYTHONPATH"] = str(PROJECT_ROOT)
 
         logger.info(
-            "Ad-hoc %s requested by %s (force=%s, send=%s) -> %s",
-            job.name, requester or "unknown", force, send, " ".join(args),
+            "Ad-hoc job requested job=%s force=%s send=%s",
+            job.name,
+            force,
+            send,
         )
         try:
-            with open(log_path, "wb") as log_file:
-                subprocess.Popen(
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "xb") as log_file:
+                log_path.chmod(0o600)
+                process = subprocess.Popen(
                     args,
                     cwd=str(PROJECT_ROOT),
                     env=env,
@@ -304,9 +540,35 @@ class JobRunner:
                     start_new_session=True,
                 )
         except Exception as exc:
-            return JobStatus.ERROR, f"Could not start {job.display_name}: {exc}"
+            error_type = type(exc).__name__
+            _record_terminal_safely(
+                execution_id,
+                "dispatch_failed",
+                f"{error_type}: detached worker could not be started.",
+                outcome=f"spawn_exception:{error_type}",
+                delivery_status="not_attempted" if send else "not_requested",
+            )
+            return JobStatus.ERROR, f"Could not start {job.display_name} ({error_type})."
 
-        return JobStatus.SUCCESS, f"✓ {job.display_name} started (log: {log_path}). {job.description}"
+        raw_pid = getattr(process, "pid", None)
+        pid = raw_pid if isinstance(raw_pid, int) and raw_pid > 0 else None
+        try:
+            receipts.record_spawned(execution_id, pid=pid, log_path=str(log_path))
+        except Exception as exc:
+            # The process already exists.  A receipt metadata write failure
+            # cannot truthfully turn a successful spawn into dispatch_failed;
+            # the worker will make its own running/finalization attempt.
+            logger.error(
+                "Could not record spawned worker %s (%s)",
+                execution_id,
+                type(exc).__name__,
+            )
+
+        suffix = "" if owns_receipt else f" Execution: {execution_id}."
+        return JobStatus.SUCCESS, (
+            f"✓ {job.display_name} dispatched (log: {log_path.name}).{suffix} "
+            f"{job.description}"
+        )
 
     def _run_shell_job(self, job: Job) -> Tuple[JobStatus, str]:
         """Run a shell script."""
@@ -317,8 +579,9 @@ class JobRunner:
                 stderr=subprocess.DEVNULL
             )
             return JobStatus.SUCCESS, f"✓ {job.display_name} started. {job.description}"
-        except Exception as e:
-            return JobStatus.ERROR, f"Could not run {job.display_name}: {str(e)}"
+        except Exception as exc:
+            error_type = type(exc).__name__
+            return JobStatus.ERROR, f"Could not run {job.display_name} ({error_type})."
 
     def list_jobs(self) -> List[Dict[str, object]]:
         """Return all available jobs with metadata, including unavailable ones
@@ -332,6 +595,7 @@ class JobRunner:
                 "schedule": job.schedule or "On-demand",
                 "available": job.available,
                 "unavailable_reason": job.unavailable_reason,
+                "max_runtime_seconds": job.max_runtime_seconds,
             }
             for job in self.registry.values()
         ]

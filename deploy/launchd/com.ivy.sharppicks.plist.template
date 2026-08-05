@@ -6,11 +6,24 @@
     <string>com.ivy.sharppicks</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>__PROJECT_ROOT__/scripts/run_daily_picks.sh</string>
+        <string>__VENV_PYTHON__</string>
+        <string>-m</string>
+        <string>ivy_core.job_worker</string>
+        <string>--job-name</string>
+        <string>sharp_picks</string>
+        <string>--entrypoint</string>
+        <string>proactive_agents.sports_bettor:run</string>
+        <string>--timeout-seconds</string>
+        <string>3600</string>
+        <string>--send</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_ROOT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT_ROOT__</string>
+    </dict>
     <key>RunAtLoad</key>
     <false/>
     <key>StandardOutPath</key>

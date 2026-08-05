@@ -121,7 +121,11 @@ def load_report_meta(report_id: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(p.read_text())
     except Exception as exc:
-        logger.warning("Outbox: could not parse %s: %s", p, exc)
+        logger.warning(
+            "Outbox metadata parse failed file=%s error=%s",
+            p.name,
+            type(exc).__name__,
+        )
         return None
 
 
@@ -203,5 +207,9 @@ def cleanup_old_reports() -> int:
                 deleted += 1
                 logger.debug("Outbox: cleaned up %s", report_id)
         except Exception as exc:
-            logger.warning("Outbox: cleanup error on %s: %s", meta_file, exc)
+            logger.warning(
+                "Outbox cleanup failed file=%s error=%s",
+                meta_file.name,
+                type(exc).__name__,
+            )
     return deleted

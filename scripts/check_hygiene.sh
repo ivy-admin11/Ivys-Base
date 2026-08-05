@@ -11,13 +11,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+if [ -n "${IVY_HYGIENE_PYTHON:-}" ]; then
+    case "$IVY_HYGIENE_PYTHON" in
+        /*) ;;
+        *) echo "ERROR: IVY_HYGIENE_PYTHON must be an absolute path." >&2; exit 2 ;;
+    esac
+    case "/$IVY_HYGIENE_PYTHON/" in
+        */../*|*/./*|*$'\n'*|*$'\r'*)
+            echo "ERROR: IVY_HYGIENE_PYTHON contains an unsafe path component." >&2
+            exit 2
+            ;;
+    esac
+    if [ ! -f "$IVY_HYGIENE_PYTHON" ] || [ ! -x "$IVY_HYGIENE_PYTHON" ]; then
+        echo "ERROR: IVY_HYGIENE_PYTHON is not an executable interpreter." >&2
+        exit 1
+    fi
+    PYTHON="$IVY_HYGIENE_PYTHON"
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
     PYTHON="$REPO_ROOT/.venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
     PYTHON="$(command -v python3)"
 else
     echo "ERROR: no Python interpreter found (.venv/bin/python or python3)." >&2
-    echo "       Create the venv: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt" >&2
+    echo "       Create the venv: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.lock" >&2
     exit 1
 fi
 
@@ -38,7 +54,7 @@ _require_tool() {
     local module="$1"
     if ! "$PYTHON" -c "import ${module}" >/dev/null 2>&1; then
         echo "ERROR: required dev tool '${module}' is not installed for ${PYTHON}." >&2
-        echo "       Install it: ${PYTHON} -m pip install -r requirements-dev.txt" >&2
+        echo "       Install it: ${PYTHON} -m pip install -r requirements-dev.lock" >&2
         exit 1
     fi
 }
