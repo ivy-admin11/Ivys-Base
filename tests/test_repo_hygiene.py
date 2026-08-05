@@ -87,7 +87,7 @@ def test_machine_specific_path_detected_in_executable_source(tmp_path):
     offender = repo_root / "script.py"
     # Split /Users/<name> across concatenation so this source file doesn't
     # itself trigger the [machine-specific-path] hygiene rule.
-    offender.write_text("#!" + "/Users/" + "someone/project/.venv/bin/python\nprint('hi')\n")
+    offender.write_text("#!" + "/Users/" + "someone/project/.venv/bin/" + "python\nprint('hi')\n")
     safe = repo_root / "docs.md"
     safe.write_text("Comment mentioning /Users/, /var/, /tmp/ paths generically.\n")
     safe_py = repo_root / "clean.py"
@@ -97,6 +97,22 @@ def test_machine_specific_path_detected_in_executable_source(tmp_path):
 
     flagged = {v.path for v in violations}
     assert flagged == {"script.py"}, "generic /Users/ mentions without a real path must not false-positive"
+
+
+def test_machine_specific_path_ignores_test_fixtures_and_placeholder_replacements(tmp_path):
+    repo_root = tmp_path
+    fixture = repo_root / "test_fixture.py"
+    fixture.write_text('PRIVATE_DETAIL = "raw-secret-contact-and-local-path-/Users/" + "private/report.pdf"\n')
+    replacement = repo_root / "render_test.py"
+    replacement.write_text('raw.replace("__HOME__", "/Users/" + "ivy")\n')
+    shell_comment = repo_root / "comment_only.sh"
+    shell_comment.write_text('# mention /Users/' + 'ivy/.venv/bin/python in docs only\n')
+
+    violations = hygiene.check_machine_specific_paths(
+        repo_root, ["test_fixture.py", "render_test.py", "comment_only.sh"]
+    )
+
+    assert violations == []
 
 
 def test_run_all_checks_reports_no_violations_for_a_clean_tree(tmp_path):
