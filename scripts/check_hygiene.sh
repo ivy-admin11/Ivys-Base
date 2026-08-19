@@ -39,13 +39,13 @@ fi
 
 # Hermetic env — mirrors .github/workflows/ci.yml exactly, so nothing here
 # ever reads the real .env / credential files / hits a live provider.
-export ALLOW_INSECURE_ADMIN_SECRET="true"
-export ADMIN_SECRET="hygiene-check-secret"
+export ALLOW_INSECURE_ADMIN_SECRET="true" # pragma: allowlist secret
+export ADMIN_SECRET="hygiene-check-secret" # pragma: allowlist secret
 export HENRY_PHONE="+15555550100"
 export LEXI_PHONE="+15555550101"
 export GEMINI_API_KEY=""
 export DEEPSEEK_API_KEY=""
-export XAI_API_KEY="hygiene-check-not-real"
+export XAI_API_KEY="hygiene-check-not-real" # pragma: allowlist secret
 export ODDS_API_KEY=""
 export READWISE_API_KEY=""
 export ENABLE_IMESSAGE_POLLER="false"
