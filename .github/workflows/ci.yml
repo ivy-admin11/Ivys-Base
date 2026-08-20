@@ -79,11 +79,11 @@ jobs:
           for fingerprint, count in sorted(head_counts.items()):
               extra = count - base_counts.get(fingerprint, 0)
               if extra > 0:
-                  filenames = head_occurrences.get(fingerprint, [])
+                  filenames = head_occurrences.get(fingerprint, [])[-extra:]
                   for index in range(extra):
                       added.append(
                           (
-                              filenames[-extra + index] if filenames else None,
+                              filenames[index] if index < len(filenames) else None,
                               fingerprint[0],
                               fingerprint[1],
                           )
