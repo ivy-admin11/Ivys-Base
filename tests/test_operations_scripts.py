@@ -672,7 +672,7 @@ def test_scheduled_plists_use_receipt_aware_worker_without_forcing_gates() -> No
         rendered = (
             raw.replace("__PROJECT_ROOT__", "/opt/ivy")
             .replace("__VENV_PYTHON__", "/opt/ivy/.venv/bin/python")
-            .replace("__HOME__", "/Users" + "/ivy")
+            .replace("__HOME__", "/Users" + "/ivy")  # split avoids hygiene-scanner false positive
         )
         payload = plistlib.loads(rendered.encode("utf-8"))
         arguments = payload["ProgramArguments"]
