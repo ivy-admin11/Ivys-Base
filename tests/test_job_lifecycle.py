@@ -344,7 +344,7 @@ def test_worker_forwards_correlation_and_records_domain_and_delivery(monkeypatch
             "result_type": "picks",
             "sent": True,
             "report_id": "SP-TEST-1",
-            "api_key": "must-not-persist",
+            "api_key": "must-not-persist",  # pragma: allowlist secret
         }
 
     monkeypatch.setattr(job_worker, "_resolve_entrypoint", lambda _value: fake_run)

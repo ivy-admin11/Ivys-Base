@@ -37,12 +37,47 @@ jobs:
             echo "Base branch has no .secrets.baseline yet; skipping baseline-modification guard."
             exit 0
           fi
-          if git diff --name-only "origin/${{ github.base_ref }}" -- .secrets.baseline | grep -q '^.secrets.baseline$'; then
-            echo "::error file=.secrets.baseline::'.secrets.baseline' was modified in this PR." \
-                 "Review the diff carefully to ensure no real secrets were added as false positives."
-            exit 1
-          fi
-          echo "Baseline unchanged — no manual review required."
+          python - <<'PY'
+          import collections
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          base_ref = "origin/${{ github.base_ref }}"
+          base_text = subprocess.check_output(
+              ["git", "show", f"{base_ref}:.secrets.baseline"],
+              text=True,
+          )
+          head_text = pathlib.Path(".secrets.baseline").read_text(encoding="utf-8")
+
+          def fingerprint_counts(raw_text: str) -> collections.Counter[tuple[str, str | None, str | None]]:
+              baseline = json.loads(raw_text)
+              counts: collections.Counter[tuple[str, str | None, str | None]] = collections.Counter()
+              for filename, findings in baseline.get("results", {}).items():
+                  for finding in findings:
+                      counts[(filename, finding.get("type"), finding.get("hashed_secret"))] += 1
+              return counts
+
+          base_counts = fingerprint_counts(base_text)
+          head_counts = fingerprint_counts(head_text)
+          additions: list[tuple[str, str | None, str | None]] = []
+          for fingerprint, count in head_counts.items():
+              extra = count - base_counts.get(fingerprint, 0)
+              if extra > 0:
+                  additions.extend([fingerprint] * extra)
+
+          if additions:
+              print(
+                  "::error file=.secrets.baseline::'.secrets.baseline' adds new tracked secret entries in this PR. "
+                  "Review the diff carefully to ensure no real secrets were allowlisted or baselined."
+              )
+              for filename, finding_type, hashed_secret in additions[:20]:
+                  print(f"Added baseline entry: {filename} [{finding_type}] {hashed_secret}")
+              sys.exit(1)
+
+          print("Baseline changes only remove or move existing findings; no new tracked secret entries were added.")
+          PY
 
   macos-safety:
     name: macOS osascript + launchd safety

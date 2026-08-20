@@ -196,7 +196,7 @@ def test_execution_endpoints_hide_requester_results_and_full_log_path():
         "completed",
         outcome="success",
         exit_code=0,
-        result={"message": "private message body", "api_key": "secret-value"},
+        result={"message": "private message body", "api_key": "secret-value"},  # pragma: allowlist secret
         delivery_status="submitted_unverified",
     )
 
