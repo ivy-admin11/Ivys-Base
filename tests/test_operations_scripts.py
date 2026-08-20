@@ -318,6 +318,7 @@ def test_ci_has_safe_real_macos_job_and_live_smoke_has_no_bypass() -> None:
     assert "Baseline cleanup-only or unchanged" in workflow
     assert "collections.Counter()" in workflow
     assert "extra = count - base_counts.get(fingerprint, 0)" in workflow
+    assert "filename_extra = filename_count - base_file_counts.get" in workflow
 
     smoke = (REPO_ROOT / "scripts" / "production_smoke_test.sh").read_text(encoding="utf-8")
     assert "--live-delivery" in smoke

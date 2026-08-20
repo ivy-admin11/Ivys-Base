@@ -62,7 +62,7 @@ jobs:
 
           def fingerprint_counts(payload):
               counts = collections.Counter()
-              occurrences = collections.defaultdict(list)
+              file_counts = collections.defaultdict(collections.Counter)
               for filename, results in payload.get("results", {}).items():
                   for result in results:
                       fingerprint = (
@@ -70,16 +70,20 @@ jobs:
                           result.get("hashed_secret"),
                       )
                       counts[fingerprint] += 1
-                      occurrences[fingerprint].append(filename)
-              return counts, occurrences
+                      file_counts[fingerprint][filename] += 1
+              return counts, file_counts
 
-          base_counts, _ = fingerprint_counts(base)
-          head_counts, head_occurrences = fingerprint_counts(head)
+          base_counts, base_file_counts = fingerprint_counts(base)
+          head_counts, head_file_counts = fingerprint_counts(head)
           added = []
           for fingerprint, count in sorted(head_counts.items()):
               extra = count - base_counts.get(fingerprint, 0)
               if extra > 0:
-                  filenames = head_occurrences.get(fingerprint, [])[-extra:]
+                  filenames = []
+                  for filename, filename_count in sorted(head_file_counts.get(fingerprint, {}).items()):
+                      filename_extra = filename_count - base_file_counts.get(fingerprint, {}).get(filename, 0)
+                      if filename_extra > 0:
+                          filenames.extend([filename] * filename_extra)
                   for index in range(extra):
                       added.append(
                           (
