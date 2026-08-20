@@ -84,6 +84,11 @@ jobs:
                       filename_extra = filename_count - base_file_counts.get(fingerprint, {}).get(filename, 0)
                       if filename_extra > 0:
                           filenames.extend([filename] * filename_extra)
+                  if len(filenames) != extra:
+                      print(
+                          f"WARNING: expected {extra} net-new filenames for {fingerprint} "
+                          f"but found {len(filenames)}"
+                      )
                   for index in range(extra):
                       added.append(
                           (
@@ -95,7 +100,8 @@ jobs:
           if added:
               print(
                   "::error file=.secrets.baseline::'.secrets.baseline' adds new "
-                  "tracked secret fingerprints in this PR."
+                  "tracked secret fingerprints in this PR. Review the diff carefully "
+                  "to ensure no real secrets were allowlisted or baselined."
               )
               for filename, secret_type, hashed_secret in added:
                   print(f"ADDED {filename} | {secret_type} | {hashed_secret}")
