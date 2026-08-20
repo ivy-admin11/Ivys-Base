@@ -31,20 +31,23 @@ jobs:
 
       - name: Protect secrets baseline from silent modification
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
-          if ! git cat-file -e "origin/${{ github.base_ref }}:.secrets.baseline" 2>/dev/null; then
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          if ! git cat-file -e "origin/$BASE_REF:.secrets.baseline" 2>/dev/null; then
             echo "Base branch has no .secrets.baseline yet; skipping baseline-modification guard."
             exit 0
           fi
           python - <<'PY'
           import collections
           import json
+          import os
           import pathlib
           import subprocess
           import sys
-
-          base_ref = "origin/${{ github.base_ref }}"
+          
+          base_ref = f"origin/{os.environ['BASE_REF']}"
           base_text = subprocess.check_output(
               ["git", "show", f"{base_ref}:.secrets.baseline"],
               text=True,
