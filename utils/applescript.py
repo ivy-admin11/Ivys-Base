@@ -288,9 +288,10 @@ class AppleScriptRunner:
                 )
                 return _ERROR_APPLESCRIPT
 
-            # Fixed scripts return a sentinel for handled AppleScript failures.
-            # Never return or log the remainder; it may contain sensitive values.
-            if stdout == "ERROR: APPLESCRIPT_FAILURE":
+            # Fixed scripts return sentinel error strings for handled failures.
+            # Never return or log the raw stdout body; it may contain sensitive
+            # values returned by script-level errors.
+            if stdout == "ERROR: APPLESCRIPT_FAILURE" or stdout.startswith("ERROR:"):
                 telemetry = self._finish(started_at, ERROR_CATEGORY_APPLESCRIPT)
                 logger.warning(
                     "AppleScript call failed category=%s duration_seconds=%.3f",
