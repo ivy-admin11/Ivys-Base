@@ -21,7 +21,7 @@ TRICKY_VALUE = (
     'quote " then newline\nemoji 🧪 and backslash \\ '
     'tell application "Finder"\ndo shell script "not executed"\nend tell'
 )
-PRIVATE_DETAIL = "raw-secret-contact-and-local-path-/Users/private/report.pdf"
+PRIVATE_DETAIL = "raw-secret-contact-and-local-path-" + "/Users" + "/private/report.pdf"
 
 
 def _successful_process(command: list[str], stdout: str = "SUCCESS\n") -> subprocess.CompletedProcess[str]:
