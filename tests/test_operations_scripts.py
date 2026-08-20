@@ -315,7 +315,7 @@ def test_ci_has_safe_real_macos_job_and_live_smoke_has_no_bypass() -> None:
     assert "test_argv_round_trip_with_tricky_characters_real_osascript" in workflow
     assert "plutil -lint deploy/launchd/*.plist.template" in workflow
     assert "tracked secret fingerprints in this PR." in workflow
-    assert "Baseline cleanup-only or unchanged" in workflow
+    assert "Baseline cleanup-only — existing findings removed or moved" in workflow
     assert "collections.Counter()" in workflow
     assert "extra = count - base_counts.get(fingerprint, 0)" in workflow
     assert "filename_extra = filename_count - base_file_counts.get" in workflow

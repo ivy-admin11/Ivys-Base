@@ -92,7 +92,7 @@ jobs:
                   for index in range(extra):
                       added.append(
                           (
-                              filenames[index] if index < len(filenames) else None,
+                              filenames[index] if index < len(filenames) else "<unknown>",
                               fingerprint[0],
                               fingerprint[1],
                           )
@@ -107,7 +107,7 @@ jobs:
                   print(f"ADDED {filename} | {secret_type} | {hashed_secret}")
               sys.exit(1)
 
-          print("Baseline cleanup-only or unchanged — no manual review required.")
+          print("Baseline cleanup-only — existing findings removed or moved, no new secrets added.")
           PY
 
   macos-safety:
