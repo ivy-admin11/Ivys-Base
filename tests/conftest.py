@@ -13,14 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-os.environ["ALLOW_INSECURE_ADMIN_SECRET"] = "true"
-os.environ["ADMIN_SECRET"] = "test-admin-secret"
+os.environ["ALLOW_INSECURE_ADMIN_SECRET"] = "true"  # pragma: allowlist secret
+os.environ["ADMIN_SECRET"] = "test-admin-secret"  # pragma: allowlist secret
 os.environ["HENRY_PHONE"] = "+15555550100"
 os.environ["LEXI_PHONE"] = "+15555550101"
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["DEEPSEEK_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
-os.environ["XAI_API_KEY"] = "test-xai-key-not-real"
+os.environ["XAI_API_KEY"] = "test-xai-key-not-real"  # pragma: allowlist secret
 os.environ["ODDS_API_KEY"] = ""
 os.environ["READWISE_API_KEY"] = ""
 os.environ["ENABLE_IMESSAGE_POLLER"] = "false"

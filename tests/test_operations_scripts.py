@@ -234,7 +234,7 @@ def test_monitor_uses_loopback_auth_without_printing_secret(tmp_path: Path, read
 )
 def test_monitor_rejects_non_loopback_before_request(unsafe_url: str) -> None:
     env = os.environ.copy()
-    env["ADMIN" + "_SECRET"] = "local-placeholder"
+    env["ADMIN" + "_SECRET"] = "local-placeholder"  # pragma: allowlist secret
     result = run_script(
         REPO_ROOT / "scripts" / "monitor_ivy.sh",
         "--base-url",
@@ -276,7 +276,7 @@ def test_restore_accepts_a_checksummed_integrity_checked_archive(tmp_path: Path)
             (
                 "BACKUP_FORMAT_VERSION=1",
                 "CREATED_UTC=20260803T000000Z",
-                "SOURCE_GIT_SHA=0123456789abcdef",
+                "SOURCE_GIT_SHA=0123456789abcdef",  # pragma: allowlist secret
                 "SOURCE_WORKTREE_DIRTY=false",
                 "SENSITIVE_FILES_INCLUDED=false",
                 "STATE_LAYOUT=allowlisted-runtime-state",
@@ -314,6 +314,8 @@ def test_ci_has_safe_real_macos_job_and_live_smoke_has_no_bypass() -> None:
     assert 'PYTEST_MACOS_INTEGRATION: "1"' in workflow
     assert "test_argv_round_trip_with_tricky_characters_real_osascript" in workflow
     assert "plutil -lint deploy/launchd/*.plist.template" in workflow
+    assert "tracked secret fingerprints in this PR." in workflow
+    assert "Baseline cleanup-only or unchanged" in workflow
 
     smoke = (REPO_ROOT / "scripts" / "production_smoke_test.sh").read_text(encoding="utf-8")
     assert "--live-delivery" in smoke
