@@ -103,8 +103,10 @@ jobs:
                   "tracked secret fingerprints in this PR. Review the diff carefully "
                   "to ensure no real secrets were allowlisted or baselined."
               )
-              for filename, secret_type, hashed_secret in added:
+              for filename, secret_type, hashed_secret in added[:20]:
                   print(f"ADDED {filename} | {secret_type} | {hashed_secret}")
+              if len(added) > 20:
+                  print(f"... and {len(added) - 20} more added baseline entries")
               sys.exit(1)
 
           print("Baseline cleanup-only — existing findings removed or moved, no new secrets added.")
