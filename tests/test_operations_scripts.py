@@ -315,7 +315,9 @@ def test_ci_has_safe_real_macos_job_and_live_smoke_has_no_bypass() -> None:
     assert "test_argv_round_trip_with_tricky_characters_real_osascript" in workflow
     assert "plutil -lint deploy/launchd/*.plist.template" in workflow
     assert "tracked secret fingerprints in this PR." in workflow
-    assert "Baseline cleanup-only or unchanged" in workflow
+    assert "Baseline cleanup-only — existing findings removed or moved" in workflow
+    assert "ADDED {filename} | {secret_type} | {hashed_secret}" in workflow
+    assert "WARNING: unable to attribute all net-new filenames" in workflow
 
     smoke = (REPO_ROOT / "scripts" / "production_smoke_test.sh").read_text(encoding="utf-8")
     assert "--live-delivery" in smoke

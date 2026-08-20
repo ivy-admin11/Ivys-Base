@@ -39,11 +39,8 @@ jobs:
             echo "Base branch has no .secrets.baseline yet; skipping baseline-modification guard."
             exit 0
           fi
-          if ! git diff --name-only "origin/${GITHUB_BASE_REF}" -- .secrets.baseline | grep -q '^.secrets.baseline$'; then
-            echo "Baseline unchanged — no manual review required."
-            exit 0
-          fi
           python - <<'PY'
+          import collections
           import json
           import os
           import subprocess
@@ -51,36 +48,69 @@ jobs:
           from pathlib import Path
 
           base_ref = f"origin/{os.environ['GITHUB_BASE_REF']}"
-          base = json.loads(
-              subprocess.check_output(
-                  ["git", "show", f"{base_ref}:.secrets.baseline"],
-                  text=True,
-              )
+          base_text = subprocess.check_output(
+              ["git", "show", f"{base_ref}:.secrets.baseline"],
+              text=True,
           )
-          head = json.loads(Path(".secrets.baseline").read_text(encoding="utf-8"))
+          head_text = Path(".secrets.baseline").read_text(encoding="utf-8")
+          if base_text == head_text:
+              print("Baseline unchanged — no manual review required.")
+              sys.exit(0)
 
-          def fingerprints(payload):
-              return {
-                  (
-                      filename,
-                      result.get("type"),
-                      result.get("hashed_secret"),
-                  )
-                  for filename, results in payload.get("results", {}).items()
-                  for result in results
-              }
+          base = json.loads(base_text)
+          head = json.loads(head_text)
 
-          added = sorted(fingerprints(head) - fingerprints(base))
+          def fingerprint_counts(payload):
+              counts = collections.Counter()
+              file_counts = collections.defaultdict(collections.Counter)
+              for filename, results in payload.get("results", {}).items():
+                  for result in results:
+                      fingerprint = (
+                          result.get("type"),
+                          result.get("hashed_secret"),
+                      )
+                      counts[fingerprint] += 1
+                      file_counts[fingerprint][filename] += 1
+              return counts, file_counts
+
+          base_counts, base_file_counts = fingerprint_counts(base)
+          head_counts, head_file_counts = fingerprint_counts(head)
+          added = []
+          for fingerprint, count in sorted(head_counts.items()):
+              extra = count - base_counts.get(fingerprint, 0)
+              if extra > 0:
+                  filenames = []
+                  for filename, filename_count in sorted(head_file_counts.get(fingerprint, {}).items()):
+                      filename_extra = filename_count - base_file_counts.get(fingerprint, {}).get(filename, 0)
+                      if filename_extra > 0:
+                          filenames.extend([filename] * filename_extra)
+                  filenames = filenames[:extra]
+                  if len(filenames) != extra:
+                      print(
+                          f"WARNING: unable to attribute all net-new filenames for {fingerprint}; "
+                          f"reporting <unknown> for {extra - len(filenames)} entries."
+                      )
+                  for index in range(extra):
+                      added.append(
+                          (
+                              filenames[index] if index < len(filenames) else "<unknown>",
+                              fingerprint[0],
+                              fingerprint[1],
+                          )
+                      )
           if added:
               print(
                   "::error file=.secrets.baseline::'.secrets.baseline' adds new "
-                  "tracked secret fingerprints in this PR."
+                  "tracked secret fingerprints in this PR. Review the diff carefully "
+                  "to ensure no real secrets were allowlisted or baselined."
               )
-              for filename, secret_type, hashed_secret in added:
+              for filename, secret_type, hashed_secret in added[:20]:
                   print(f"ADDED {filename} | {secret_type} | {hashed_secret}")
+              if len(added) > 20:
+                  print(f"... and {len(added) - 20} more added baseline entries")
               sys.exit(1)
 
-          print("Baseline cleanup-only or unchanged — no manual review required.")
+          print("Baseline cleanup-only — existing findings removed or moved, no new secrets added.")
           PY
 
   macos-safety:
