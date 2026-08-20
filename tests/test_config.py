@@ -141,4 +141,4 @@ def test_env_example_documents_bounded_imessage_settings():
     }
 
     assert {name: settings.get(name) for name in expected_defaults} == expected_defaults
-    assert settings["OPENAI_API_KEY"] == "your_openai_api_key_here"
+    assert settings["OPENAI_API_KEY"] == "your_openai_api_key_here"  # pragma: allowlist secret
