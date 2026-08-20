@@ -12,6 +12,7 @@ was found (printed to stdout, one per line).
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
@@ -143,8 +144,36 @@ def check_private_key_markers(repo_root: Path, paths: List[str]) -> List[Violati
 # Rule: machine-specific /Users/<name>/... paths in executable source
 # ---------------------------------------------------------------------------
 
-_MACHINE_PATH_RE = re.compile(r"/Users/[A-Za-z0-9_.\-]+")
+_MACHINE_PATH_RE = re.compile(
+    r"/Users/[A-Za-z0-9_.\-]+(?:/[^ \t\r\n\"']+)?/(?:python(?:\d+(?:\.\d+)*)?|osascript)\b"
+)
 _EXECUTABLE_SOURCE_EXTENSIONS = (".py", ".sh")
+
+
+def _python_contains_machine_path(content: str) -> bool:
+    first_line = content.splitlines()[0] if content.splitlines() else ""
+    if first_line.startswith("#!") and _MACHINE_PATH_RE.search(first_line):
+        return True
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return bool(_MACHINE_PATH_RE.search(content))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and _MACHINE_PATH_RE.search(node.value):
+            return True
+    return False
+
+
+def _shell_contains_machine_path(content: str) -> bool:
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _MACHINE_PATH_RE.search(line):
+            return True
+    return False
 
 
 def check_machine_specific_paths(repo_root: Path, paths: List[str]) -> List[Violation]:
@@ -153,7 +182,11 @@ def check_machine_specific_paths(repo_root: Path, paths: List[str]) -> List[Viol
         if not p.endswith(_EXECUTABLE_SOURCE_EXTENSIONS):
             continue
         content = _read_text(repo_root, p)
-        if content and _MACHINE_PATH_RE.search(content):
+        if not content:
+            continue
+        if p.endswith(".py") and _python_contains_machine_path(content):
+            violations.append(Violation("machine-specific-path", p))
+        elif p.endswith(".sh") and _shell_contains_machine_path(content):
             violations.append(Violation("machine-specific-path", p))
     return violations
 
