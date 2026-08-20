@@ -34,7 +34,7 @@ Run jobs via:
 
 ## Common Operations
 - Run the Live Engine: `uvicorn main:app --host 127.0.0.1 --port 8000` from `~/openclaw-admin/`
-- Test Failover: `export DEEPSEEK_API_KEY="broken_key_test" && uvicorn main:app --host 127.0.0.1 --port 8000`
+- Test Failover: `export DEEPSEEK_API_KEY="broken_key_test" && uvicorn main:app --host 127.0.0.1 --port 8000` <!-- pragma: allowlist secret -->
 - Review Active Local Logs: logs are emitted to stdout; capture with `uvicorn main:app --host 127.0.0.1 --port 8000 2>&1 | tee run.log`
 - List available jobs: `./ivy list`
 - Run a job from terminal: `./ivy run meals` (run the Familia meal planner)

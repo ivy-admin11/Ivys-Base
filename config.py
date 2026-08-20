@@ -184,9 +184,9 @@ ENABLE_SPORTS_PICKS: bool = os.environ.get("ENABLE_SPORTS_PICKS", "true").lower(
 ADMIN_SECRET: str = os.environ.get("ADMIN_SECRET", "")
 """Shared secret for protecting FastAPI endpoints (HTTP header: X-API-Key)"""
 
-if not ADMIN_SECRET:
-    if os.environ.get("ALLOW_INSECURE_ADMIN_SECRET", "").lower() == "true":
-        ADMIN_SECRET = "insecure-test-secret-do-not-use-in-production"
+if not ADMIN_SECRET:  # pragma: allowlist secret
+    if os.environ.get("ALLOW_INSECURE_ADMIN_SECRET", "").lower() == "true":  # pragma: allowlist secret
+        ADMIN_SECRET = "insecure-test-secret-do-not-use-in-production"  # pragma: allowlist secret
     else:
         raise RuntimeError(
             "ADMIN_SECRET is not set. Set ADMIN_SECRET in your environment or .env file. "

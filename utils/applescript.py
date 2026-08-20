@@ -288,10 +288,9 @@ class AppleScriptRunner:
                 )
                 return _ERROR_APPLESCRIPT
 
-            # Fixed scripts return a sentinel for handled AppleScript failures.
-            # Any stdout that starts with "ERROR:" is treated as an AppleScript
-            # failure regardless of the exact message; never return or log the
-            # raw text because it may contain sensitive values.
+            # Fixed scripts return sentinel error strings for handled failures.
+            # Never return or log the raw stdout body; it may contain sensitive
+            # values returned by script-level errors.
             if stdout.upper().startswith("ERROR:"):
                 telemetry = self._finish(started_at, ERROR_CATEGORY_APPLESCRIPT)
                 logger.warning(

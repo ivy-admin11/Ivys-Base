@@ -37,7 +37,7 @@ def test_admin_secret_escape_hatch_allows_import(tmp_path):
     isolated_dir = _isolated_config_dir(tmp_path)
     env = {
         "PATH": os.environ.get("PATH", ""),
-        "ALLOW_INSECURE_ADMIN_SECRET": "true",
+        "ALLOW_INSECURE_ADMIN_SECRET": "true",  # pragma: allowlist secret
         "HENRY_PHONE": "+15555550100",
         "LEXI_PHONE": "+15555550101",
     }
@@ -141,4 +141,4 @@ def test_env_example_documents_bounded_imessage_settings():
     }
 
     assert {name: settings.get(name) for name in expected_defaults} == expected_defaults
-    assert settings["OPENAI_API_KEY"] == "your_openai_api_key_here"
+    assert settings["OPENAI_API_KEY"] == "your_openai_api_key_here"  # pragma: allowlist secret
