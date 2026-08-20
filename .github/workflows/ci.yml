@@ -44,6 +44,7 @@ jobs:
             exit 0
           fi
           python - <<'PY'
+          import collections
           import json
           import os
           import subprocess
@@ -59,18 +60,35 @@ jobs:
           )
           head = json.loads(Path(".secrets.baseline").read_text(encoding="utf-8"))
 
-          def fingerprints(payload):
-              return {
-                  (
-                      filename,
-                      result.get("type"),
-                      result.get("hashed_secret"),
-                  )
-                  for filename, results in payload.get("results", {}).items()
-                  for result in results
-              }
+          def fingerprint_counts(payload):
+              counts = collections.Counter()
+              examples = {}
+              for filename, results in payload.get("results", {}).items():
+                  for result in results:
+                      fingerprint = (
+                          result.get("type"),
+                          result.get("hashed_secret"),
+                      )
+                      counts[fingerprint] += 1
+                      examples.setdefault(fingerprint, filename)
+              return counts, examples
 
-          added = sorted(fingerprints(head) - fingerprints(base))
+          base_counts, _ = fingerprint_counts(base)
+          head_counts, head_examples = fingerprint_counts(head)
+          added = []
+          for fingerprint, count in sorted(head_counts.items()):
+              extra = count - base_counts.get(fingerprint, 0)
+              if extra > 0:
+                  added.extend(
+                      [
+                          (
+                              head_examples.get(fingerprint),
+                              fingerprint[0],
+                              fingerprint[1],
+                          )
+                      ]
+                      * extra
+                  )
           if added:
               print(
                   "::error file=.secrets.baseline::'.secrets.baseline' adds new "
