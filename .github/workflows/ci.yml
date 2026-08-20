@@ -86,8 +86,8 @@ jobs:
                           filenames.extend([filename] * filename_extra)
                   if len(filenames) != extra:
                       print(
-                          f"WARNING: expected {extra} net-new filenames for {fingerprint} "
-                          f"but found {len(filenames)}"
+                          f"WARNING: unable to attribute all net-new filenames for {fingerprint}; "
+                          f"reporting <unknown> for {extra - len(filenames)} entries."
                       )
                   for index in range(extra):
                       added.append(
