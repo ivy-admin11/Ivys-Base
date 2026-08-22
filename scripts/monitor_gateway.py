@@ -12,6 +12,12 @@ still down, so a missed first alert doesn't mean total silence for a month
 like the outage that prompted this script (2026-07-19 to 2026-08-21). The
 very first run (no prior state on disk) only establishes a baseline and
 never alerts — there's no real transition to report yet.
+
+check_gateway_up() retries a few times before declaring the gateway down —
+a single flaky request (one dropped connection, one slow response) already
+triggered a false "DOWN" alert to Henry once while the gateway process
+never actually stopped (2026-08-22). A real outage still fails every retry
+within seconds, so this doesn't meaningfully slow real detection.
 """
 
 import json
@@ -33,9 +39,11 @@ GATEWAY_HEALTH_URL = "http://127.0.0.1:8000/health"
 REQUEST_TIMEOUT_SECONDS = 5
 STATE_PATH = os.path.join(PROJECT_ROOT, "logs", "gateway_monitor_state.json")
 REALERT_INTERVAL_SECONDS = 3600
+HEALTH_CHECK_ATTEMPTS = 3
+HEALTH_CHECK_RETRY_DELAY_SECONDS = 2.5
 
 
-def check_gateway_up() -> bool:
+def _probe_once() -> bool:
     try:
         resp = requests.get(
             GATEWAY_HEALTH_URL,
@@ -45,6 +53,15 @@ def check_gateway_up() -> bool:
         return resp.status_code == 200
     except requests.exceptions.RequestException:
         return False
+
+
+def check_gateway_up() -> bool:
+    for attempt in range(HEALTH_CHECK_ATTEMPTS):
+        if _probe_once():
+            return True
+        if attempt < HEALTH_CHECK_ATTEMPTS - 1:
+            time.sleep(HEALTH_CHECK_RETRY_DELAY_SECONDS)
+    return False
 
 
 def load_state() -> dict:
