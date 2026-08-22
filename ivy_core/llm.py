@@ -61,7 +61,7 @@ def _get_gemini_client():
 
 
 def query_llm(prompt_text: str, temperature: Optional[float] = None) -> str:
-    """Dual-brain failover: deepseek-chat (primary) -> gemini-2.5-flash (backup).
+    """Dual-brain failover: deepseek-v4-flash (primary) -> gemini-2.5-flash (backup).
 
     temperature is optional and forwarded to whichever provider answers —
     both SDKs accept it as a real generation parameter, not a made-up one.
@@ -72,7 +72,7 @@ def query_llm(prompt_text: str, temperature: Optional[float] = None) -> str:
             logger.info("Querying primary engine (DeepSeek)...")
             kwargs = {} if temperature is None else {"temperature": temperature}
             response = deepseek.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 messages=[{"role": "user", "content": prompt_text}],
                 **kwargs,
             )
