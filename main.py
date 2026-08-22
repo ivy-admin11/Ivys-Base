@@ -285,7 +285,7 @@ def _probe_deepseek() -> Dict[str, Any]:
             "https://api.deepseek.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": "deepseek-chat",
+                "model": "deepseek-v4-flash",
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 1,
             },
@@ -750,7 +750,7 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
     headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
 
     payload = {
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "messages": [
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": text_content},
