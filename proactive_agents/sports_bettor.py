@@ -1014,6 +1014,12 @@ def _run_pipeline(
             f"Admin action required: Verify ODDS_API_KEY is current and authorized."
         )
         print(result.admin_message)
+        # Unlike the NO_QUALIFYING_PICKS alert below (force-only), this fires on
+        # every run including scheduled ones — a bad key must never go silent
+        # again the way it did for a month (2026-07-21 to 2026-08-22).
+        if send:
+            send_imessage(HENRY_PHONE, f"\U0001F534 {result.admin_message}")
+            print("\U0001F4E8 Sent auth-failure alert to Henry.")
         return result.to_dict()
     except RetryableProviderError as e:
         print(f"⚠️  {e} — will retry on next scheduled run")
