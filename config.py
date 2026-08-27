@@ -115,8 +115,13 @@ GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 XAI_API_KEY: str = os.environ.get("XAI_API_KEY", "")
 """xAI (Grok) API key, used by the 'brain' job"""
 
-ODDS_API_KEY: str = os.environ.get("ODDS_API_KEY", "")
-"""The Odds API key, used by the Sharp Picks job"""
+ODDS_API_KEY: str = os.environ.get("ODDS_API_KEY", "").strip().strip("*'\"")
+"""The Odds API key, used by the Sharp Picks job.
+
+Stripped of surrounding asterisks/quotes — the-odds-api.com's dashboard
+displays keys wrapped in ** for masking, and that's easy to paste verbatim
+into .env by mistake, which then fails every request with HTTP 401.
+"""
 
 READWISE_API_KEY: str = os.environ.get("READWISE_API_KEY", "")
 """Readwise API key"""

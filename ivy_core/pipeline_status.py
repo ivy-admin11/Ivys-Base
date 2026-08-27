@@ -20,7 +20,7 @@ class PipelineStatus(str, Enum):
     DEGRADED = "degraded"  # Non-critical sources unavailable, but minimum picks still delivered
     
     # Failure states
-    AUTH_FAILURE = "auth_failure"  # 401/403 on required API (e.g., Odds API)
+    AUTH_FAILURE = "auth_failure"  # 401/403 on a required source
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"  # All sources down/unavailable
     NO_QUALIFYING_PICKS = "no_qualifying_picks"  # Sources healthy but no picks meet threshold
     INTERNAL_ERROR = "internal_error"  # Code error or unexpected exception
@@ -139,6 +139,7 @@ class PipelineResult:
         self.admin_message: Optional[str] = None
         self.error: Optional[Exception] = None
         self.sent = False
+        self.attached: Optional[bool] = None
         self.report_id: Optional[str] = None
     
     def add_source(self, name: str, is_required: bool = False) -> SourceHealth:
@@ -154,6 +155,7 @@ class PipelineResult:
             "picks": self.picks_count,
             "consensus": self.consensus_count,
             "sent": self.sent,
+            "attached": self.attached,
             "report_id": self.report_id,
             "message": self.message,
             "admin_alert": self.admin_message,

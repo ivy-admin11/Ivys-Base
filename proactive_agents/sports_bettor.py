@@ -38,6 +38,7 @@ returns no usable picks, run() returns a "no_picks" result without sending
 import hashlib
 import json
 import re
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -53,6 +54,7 @@ from ivy_core.report_fallback import (
     build_attachment_failure_notice,
     split_imessage_content,
 )
+from picks_formatter import PicksReportFormatter
 from ivy_core.pipeline_status import (
     PipelineStatus,
     PipelineResult,
@@ -77,7 +79,7 @@ HENRY_PHONE = "+12147334061"
 XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
 # The Odds API (https://the-odds-api.com) — live Vegas lines + scheduled games.
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip("'\" ")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip().strip("*'\"")
 ODDS_SPORT_KEYS = {
     "NFL":        "americanfootball_nfl",
     "MLB":        "baseball_mlb",
@@ -894,6 +896,61 @@ def format_picks_by_sport(merged):
     return "\n".join(lines)
 
 
+def format_picks_pdf(merged) -> str:
+    """Generate a professional PDF report of sharp picks.
+
+    Args:
+        merged: List of merged pick dicts from the sweep pipeline.
+
+    Returns:
+        str: Path to the generated PDF file.
+    """
+    consensus_picks = [p for p in merged if p.get("is_consensus")]
+    other_picks = [p for p in merged if not p.get("is_consensus")]
+
+    formatter = PicksReportFormatter(
+        title="Ivy's Sharp Picks",
+        subtitle=f"Sharp Picks Report | {datetime.now():%A, %B %d, %Y}",
+        color_scheme="picks",
+    )
+
+    def _to_row(pick):
+        return {
+            "sport": pick.get("sport", ""),
+            "matchup": pick.get("matchup", ""),
+            "side": pick.get("side", ""),
+            "odds": pick.get("odds", ""),
+            "reasoning": (pick.get("enrichment") or {}).get("summary", ""),
+        }
+
+    summary = (
+        f"{len(merged)} pick(s) sourced from X handicappers — "
+        f"{len(consensus_picks)} consensus play(s) with 2+ sharps agreeing."
+    )
+    metadata = {
+        "pick_count": f"{len(merged)} pick(s) ({len(consensus_picks)} consensus)",
+        "source": "X Sharp Picks",
+        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
+    }
+
+    pdf_path = os.path.join(
+        tempfile.gettempdir(),
+        f"sharp_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf",
+    )
+    formatter.generate_pdf(
+        filename=pdf_path,
+        summary=summary,
+        consensus_picks=[_to_row(p) for p in consensus_picks],
+        other_picks=[_to_row(p) for p in other_picks],
+        metadata=metadata,
+        headers=["Sport", "Matchup", "Side", "Odds", "Context"],
+        col_widths=[0.6, 1.8, 1.0, 0.7, 3.4],
+        consensus_heading="🔥 HIGH LIKELIHOOD 🔥 (Consensus Plays)",
+        other_heading="Additional Picks",
+    )
+    return pdf_path
+
+
 # ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
@@ -1006,9 +1063,11 @@ def _run_pipeline(
     except ProviderAuthenticationError as e:
         print(f"🔴 {e}")
         odds_source.mark_failure(e, status_code=e.status_code)
-        result.status = PipelineStatus.AUTH_FAILURE
+        result.status = PipelineStatus.DEGRADED
         result.admin_message = (
-            f"Sharp Picks halted: Odds API authentication failed.\n"
+            f"Sharp Picks: Odds API authentication failed (live odds/pricing "
+            f"disabled for this run — The Odds API isn't a required source, "
+            f"so the X sweep continues without it).\n"
             f"Status: HTTP {e.status_code}\n"
             f"Message: {e.message}\n"
             f"Admin action required: Verify ODDS_API_KEY is current and authorized."
@@ -1020,7 +1079,12 @@ def _run_pipeline(
         if send:
             send_imessage(HENRY_PHONE, f"\U0001F534 {result.admin_message}")
             print("\U0001F4E8 Sent auth-failure alert to Henry.")
-        return result.to_dict()
+        # The Odds API is registered is_required=False — a bad key must degrade
+        # (skip live odds/pricing), not halt the whole run before Grok X Search
+        # even gets a turn. Returning early here left grok_source at its default
+        # unmarked state, which reported as healthy=false with no error — making
+        # a required-but-never-run source look like the actual failure.
+        games = []
     except RetryableProviderError as e:
         print(f"⚠️  {e} — will retry on next scheduled run")
         odds_source.mark_failure(e, status_code=e.status_code)
@@ -1113,11 +1177,6 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-    # Generate text-only report
-    print("📝 Generating text-only picks report...")
-    report_text = format_picks_by_sport(filtered_picks)
-    print(f"✅ Report formatted ({len(filtered_picks)} picks)")
-
     # Assign a report ID
     report_id = _outbox.make_report_id("sharp_picks")
     result.report_id = report_id
@@ -1132,19 +1191,59 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-    # Send text report directly
-    delivered_text = send_imessage(HENRY_PHONE, report_text)
-    
-    if delivered_text:
+    # Generate PDF report and send as a real iMessage attachment.
+    print("📄 Generating PDF picks report...")
+    pdf_path = format_picks_pdf(filtered_picks)
+    print(f"✅ PDF generated: {pdf_path}")
+
+    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
+    try:
+        _outbox.save_report(
+            report_id, pdf_path,
+            job_name="sharp_picks",
+            recipient=HENRY_PHONE,
+            content_summary=content_summary,
+        )
+        _outbox.update_report_status(
+            report_id, getattr(receipt, "status", "submitted_unverified"),
+            attempts=getattr(receipt, "attempts", 1),
+        )
+    except Exception as _oe:
+        print(f"⚠️  Outbox tracking skipped: {_oe}")
+
+    if receipt:
         save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus).")
+        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via PDF.")
         result.sent = True
+        result.attached = True
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent successfully."
         return result.to_dict()
 
-    # Fallback if text send failed
-    print("⚠️  Text delivery failed")
+    # Fallback: PDF attachment failed — send text instead, never fail silently.
+    print("⚠️  PDF attachment failed — falling back to text")
+    notice = build_attachment_failure_notice(
+        report_name="Sharp Picks",
+        report_id=report_id,
+        resend_command="RESEND PICKS",
+        retry_queued=True,
+    )
+    send_imessage(HENRY_PHONE, notice)
+    report_text = format_picks_by_sport(filtered_picks)
+    bubbles = split_imessage_content(report_text)
+    delivered_text = all(send_imessage(HENRY_PHONE, b) for b in bubbles)
+
+    if delivered_text:
+        save_last_report(signature, signature)
+        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via text fallback.")
+        result.sent = True
+        result.attached = False
+        result.status = PipelineStatus.SUCCESS
+        result.message = f"Report {report_id} sent (text fallback)."
+        return result.to_dict()
+
+    # Fallback if text send also failed
+    print("⚠️  Text delivery also failed")
     print(f"Report ID {report_id} queued for retry")
     result.sent = False
     result.status = PipelineStatus.INTERNAL_ERROR

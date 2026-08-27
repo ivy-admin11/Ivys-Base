@@ -44,7 +44,14 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
 def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
     monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
-    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [{"is_consensus": False}])
+    monkeypatch.setattr(
+        sports_bettor, "merge_picks",
+        lambda picks: [{
+            "is_consensus": False, "consensus_count": 1,
+            "enrichment": {"confidence": "high"},
+            "sport": "MLB", "matchup": "A vs B", "side": "A", "odds": "-110",
+        }],
+    )
     monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
     monkeypatch.setattr(sports_bettor, "_report_signature", lambda merged: "sig-1")
