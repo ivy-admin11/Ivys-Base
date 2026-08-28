@@ -99,14 +99,10 @@ JOB_REGISTRY = [
         display_name="Bravo Scout",
         aliases=["bravo", "bravoscout", "reality scout"],
         description="Monitor Bravo reality TV schedules and episodes",
-        executor="launchctl",
-        target="com.ivy.bravoscout",
-        available=False,
-        unavailable_reason=(
-            "proactive_agents/bravo_scout.py does not exist in this repo — no "
-            "implementation has ever been committed to main (only uncommitted "
-            "copies survive in abandoned .claude/worktrees/ directories)."
-        ),
+        executor="entrypoint",
+        target="com.ivy.bravoscout",  # name reserved; no plist is installed
+        entrypoint="proactive_agents.bravo_scout:run",
+        schedule="On-demand only (no launchd plist installed)",
     ),
     Job(
         name="familia_meal_planner",
