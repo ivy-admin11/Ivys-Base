@@ -1115,6 +1115,84 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 # ============================================================================
 
 
+# ============================================================================
+# IMESSAGE POLLER SELF-HEALING
+# ============================================================================
+#
+# History: on 2026-08-24 the poller hit five consecutive "authorization
+# denied" errors reading chat.db (Full Disk Access is decided at process
+# launch, and this process had been started before the grant), exhausted its
+# 2/4/8/16s backoff in about 30 seconds, and exited the worker thread for
+# good. The process stayed alive and /health kept returning 200, so Ivy went
+# on texting out while deaf to every incoming message — for three days,
+# silently. Two things were wrong: giving up permanently, and doing so
+# invisibly.
+#
+# Now: retry indefinitely with capped backoff, and if the failure outlasts
+# POLLER_ESCALATE_AFTER_SECONDS, exit the process so launchd (KeepAlive=true)
+# relaunches it. A TCC denial cannot be cleared in-process — only a fresh
+# process can — so exiting IS the recovery, not a crash. POLLER_STATE is
+# surfaced through /ready so a wedged poller is visible even when chat.db is
+# perfectly readable.
+
+POLLER_MAX_BACKOFF_SECONDS = 60
+POLLER_ESCALATE_AFTER_SECONDS = int(os.environ.get("POLLER_ESCALATE_AFTER_SECONDS", "300"))
+POLLER_STALE_AFTER_SECONDS = int(os.environ.get("POLLER_STALE_AFTER_SECONDS", "300"))
+# Escape hatch: a developer running `uvicorn main:app` by hand does not want a
+# broken chat.db to kill their foreground server after five minutes.
+POLLER_EXIT_ON_UNRECOVERABLE = os.environ.get("POLLER_EXIT_ON_UNRECOVERABLE", "true").lower() == "true"
+
+POLLER_STATE: Dict[str, Any] = {
+    "enabled": ENABLE_IMESSAGE_POLLER,
+    "running": False,
+    "started_at": None,
+    "last_success_ts": None,
+    "consecutive_failures": 0,
+    "last_error": None,
+    "escalations": 0,
+}
+
+
+def _escalate_poller_restart(reason: str) -> None:
+    """Exit the process so launchd relaunches it with a fresh TCC decision."""
+    POLLER_STATE["escalations"] += 1
+    POLLER_STATE["running"] = False
+    POLLER_STATE["last_error"] = reason
+    if not POLLER_EXIT_ON_UNRECOVERABLE:
+        logger.error(
+            "🔁 iMessage poller unrecoverable (%s), but POLLER_EXIT_ON_UNRECOVERABLE=false — "
+            "staying up and continuing to retry. /ready will report the poller unhealthy.",
+            reason,
+        )
+        return
+    logger.error(
+        "🔁 iMessage poller unrecoverable (%s). Exiting process so launchd relaunches it.",
+        reason,
+    )
+    for handler in list(logger.handlers) + list(logging.getLogger().handlers):
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    os._exit(1)
+
+
+def poller_healthy() -> bool:
+    """True when the poller is either deliberately off or demonstrably alive.
+
+    "Alive" means a poll cycle completed recently — not merely that the thread
+    object exists, which is what made the 2026-08-24 outage invisible.
+    """
+    if not POLLER_STATE["enabled"]:
+        return True
+    if not POLLER_STATE["running"]:
+        return False
+    reference = POLLER_STATE["last_success_ts"] or POLLER_STATE["started_at"]
+    if reference is None:
+        return False
+    return (time.time() - reference) < POLLER_STALE_AFTER_SECONDS
+
+
 def background_imessage_worker() -> None:
     """Poll iMessage database and respond via DeepSeek → Gemini failover chain.
     
@@ -1123,13 +1201,32 @@ def background_imessage_worker() -> None:
     logger.info("🤖 Ivy Polling Thread Engaged (DeepSeek Primary + Gemini Backup Core)")
     logger.info(f"💾 Prompt Caching: {'ENABLED' if (ENABLE_PROMPT_CACHING and CACHING_AVAILABLE) else 'DISABLED'}")
     
+    POLLER_STATE.update({
+        "running": True,
+        "started_at": time.time(),
+        "consecutive_failures": 0,
+        "last_error": None,
+    })
+
+    # get_last_message_id() returns 0 for an empty database and None only on a
+    # real access error, so None unambiguously means "cannot read chat.db".
     last_id = get_last_message_id()
-    if last_id is None:
+    startup_attempt = 0
+    startup_began = time.time()
+    while last_id is None:
+        startup_attempt += 1
+        POLLER_STATE["consecutive_failures"] = startup_attempt
+        POLLER_STATE["last_error"] = "chat.db unreadable at startup"
         logger.error(
-            "❌ Security Warning: Cannot access chat.db files. "
-            "Verify Full Disk Access in System Preferences."
+            "❌ Cannot access chat.db (attempt %d). Verify Full Disk Access for the "
+            "interpreter launchd starts. Retrying...",
+            startup_attempt,
         )
-        return
+        if (time.time() - startup_began) >= POLLER_ESCALATE_AFTER_SECONDS:
+            _escalate_poller_restart("chat.db unreadable throughout poller startup")
+            return
+        time.sleep(min(2 ** startup_attempt, POLLER_MAX_BACKOFF_SECONDS))
+        last_id = get_last_message_id()
 
     current_date_str = datetime.now().strftime("%A, %B %d, %Y")
     deepseek_sys_instruction = DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
@@ -1137,6 +1234,17 @@ def background_imessage_worker() -> None:
     )
 
     consecutive_failures = 0
+    first_failure_ts: Optional[float] = None
+
+    def _mark_poll_success() -> None:
+        """A completed cycle — including one that found no new message — proves
+        the read path works, so it clears the failure streak and the heartbeat."""
+        nonlocal consecutive_failures, first_failure_ts
+        consecutive_failures = 0
+        first_failure_ts = None
+        POLLER_STATE["consecutive_failures"] = 0
+        POLLER_STATE["last_error"] = None
+        POLLER_STATE["last_success_ts"] = time.time()
 
     while True:
         try:
@@ -1144,7 +1252,7 @@ def background_imessage_worker() -> None:
             row = safe_fetch_last_message(last_id)
 
             if not row:
-                consecutive_failures = 0
+                _mark_poll_success()
                 continue
 
             msg_id, text, sender = row
@@ -1179,7 +1287,7 @@ def background_imessage_worker() -> None:
                     "🛑 Security Exception: Trigger blocked. Unauthorized Contact ID: %s",
                     sender,
                 )
-                consecutive_failures = 0
+                _mark_poll_success()
                 continue
 
             logger.info("📩 Inbound Trigger Isolated: %s", text)
@@ -1189,7 +1297,7 @@ def background_imessage_worker() -> None:
             resend_reply = handle_resend_command(text, sender)
             if resend_reply is not None:
                 run_local_applescript_send(sender, resend_reply)
-                consecutive_failures = 0
+                _mark_poll_success()
                 continue
 
             # ========== PHASE 1: DEEPSEEK PRIMARY ==========
@@ -1224,17 +1332,29 @@ def background_imessage_worker() -> None:
             else:
                 logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
 
-            consecutive_failures = 0
+            _mark_poll_success()
 
         except Exception as database_err:
             consecutive_failures += 1
-            logger.error("❌ Database polling loop exception: %s", str(database_err))
-            if consecutive_failures >= 5:
-                logger.error(
-                    "Database polling failed 5 times. Exiting worker to prevent cascade failures."
+            if first_failure_ts is None:
+                first_failure_ts = time.time()
+            failing_for = time.time() - first_failure_ts
+            POLLER_STATE["consecutive_failures"] = consecutive_failures
+            POLLER_STATE["last_error"] = str(database_err)
+            logger.error(
+                "❌ Database polling loop exception (#%d, failing for %.0fs): %s",
+                consecutive_failures,
+                failing_for,
+                str(database_err),
+            )
+            if failing_for >= POLLER_ESCALATE_AFTER_SECONDS:
+                _escalate_poller_restart(
+                    f"{consecutive_failures} consecutive polling failures over {failing_for:.0f}s"
                 )
-                return
-            time.sleep(2 ** consecutive_failures)  # Exponential backoff
+                first_failure_ts = time.time()  # only reached when exit is disabled
+            # Capped exponential backoff — retry forever rather than exiting the
+            # thread, which is what left Ivy silently deaf for three days.
+            time.sleep(min(2 ** consecutive_failures, POLLER_MAX_BACKOFF_SECONDS))
 
 
 # ============================================================================
@@ -1286,6 +1406,9 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     """
     checks: Dict[str, Any] = {
         "chat_db_readable": os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK),
+        # os.access() only proves the file is readable, not that the poller is
+        # actually consuming it — the distinction that hid the 2026-08-24 outage.
+        "imessage_poller_healthy": poller_healthy(),
     }
     try:
         receipts.list_recent(limit=1)
