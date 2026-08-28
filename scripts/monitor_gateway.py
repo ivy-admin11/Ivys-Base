@@ -3,9 +3,19 @@
 
 Runs as its own launchd job (com.ivy.gateway_monitor), independent of the
 gateway process itself, so it can still alert Henry when the gateway is
-completely down. Hits /health over HTTP rather than importing main.py,
+completely down. Hits the gateway over HTTP rather than importing main.py,
 since importing only proves the module loads — not that the actual running
 server is up.
+
+Probes two endpoints, because they answer different questions:
+  /health  — is the process alive at all?          (liveness)
+  /ready   — can it actually serve requests?       (readiness, 503 + reasons)
+Watching /health alone hid a real 3-day outage: on 2026-08-24 the iMessage
+polling worker exited after repeated "authorization denied" errors reading
+chat.db, so Ivy could still text out but could no longer see incoming
+messages. /health kept returning 200 the whole time and this monitor stayed
+silent. A readiness failure is now its own "degraded" state, alerted with
+the specific failing checks named.
 
 Alerts on state transitions (up->down, down->up) and re-alerts hourly while
 still down, so a missed first alert doesn't mean total silence for a month
@@ -36,6 +46,7 @@ from config import ADMIN_SECRET, HENRY_PHONE  # noqa: E402
 from ivy_core import send_imessage  # noqa: E402
 
 GATEWAY_HEALTH_URL = "http://127.0.0.1:8000/health"
+GATEWAY_READY_URL = "http://127.0.0.1:8000/ready"
 REQUEST_TIMEOUT_SECONDS = 5
 STATE_PATH = os.path.join(PROJECT_ROOT, "logs", "gateway_monitor_state.json")
 REALERT_INTERVAL_SECONDS = 3600
@@ -43,25 +54,73 @@ HEALTH_CHECK_ATTEMPTS = 3
 HEALTH_CHECK_RETRY_DELAY_SECONDS = 2.5
 
 
-def _probe_once() -> bool:
+def _probe_once(url: str):
+    """Return (status_code, body) — status_code None means the request itself
+    failed (connection refused, timeout), which is what retries are for. A
+    503 is a definitive answer from a live server and is NOT retried."""
     try:
         resp = requests.get(
-            GATEWAY_HEALTH_URL,
+            url,
             headers={"X-API-Key": ADMIN_SECRET},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        return resp.status_code == 200
     except requests.exceptions.RequestException:
-        return False
+        return None, None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    return resp.status_code, body
+
+
+def _probe_with_retries(url: str):
+    """Retry only transport failures — a single dropped connection already
+    triggered a false DOWN alert once (2026-08-22)."""
+    for attempt in range(HEALTH_CHECK_ATTEMPTS):
+        code, body = _probe_once(url)
+        if code is not None:
+            return code, body
+        if attempt < HEALTH_CHECK_ATTEMPTS - 1:
+            time.sleep(HEALTH_CHECK_RETRY_DELAY_SECONDS)
+    return None, None
+
+
+def _failed_checks(body) -> list:
+    """Pull the false checks out of /ready's payload. The 503 body nests them
+    under FastAPI's "detail"; a 200 body carries them at the top level."""
+    if not isinstance(body, dict):
+        return []
+    payload = body.get("detail") if isinstance(body.get("detail"), dict) else body
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        return []
+    return sorted(name for name, ok in checks.items() if not ok)
+
+
+def check_gateway() -> tuple:
+    """Classify the gateway as up / degraded / down, with a reason.
+
+    down     — /health unreachable: the process is gone or wedged.
+    degraded — /health passes but /ready does not: alive, cannot serve.
+    up       — both pass.
+    """
+    code, _ = _probe_with_retries(GATEWAY_HEALTH_URL)
+    if code != 200:
+        return "down", "/health unreachable" if code is None else f"/health returned {code}"
+
+    code, body = _probe_with_retries(GATEWAY_READY_URL)
+    if code is None:
+        return "degraded", "/ready unreachable while /health passes"
+    if code != 200:
+        failing = _failed_checks(body)
+        detail = ", ".join(failing) if failing else f"/ready returned {code}"
+        return "degraded", detail
+    return "up", "/health and /ready both passing"
 
 
 def check_gateway_up() -> bool:
-    for attempt in range(HEALTH_CHECK_ATTEMPTS):
-        if _probe_once():
-            return True
-        if attempt < HEALTH_CHECK_ATTEMPTS - 1:
-            time.sleep(HEALTH_CHECK_RETRY_DELAY_SECONDS)
-    return False
+    """Back-compat shim for any caller that just wants a boolean."""
+    return check_gateway()[0] == "up"
 
 
 def load_state() -> dict:
@@ -81,24 +140,31 @@ def save_state(state: dict) -> None:
 def main() -> int:
     now = time.time()
     timestamp = datetime.now(timezone.utc).isoformat()
-    new_status = "up" if check_gateway_up() else "down"
+    new_status, reason = check_gateway()
 
     state = load_state()
     prev_status = state.get("status")
 
     alert_text = None
     if prev_status is None:
-        print(f"[{timestamp}] first run, establishing baseline: gateway status={new_status}")
+        print(f"[{timestamp}] first run, establishing baseline: gateway status={new_status} ({reason})")
     elif new_status != prev_status:
         if new_status == "down":
             alert_text = (
                 "⚠️ Ivy gateway (com.lexi.ivy) is DOWN — "
                 "/health check failed. iMessage replies won't work until it's restarted."
             )
+        elif new_status == "degraded":
+            alert_text = (
+                f"⚠️ Ivy gateway is UP but NOT READY — failing: {reason}. "
+                "It can still text out; incoming iMessages may not be processed."
+            )
         else:
-            alert_text = "✅ Ivy gateway (com.lexi.ivy) is back UP — /health passing again."
-    elif new_status == "down" and (now - state.get("last_alert_ts", 0.0)) > REALERT_INTERVAL_SECONDS:
-        alert_text = "⚠️ Ivy gateway (com.lexi.ivy) is STILL DOWN — has not recovered."
+            alert_text = "✅ Ivy gateway (com.lexi.ivy) is back UP — /health and /ready passing."
+    elif new_status != "up" and (now - state.get("last_alert_ts", 0.0)) > REALERT_INTERVAL_SECONDS:
+        alert_text = (
+            f"⚠️ Ivy gateway is STILL {new_status.upper()} — {reason}. Has not recovered."
+        )
 
     if alert_text:
         print(f"[{timestamp}] {alert_text}")
@@ -108,9 +174,10 @@ def main() -> int:
             print(f"[{timestamp}] WARNING: alert send failed")
     else:
         if prev_status is not None:
-            print(f"[{timestamp}] gateway status={new_status}, no alert needed")
+            print(f"[{timestamp}] gateway status={new_status} ({reason}), no alert needed")
 
     state["status"] = new_status
+    state["reason"] = reason
     save_state(state)
     return 0
 
