@@ -17,7 +17,7 @@
 - Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it.
 
 ## Job Execution System
-Ivy can run background jobs on-demand via natural language, dispatched through the single registry in `job_runner.py` — job names, aliases, and entrypoints live there. `./ivy list` lists them all, but only `GET /capabilities` reports which are unavailable — `./ivy list` prints an unavailable job with no marker, so it looks runnable.
+Ivy can run background jobs on-demand via natural language, dispatched through the single registry in `job_runner.py` — job names, aliases, and entrypoints live there. Run `./ivy list` (or `GET /capabilities`) to see them all, including unavailable ones.
 
 Sharp Picks and Familia Meal Planner support both a real schedule (via launchd — see `deploy/launchd/`) and ad-hoc/on-demand dispatch (via a detached subprocess, no launchd required — see `job_runner._run_entrypoint_job`). An ad-hoc request always passes `force=True`, bypassing whatever duplicate-suppression/48h-gate the scheduled cadence uses, so "run picks now" always delivers.
 

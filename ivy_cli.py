@@ -23,6 +23,7 @@ Examples:
 import contextlib
 import os
 import sys
+import textwrap
 
 # Run from the project root so `import main` resolves and .env loads.
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -35,9 +36,15 @@ if args and args[0] == "list":
     jobs = job_runner.list_jobs()
     print("\n📋 Available Ivy Jobs:\n")
     for job in jobs:
-        print(f"  {job['display_name']}")
+        flag = "" if job["available"] else "  ⚠️  UNAVAILABLE"
+        print(f"  {job['display_name']}{flag}")
         print(f"    → {job['description']}")
         print(f"    Aliases: {job['aliases']}")
+        if not job["available"]:
+            reason = job["unavailable_reason"] or "no reason recorded"
+            print(textwrap.fill(reason, width=88,
+                               initial_indent="    Why: ",
+                               subsequent_indent="         "))
         print()
     sys.exit(0)
 
