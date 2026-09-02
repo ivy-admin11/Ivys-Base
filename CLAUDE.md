@@ -3,7 +3,7 @@
 ## System Architecture
 - **Core Engine:** `main.py` (FastAPI app; the local iMessage database poller runs as a background thread spawned on startup)
 - **Primary Database:** macOS Chat DB (`~/Library/Messages/chat.db`)
-- **Primary LLM:** DeepSeek (`deepseek-chat`); falls back to Gemini (`gemini-2.5-flash`) only on provider failure, timeout, or empty response — never merely because DeepSeek gave an honest answer.
+- **Primary LLM:** DeepSeek (`deepseek-v4-flash`); falls back to Gemini (`gemini-2.5-flash`) only on provider failure, timeout, or empty response — never merely because DeepSeek gave an honest answer.
 - **Tool schema:** generated from one canonical source (`registry.py`) for both providers — never hand-edit `GEMINI_TOOL_DECLARATIONS`/`DEEPSEEK_TOOL_SCHEMA` separately, they don't exist as separate lists anymore.
 - **Job agents:** `ivy_core/` (version-controlled — `env.py`, `messaging.py`, `llm.py`, `receipts.py`) is the shared library every proactive agent imports. There is no untracked `.ivy/ivy_core.py` dependency anymore.
 - **Automation Pipeline:** AppleScript via `osascript`, invoked with `on run argv` so untrusted content (recipient, message body, attachment path) is passed as process arguments, never interpolated into AppleScript source text.
@@ -11,7 +11,7 @@
 
 ## Development Guidelines
 - Always preserve the dual-brain failover structure (DeepSeek → Gemini) inside `main.py`.
-- Keep text replies short, concise, and direct (under 40 words).
+- Keep text replies short, concise, and direct (under 40 words). Exception: when the user explicitly asks for a full recipe, list, or step-by-step plan, give the complete thing compactly.
 - Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`. The process fails closed — it refuses to start at all if `ADMIN_SECRET` is unset (set `ALLOW_INSECURE_ADMIN_SECRET=true` for local/test use only).
 - Job execution is automatic when the user mentions running jobs via iMessage — Ivy will offer and execute them.
 - Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it. For attachments the receipt is chat.db itself: `ivy_core.messaging.send_imessage_attachment` sends via Messages' `participant … of account` scripting verb first, verifies the row through `GET /imessage/attachments`, and only falls back to clipboard-paste UI automation when the screen is unlocked. AppleScript's "SUCCESS" return is not evidence of delivery.
