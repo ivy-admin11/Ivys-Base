@@ -40,6 +40,35 @@ on run argv
 end run
 """
 
+SEND_FILE_SCRIPTING_ARGV_SCRIPT = """
+on run argv
+    set recipientValue to item 1 of argv
+    set filePathValue to item 2 of argv
+    set theFile to POSIX file filePathValue
+    tell application "Messages"
+        try
+            set targetAccount to 1st account whose service type = iMessage
+            set targetParticipant to participant recipientValue of targetAccount
+            send theFile to targetParticipant
+            return "SUCCESS"
+        on error errMsg
+            return "ERROR: " & errMsg
+        end try
+    end tell
+end run
+"""
+
+# Headless attachment send through Messages' own scripting verb — no
+# keystrokes, so it works with the screen locked and the display asleep.
+#
+# It MUST address the recipient as `participant … of account` (the modern
+# Messages scripting model), not the legacy `buddy … of service` used for
+# text. Verified 2026-09-01 against chat.db: the buddy/service form returns
+# "SUCCESS" and creates no message row at all (the file is silently
+# dropped); the participant/account form creates the row with
+# transfer_state=5 / is_sent=1 within ~3 s. Callers still verify the outcome
+# (ivy_core.attachment_verify) rather than trust the return value.
+
 SEND_FILE_ARGV_SCRIPT = """
 on run argv
     set recipientValue to item 1 of argv
@@ -184,7 +213,21 @@ class AppleScriptRunner:
         target = "me" if (recipient or "").lower() == "me" else recipient
         return self.run_argv(SEND_TEXT_ARGV_SCRIPT, [target, body])
 
+    def send_imessage_file_scripting_argv(self, recipient: str, file_path: str) -> str:
+        """Send a file via Messages' scripting verb (no UI automation, safe when
+        the screen is locked). Outcome must be verified in chat.db."""
+        target = "me" if (recipient or "").lower() == "me" else recipient
+        return self.run_argv(SEND_FILE_SCRIPTING_ARGV_SCRIPT, [target, file_path])
+
     def send_imessage_file_argv(self, recipient: str, file_path: str) -> str:
-        """Send a file attachment with recipient/path passed as argv, not interpolated source."""
+        """Send a file attachment by emulating a human paste into the Messages
+        compose field (clipboard + Cmd-V + Return via System Events).
+
+        Requires an unlocked, interactive session: with the screen locked the
+        keystrokes go to the lock screen and nothing is sent, yet this still
+        returns "SUCCESS". Callers must gate on
+        ``ivy_core.attachment_verify.screen_is_locked()`` and verify the
+        outcome in chat.db.
+        """
         target = "me" if (recipient or "").lower() == "me" else recipient
         return self.run_argv(SEND_FILE_ARGV_SCRIPT, [target, file_path])
