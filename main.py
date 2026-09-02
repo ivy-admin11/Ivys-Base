@@ -94,6 +94,7 @@ from config import (
 
 # Canonical tool schema — single source of truth for both providers
 from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
+from ivy_core import attachment_verify
 from ivy_core import receipts
 from ivy_core import outbox as _outbox
 from ivy_core.imessage_state import (
@@ -3130,6 +3131,34 @@ def runtime_endpoint(authenticated: bool = Depends(verify_api_key)):
         "providers": _cached_provider_snapshot(),
         "tools": compute_tool_statuses(),
     }
+
+
+@app.get("/imessage/attachments")
+def imessage_attachments_endpoint(
+    since: float,
+    filename: Optional[str] = None,
+    handle: Optional[str] = None,
+    limit: int = 20,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Outgoing attachment rows from chat.db newer than ``since`` (unix
+    seconds), optionally narrowed to one ``filename`` (the staged name the
+    recipient sees) and/or one ``handle``. Each row carries a ``state`` of
+    delivered / failed / pending.
+
+    This is how job subprocesses — which do not have Full Disk Access — find
+    out whether a PDF they just sent actually left the Mac. The gateway does
+    have that access, so it does the chat.db read on their behalf
+    (ivy_core.attachment_verify falls back to this endpoint automatically).
+    """
+    try:
+        rows = attachment_verify.fetch_outgoing_attachments(
+            since_ts=since, filename=filename or None, handle=handle or None, limit=limit,
+        )
+    except sqlite3.Error as exc:
+        logger.warning("chat.db attachment lookup failed error=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="chat.db is not readable")
+    return {"attachments": rows, "count": len(rows)}
 
 
 @app.get("/version")
