@@ -180,6 +180,12 @@ def test_attachment_staging_uses_unique_private_paths(
             staged_paths.append(Path(path))
             return "SUCCESS"
 
+        # Delivery now tries the headless scripting verb before the paste
+        # path; both must land on the same uniquely-staged file.
+        def send_imessage_file_scripting_argv(self, _recipient: str, path: str) -> str:
+            staged_paths.append(Path(path))
+            return "SUCCESS"
+
     monkeypatch.setattr(messaging, "_IMSG_ATTACH_STAGE", str(stage))
     monkeypatch.setattr(messaging, "_runner", Runner())
 

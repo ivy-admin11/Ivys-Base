@@ -4,14 +4,31 @@ never runs — no test here touches the real chat.db.
 """
 
 import os
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import main
 
 client = TestClient(main.app)
 HEADERS = {"X-API-Key": os.environ["ADMIN_SECRET"]}
+
+
+@pytest.fixture
+def unavailable_bravo(monkeypatch):
+    """Bravo Scout is runnable now; these tests need a registered job that is
+    NOT runnable. Popen is guarded so a regression can never launch the real
+    agent, which texts the household."""
+    job = main.job_runner.find_job("bravo")
+    monkeypatch.setattr(job, "available", False)
+    monkeypatch.setattr(
+        job, "unavailable_reason",
+        "proactive_agents/bravo_scout.py does not exist (test fixture)",
+    )
+    with patch("job_runner.subprocess.Popen") as mock_popen:
+        yield job
+    mock_popen.assert_not_called()
 
 
 def test_poller_thread_not_started_by_bare_testclient():
@@ -49,7 +66,7 @@ def test_health_is_pure_liveness_and_never_probes_providers(monkeypatch):
     probe.assert_not_called()
 
 
-def test_capabilities_lists_bravo_scout_as_unavailable_with_reason():
+def test_capabilities_lists_bravo_scout_as_unavailable_with_reason(unavailable_bravo):
     resp = client.get("/capabilities", headers=HEADERS)
     assert resp.status_code == 200
     jobs = resp.json()["jobs"]
@@ -141,7 +158,7 @@ def test_jobs_endpoint_never_lists_gateway_as_a_job():
     assert "gateway" not in names
 
 
-def test_executions_endpoint_reflects_a_real_run_job_call():
+def test_executions_endpoint_reflects_a_real_run_job_call(unavailable_bravo):
     run_resp = client.post("/run-job", params={"job_name": "bravo"}, headers=HEADERS)
     assert run_resp.status_code == 200
 
@@ -213,7 +230,7 @@ def test_execution_endpoints_hide_requester_results_and_full_log_path():
     assert "secret-value" not in resp.text
 
 
-def test_run_job_response_never_claims_success_for_unavailable_job():
+def test_run_job_response_never_claims_success_for_unavailable_job(unavailable_bravo):
     resp = client.post("/run-job", params={"job_name": "bravo"}, headers=HEADERS)
     body = resp.json()
     assert "unavailable" in body["result"].lower()

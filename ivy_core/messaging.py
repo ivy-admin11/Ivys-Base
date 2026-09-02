@@ -15,6 +15,7 @@ from typing import Optional
 
 from config import IMESSAGE_SEND_TIMEOUT_SECONDS
 from utils.applescript import AppleScriptRunner
+from ivy_core import attachment_verify
 from ivy_core.report_fallback import AttachmentDeliveryReceipt
 
 logger = logging.getLogger("ivy.messaging")
@@ -27,9 +28,23 @@ _runner = AppleScriptRunner(timeout=IMESSAGE_SEND_TIMEOUT_SECONDS)
 # stage outbound attachments there before sending. Verified 2026-06-29.
 _IMSG_ATTACH_STAGE = os.path.join(os.path.expanduser("~"), "Pictures", ".ivy_outbound")
 
-# Maximum attachment attempts and inter-attempt delays (seconds).
-_MAX_ATTEMPTS = 2
-_RETRY_DELAYS = (3, 10)
+# Delivery methods, tried in order until chat.db confirms one worked:
+#   "scripting" — Messages' own `send <file> to participant … of account`
+#                 verb (utils.applescript). Headless: no keystrokes, works
+#                 with the screen locked or the display asleep. Verified in
+#                 chat.db 2026-09-01 (transfer_state=5 within ~3 s).
+#   "paste"     — clipboard + Cmd-V + Return into the Messages compose field.
+#                 Fallback only. Delivered exactly once in the month before
+#                 2026-09-01 (chat.db shows one outgoing PDF, FILE_5766.pdf,
+#                 against a dozen "SUCCESS" logs): it needs an unlocked,
+#                 focused session, and it returns SUCCESS even when the
+#                 keystrokes went nowhere. Skipped while the screen is locked.
+# Order is a module constant so it can be flipped from evidence, not guesswork.
+_DELIVERY_METHODS = ("scripting", "paste")
+
+# Seconds subtracted from the send timestamp when querying chat.db, to absorb
+# clock granularity between Python and Messages.
+_VERIFY_LOOKBACK_S = 2.0
 
 
 def send_imessage(phone_number: str, message_text: str) -> bool:
@@ -41,32 +56,69 @@ def send_imessage(phone_number: str, message_text: str) -> bool:
     return False
 
 
+def _stage_for_messages(file_path: str) -> str:
+    """Copy the file under ~/Pictures (see _IMSG_ATTACH_STAGE). Returns the
+    path Messages should be pointed at — the source path if staging fails.
+
+    The staged basename gets a uuid prefix: two jobs can legitimately produce
+    `report.pdf` at the same moment, and a shared staged name could make
+    Messages attach one recipient's report to another conversation. The unique
+    name doubles as the chat.db lookup key in attachment_verify, so
+    verification can never match a different job's attachment either.
+    """
+    try:
+        os.makedirs(_IMSG_ATTACH_STAGE, mode=0o700, exist_ok=True)
+        os.chmod(_IMSG_ATTACH_STAGE, 0o700)
+        staged = os.path.join(
+            _IMSG_ATTACH_STAGE,
+            f"{uuid.uuid4().hex}-{os.path.basename(file_path)}",
+        )
+        shutil.copyfile(file_path, staged)
+        os.chmod(staged, 0o600)
+        logger.info("Staged attachment for delivery")
+        return staged
+    except OSError as exc:
+        logger.warning(
+            "Could not stage attachment; sending from source error=%s",
+            type(exc).__name__,
+        )
+        return file_path
+
+
+def _run_method(method: str, phone_number: str, staged: str) -> str:
+    if method == "paste":
+        return _runner.send_imessage_file_argv(phone_number, staged)
+    if method == "scripting":
+        return _runner.send_imessage_file_scripting_argv(phone_number, staged)
+    raise ValueError(f"unknown delivery method {method!r}")
+
+
 def send_imessage_attachment(
     phone_number: str,
     file_path: str,
     caption: Optional[str] = None,
     *,
     report_id: Optional[str] = None,
+    methods: Optional[tuple] = None,
 ) -> AttachmentDeliveryReceipt:
-    """Send a file attachment (and optional caption) via iMessage.
+    """Send a file attachment (and optional caption) via iMessage, and confirm
+    it in chat.db before claiming success.
 
-    Returns an :class:`AttachmentDeliveryReceipt` describing the outcome.
-    The receipt is truthy for ``submitted_unverified`` and
-    ``verified_delivered``; falsy for ``failed``.
+    Returns an :class:`AttachmentDeliveryReceipt`:
 
-    Retry policy
-    ------------
-    - Up to ``_MAX_ATTEMPTS`` total attempts on explicit staging/AppleScript
-      failures.
-    - Delays: ~3 s before the second attempt; ~10 s before any future attempt.
-    - A ``submitted_unverified`` result (AppleScript UI automation succeeded
-      but delivery cannot be confirmed) is **not** retried — retrying would
-      risk duplicate attachments.
-    - A ``failed`` result on the final attempt triggers the caller's fallback.
+    - ``verified_delivered``  — chat.db shows the upload finished, no error.
+    - ``submitted_unverified`` — AppleScript accepted the send but chat.db is
+      unreadable from this process AND the gateway could not be reached, or
+      the upload was still in flight at the deadline. Not retried (a retry
+      could duplicate the attachment).
+    - ``failed`` — every method either errored, left no message row, or left
+      one Messages marked as failed. The caller's text fallback runs.
+
+    Each method is tried at most once; a later method only runs after
+    chat.db proves the earlier one did not deliver.
     """
     file_path = os.path.abspath(file_path)
     report_id = report_id or str(uuid.uuid4())
-    file_size = 0
 
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
         logger.warning("Attachment missing or empty")
@@ -85,64 +137,72 @@ def send_imessage_attachment(
     if caption and not send_imessage(phone_number, caption):
         logger.warning("Caption failed to send before attachment")
 
-    staged = file_path
-    try:
-        # Never reuse a basename here. Two jobs can legitimately generate
-        # `report.pdf` at the same time; a shared staged filename could make
-        # Messages paste one recipient's report into another conversation.
-        os.makedirs(_IMSG_ATTACH_STAGE, mode=0o700, exist_ok=True)
-        os.chmod(_IMSG_ATTACH_STAGE, 0o700)
-        staged = os.path.join(
-            _IMSG_ATTACH_STAGE,
-            f"{uuid.uuid4().hex}-{os.path.basename(file_path)}",
-        )
-        shutil.copyfile(file_path, staged)
-        os.chmod(staged, 0o600)
-        logger.info("Staged attachment for delivery")
-    except OSError as exc:
-        logger.warning(
-            "Could not stage attachment; sending from source error=%s",
-            type(exc).__name__,
-        )
-        staged = file_path
+    staged = _stage_for_messages(file_path)
+    filename = os.path.basename(staged)
 
+    locked = attachment_verify.screen_is_locked()
+    order = list(methods or _DELIVERY_METHODS)
+    if locked and "paste" in order:
+        logger.info("Screen is locked — skipping keystroke-based paste delivery")
+        order.remove("paste")
+    if not order:
+        order = ["scripting"]
+
+    attempts = 0
     last_result = ""
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            delay = _RETRY_DELAYS[attempt - 2] if attempt - 2 < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
-            logger.info("Attachment attempt %d/%d: waiting %ds before retry…", attempt, _MAX_ATTEMPTS, delay)
-            time.sleep(delay)
+    last_error = "no delivery method ran"
+    for method in order:
+        attempts += 1
+        since_ts = time.time() - _VERIFY_LOOKBACK_S
+        last_result = _run_method(method, phone_number, staged)
+        if last_result != "SUCCESS":
+            last_error = f"{method}: {last_result[:120]}"
+            logger.warning(
+                "send_imessage_attachment failed method=%s attempt=%d category=%s",
+                method, attempts, _runner.last_error_category or "unknown",
+            )
+            continue
 
-        last_result = _runner.send_imessage_file_argv(phone_number, staged)
-
-        if last_result == "SUCCESS":
-            # AppleScript UI automation completed. We cannot independently
-            # verify phone delivery from Python, so we mark as unverified.
-            logger.info("send_imessage_attachment submitted attempt=%d", attempt)
+        outcome, details = attachment_verify.wait_for_attachment_outcome(
+            filename, since_ts, handle=phone_number,
+        )
+        logger.info(
+            "send_imessage_attachment method=%s attempt=%d outcome=%s source=%s",
+            method, attempts, outcome, details.get("source"),
+        )
+        if outcome == "delivered":
+            return AttachmentDeliveryReceipt.make_verified(
+                report_id=report_id,
+                attachment_path=file_path,
+                staged_path=staged,
+                file_size_bytes=file_size,
+                attempts=attempts,
+                applescript_result="SUCCESS",
+            )
+        if outcome in ("unknown", "pending"):
+            # Can't prove it failed — don't risk a duplicate by trying again.
             return AttachmentDeliveryReceipt.make_unverified(
                 report_id=report_id,
                 attachment_path=file_path,
                 staged_path=staged,
                 file_size_bytes=file_size,
-                attempts=attempt,
+                attempts=attempts,
                 applescript_result="SUCCESS",
             )
-
-        logger.warning(
-            "send_imessage_attachment attempt=%d/%d failed category=%s",
-            attempt,
-            _MAX_ATTEMPTS,
-            _runner.last_error_category or "unknown",
+        row = details.get("row") or {}
+        last_error = (
+            f"{method}: chat.db {outcome}"
+            + (f" (error={row.get('error')}, transfer_state={row.get('transfer_state')})" if row else "")
         )
+        logger.warning("send_imessage_attachment did not deliver method=%s detail=%s", method, last_error)
 
-    # All attempts exhausted.
     return AttachmentDeliveryReceipt.make_failed(
         report_id=report_id,
         attachment_path=file_path,
         staged_path=staged,
         file_size_bytes=file_size,
-        attempts=_MAX_ATTEMPTS,
-        error_code="APPLESCRIPT_FAILED",
-        error_detail=f"AppleScript returned: {last_result[:120] if last_result else 'no result'}",
+        attempts=attempts,
+        error_code="ATTACHMENT_NOT_DELIVERED",
+        error_detail=last_error[:200],
         applescript_result=last_result[:120] if last_result else "",
     )

@@ -15,7 +15,8 @@
 - Keep text replies short, concise, and direct (under 40 words).
 - Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`. The process fails closed — it refuses to start at all if `ADMIN_SECRET` is unset (set `ALLOW_INSECURE_ADMIN_SECRET=true` for local/test use only).
 - Job execution is automatic when the user mentions running jobs via iMessage — Ivy will offer and execute them.
-- Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it.
+- Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it. For attachments the receipt is chat.db itself: `send_imessage_attachment` sends via Messages' `participant … of account` scripting verb, confirms the row through `GET /imessage/attachments`, and only falls back to clipboard-paste UI automation when the screen is unlocked. AppleScript returning "SUCCESS" is not evidence of delivery — it says so even when the file was silently dropped.
+- The poller keeps the last 8 turns per sender for 45 minutes (`conversation_history` in `main.py`) so a follow-up like "yes, the full recipe" is answered in context. `run_job` fires only on a message that names a job; a bare "yes" never dispatches one.
 
 ## Job Execution System
 Ivy can run background jobs on-demand via natural language, dispatched through the single registry in `job_runner.py`. Available jobs:
@@ -23,7 +24,7 @@ Ivy can run background jobs on-demand via natural language, dispatched through t
 - **Happy Hour Scout** (aliases: happy hour, scout, hh scout) — find nearby venues and deals. `proactive_agents/happy_hour_scout.py`.
 - **Familia Meal Planner** (aliases: meals, meal plan, planner, weekly planner, household meal plan) — generate a weekly fusion meal plan. `proactive_agents/Familia_meal_planner.py`. (This replaces the old "Weekly Planner" name, which pointed at a `weekly_planner.py` that was never actually committed to any branch — the alias now resolves to the real, working implementation.)
 - **Brain** (aliases: grok, xai) — knowledge queries via Grok. Lives outside this repo at `~/ai-admin-api/agent.py`.
-- **Bravo Scout** (aliases: bravo, reality scout) — **currently unavailable**: `proactive_agents/bravo_scout.py` doesn't exist in this repo (no implementation has ever been committed to main). `/capabilities` and `./ivy list` report this honestly rather than silently omitting it or pretending it works.
+- **Bravo Scout** (aliases: bravo, reality scout) — Bravo/reality morning brief: drama headlines ranked by `drama_score`, each watchlist show's next episode and the week's reality premieres from TVmaze, and "if you liked X, try Y" picks drawn only from that real schedule. `proactive_agents/bravo_scout.py`. On-demand only, no launchd plist. Every title, network and date in the brief must come from the fetched payload — the prompt forbids inventing one.
 
 Sharp Picks and Familia Meal Planner support both a real schedule (via launchd — see `deploy/launchd/`) and ad-hoc/on-demand dispatch (via a detached subprocess, no launchd required — see `job_runner._run_entrypoint_job`). An ad-hoc request always passes `force=True`, bypassing whatever duplicate-suppression/48h-gate the scheduled cadence uses, so "run picks now" always delivers.
 
@@ -41,3 +42,6 @@ Run jobs via:
 - Check readiness/health: `GET /health` (liveness), `GET /ready` (503 if a required component is down), `GET /version` (git SHA, PID, dirty-tree state), `GET /capabilities` (tools + jobs, including unavailable ones)
 - Inspect job execution history: `GET /executions` or `GET /executions/{execution_id}` (backed by `logs/executions.db`)
 - Render (never install without review) launchd plist templates: `./deploy/install_launchd.sh` (dry-run by default; `--apply` to write, `--yes-i-know-this-is-live` required on top to touch any currently-installed scheduled job)
+- Confirm a PDF actually left the Mac: `GET /imessage/attachments?since=<unix seconds>` (rows carry a `state` of delivered / failed / pending). This is the ground truth when someone reports a missing attachment; job subprocesses have no Full Disk Access and rely on this endpoint.
+- Gateway watchdog: `com.ivy.gateway_monitor` probes `/health` and `/ready` every five minutes and texts on a confirmed transition. It rechecks a "down" verdict after 20s and needs two consecutive "degraded" readings, so a launchd relaunch or a wake-from-sleep blip does not page anyone.
+- Deeper runbook: see the `ivy-ops` skill (`.claude/skills/ivy-ops/SKILL.md`).

@@ -24,6 +24,12 @@ os.environ["XAI_API_KEY"] = "test-xai-key-not-real"  # pragma: allowlist secret
 os.environ["ODDS_API_KEY"] = ""
 os.environ["READWISE_API_KEY"] = ""
 os.environ["ENABLE_IMESSAGE_POLLER"] = "false"
+# Attachment verification reads chat.db and, when that is unavailable, falls
+# back to the gateway over HTTP. Point both at dead ends so no test can read
+# the real Messages database or query a gateway that happens to be running on
+# this machine. Port 9 (discard) refuses instantly.
+os.environ["CHAT_DB_PATH"] = "/nonexistent/test-chat.db"
+os.environ["IVY_GATEWAY_URL"] = "http://127.0.0.1:9"
 
 import pytest  # noqa: E402
 

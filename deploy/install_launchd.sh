@@ -146,6 +146,9 @@ if [ "$VALIDATE_ONLY" != true ]; then
     if grep -qF 'scripts/run_happy_hour_scout.sh' "$TEMPLATE_DIR"/*.plist.template; then
         require_path "legacy Happy Hour launcher" "$PROJECT_ROOT/scripts/run_happy_hour_scout.sh"
     fi
+    if grep -qF 'scripts/run_gateway_monitor.sh' "$TEMPLATE_DIR"/*.plist.template; then
+        require_executable "gateway monitor launcher" "$PROJECT_ROOT/scripts/run_gateway_monitor.sh"
+    fi
     private_file_check "runtime environment file" "$PROJECT_ROOT/.env"
     private_file_check "contact allowlist" "$PROJECT_ROOT/favorites.json"
 
