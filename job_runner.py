@@ -98,7 +98,10 @@ JOB_REGISTRY = [
         name="bravo_scout",
         display_name="Bravo Scout",
         aliases=["bravo", "bravoscout", "reality scout"],
-        description="Monitor Bravo reality TV schedules and episodes",
+        description=(
+            "Bravo/reality morning brief — the juiciest drama headlines, when your "
+            "shows are next on, what premieres this week, and what to watch next"
+        ),
         executor="entrypoint",
         target="com.ivy.bravoscout",  # name reserved; no plist is installed
         entrypoint="proactive_agents.bravo_scout:run",
