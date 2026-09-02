@@ -252,7 +252,7 @@ def test_reply_after_mutating_tool_is_not_suppressed(
     monkeypatch.setattr(
         main,
         "_conversation_reply",
-        lambda _text: main._execute_tool_call(
+        lambda _text, _sender=None: main._execute_tool_call(
             "add_apple_reminder", {"title": "milk", "list_name": "Household"}
         ),
     )
@@ -281,7 +281,7 @@ def test_slow_conversation_does_not_block_later_status_response(
     status_sent = threading.Event()
     sent_bodies = []
 
-    def slow_provider(_text):
+    def slow_provider(_text, _sender=None):
         provider_started.set()
         assert provider_release.wait(2)
         return "old conversation response"
@@ -333,7 +333,7 @@ def test_slow_conversation_does_not_block_job_dispatch(
     job_sent = threading.Event()
     job_calls = []
 
-    def slow_provider(_text):
+    def slow_provider(_text, _sender=None):
         provider_started.set()
         assert provider_release.wait(2)
         return "conversation result"

@@ -428,6 +428,16 @@ _IMESSAGE_LATEST_BY_SENDER: Dict[str, int] = {}
 _IMESSAGE_LATEST_LOCK = threading.RLock()
 _IMESSAGE_SEND_LOCK = threading.RLock()
 _IMESSAGE_TOOL_CONTEXT = threading.local()
+
+# Per-sender short-term memory so follow-ups are answered in context. Without
+# it every inbound text is a standalone prompt: "Yes, I want the full recipe"
+# arrived with no trace of the recipe Ivy had just offered, and DeepSeek —
+# which still has run_job in its tool schema — read it as a fresh command and
+# launched the Familia Meal Planner instead of answering.
+CONVERSATION_MAX_MESSAGES = int(os.environ.get("CONVERSATION_MAX_MESSAGES", "8"))
+CONVERSATION_TTL_SECONDS = int(os.environ.get("CONVERSATION_TTL_SECONDS", "2700"))
+_CONVERSATIONS: Dict[str, List[Dict[str, Any]]] = {}
+_CONVERSATION_LOCK = threading.RLock()
 _IMESSAGE_POLLER_LOCK_PATH = Path(__file__).resolve().parent / "logs" / "imessage-poller.lock"
 
 _CALENDAR_RUNNER = AppleScriptRunner(timeout=APPLE_CALENDAR_TIMEOUT_SECONDS)
@@ -1269,8 +1279,31 @@ def run_local_applescript_send(target: str, body: str) -> str:
 # ============================================================================
 
 
-def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
+def _provider_messages(
+    system_instruction: str,
+    text_content: str,
+    history: Optional[List[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    """Chat-completions message list: system, prior turns, then the current
+    message. Only well-formed user/assistant turns are forwarded."""
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_instruction}]
+    for turn in history or []:
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": text_content})
+    return messages
+
+
+def execute_deepseek_call(
+    text_content: str,
+    system_instruction: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """Execute call via DeepSeek API with tool calling support.
+
+    ``history`` is the sender's recent turns (see conversation_history), sent
+    ahead of the current message so a follow-up like "yes, the full recipe"
+    resolves against what Ivy just offered rather than reading as a command.
     
     Raises:
         ValueError: If DEEPSEEK_API_KEY is not configured
@@ -1294,10 +1327,7 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 
     payload = {
         "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": text_content},
-        ],
+        "messages": _provider_messages(system_instruction, text_content, history),
         "tools": DEEPSEEK_TOOL_SCHEMA,
         "temperature": 0.1,
     }
@@ -1342,8 +1372,16 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 # ============================================================================
 
 
-def execute_openai_call(text_content: str, system_instruction: str) -> str:
+def execute_openai_call(
+    text_content: str,
+    system_instruction: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """Execute call via OpenAI API with tool calling support.
+
+    ``history`` is the sender's recent turns (see conversation_history), sent
+    ahead of the current message so a follow-up like "yes, the full recipe"
+    resolves against what Ivy just offered rather than reading as a command.
     
     Raises:
        ValueError: If OPENAI_API_KEY is not configured
@@ -1367,10 +1405,7 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
 
     payload = {
        "model": "gpt-4o-mini",
-       "messages": [
-           {"role": "system", "content": system_instruction},
-           {"role": "user", "content": text_content},
-       ],
+       "messages": _provider_messages(system_instruction, text_content, history),
        "tools": DEEPSEEK_TOOL_SCHEMA,  # OpenAI uses same format as DeepSeek
        "temperature": 0.1,
        "max_tokens": 2000,
@@ -1413,14 +1448,20 @@ def execute_openai_call(text_content: str, system_instruction: str) -> str:
 # ============================================================================
 
 
-def _gemini_backup_reply(text: str) -> Optional[str]:
+def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = None) -> Optional[str]:
     """Gemini backup: prompt-cached generate_content call with real tool
     execution and a real follow-up round-trip. Raises on provider failure
     (caller treats that as "no backup available" and gives up); returns None
     if Gemini responded but had nothing usable to say.
+
+    Recent turns are folded into the user message as plain text, since the
+    cached-request helper takes a single user string.
     """
     if not os.environ.get("GEMINI_API_KEY", "").strip():
         raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    if history:
+        text = format_history_for_prompt(history) + "\n\nCurrent message: " + text
 
     # ✅ USE CACHED PROMPTS IF ENABLED
     use_caching = ENABLE_PROMPT_CACHING and CACHING_AVAILABLE
@@ -2574,16 +2615,57 @@ def _category_can_be_superseded(category: str) -> bool:
     }
 
 
-def _conversation_reply(text: str) -> str:
-    """Run the bounded DeepSeek → OpenAI → Gemini provider chain."""
+def conversation_history(sender: str) -> List[Dict[str, str]]:
+    """Recent turns for ``sender`` as [{role, content}], oldest first.
+    Entries older than CONVERSATION_TTL_SECONDS are dropped on read."""
+    cutoff = time.time() - CONVERSATION_TTL_SECONDS
+    with _CONVERSATION_LOCK:
+        turns = [t for t in _CONVERSATIONS.get(sender, []) if t["ts"] >= cutoff]
+        if turns:
+            _CONVERSATIONS[sender] = turns
+        else:
+            _CONVERSATIONS.pop(sender, None)
+        return [{"role": t["role"], "content": t["content"]} for t in turns]
+
+
+def remember_turn(sender: str, user_text: str, reply_text: Optional[str]) -> None:
+    """Record one exchange. An unanswered turn is still recorded, so a retry
+    after a provider outage still sees what the user originally asked."""
+    now = time.time()
+    with _CONVERSATION_LOCK:
+        turns = _CONVERSATIONS.setdefault(sender, [])
+        turns.append({"role": "user", "content": user_text, "ts": now})
+        if reply_text:
+            turns.append({"role": "assistant", "content": str(reply_text), "ts": now})
+        del turns[:-CONVERSATION_MAX_MESSAGES]
+
+
+def forget_conversation(sender: str) -> None:
+    with _CONVERSATION_LOCK:
+        _CONVERSATIONS.pop(sender, None)
+
+
+def format_history_for_prompt(history: List[Dict[str, str]]) -> str:
+    """Flatten turns for providers that take a single prompt string."""
+    lines = ["Recent conversation (oldest first):"]
+    for turn in history:
+        speaker = "User" if turn.get("role") == "user" else "Ivy"
+        lines.append(f"{speaker}: {turn.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _conversation_reply(text: str, sender: Optional[str] = None) -> str:
+    """Run the bounded DeepSeek → OpenAI → Gemini provider chain, with the
+    sender's recent turns supplied as context."""
     instruction = DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE.format(
         current_date_str=datetime.now().strftime("%A, %B %d, %Y")
     )
+    history = conversation_history(sender) if sender else []
     reply: Optional[str] = None
     for provider_name, provider_call in (
-        ("deepseek", lambda: execute_deepseek_call(text, instruction)),
-        ("openai", lambda: execute_openai_call(text, instruction)),
-        ("gemini", lambda: _gemini_backup_reply(text)),
+        ("deepseek", lambda: execute_deepseek_call(text, instruction, history=history)),
+        ("openai", lambda: execute_openai_call(text, instruction, history=history)),
+        ("gemini", lambda: _gemini_backup_reply(text, history=history)),
     ):
         try:
             reply = provider_call()
@@ -2595,7 +2677,11 @@ def _conversation_reply(text: str) -> str:
             )
             reply = None
         if reply:
+            if sender:
+                remember_turn(sender, text, str(reply))
             return str(reply)
+    if sender:
+        remember_turn(sender, text, None)
     return (
         "Ivy's conversation engines are temporarily unavailable. "
         "Local commands such as Run Sharp Picks still work."
@@ -2740,7 +2826,7 @@ def _process_imessage_unit(unit: ProcessingUnit) -> None:
             reply = handle_job_command(unit.text, unit.sender)
         else:
             timer, ack_finished, ack_send_gate = _start_slow_ack_timer(unit)
-            reply = _conversation_reply(unit.text)
+            reply = _conversation_reply(unit.text, unit.sender)
 
         if not reply:
             raise RuntimeError("handler produced no reply")

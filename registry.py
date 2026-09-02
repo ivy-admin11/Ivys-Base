@@ -67,9 +67,12 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
     ToolSpec(
         name="run_job",
         description=(
-            "Execute a background job on-demand. Available jobs: sharp_picks (daily picks), "
-            "happy_hour (scout nearby happy hours), bravo_scout (reality TV monitor), "
-            "familia_meal_planner (Venezuelan-American-Asian fusion meal plan), brain (knowledge queries)."
+            "Launch a background job the user EXPLICITLY asked to run, start, or send. "
+            "Available jobs: sharp_picks (daily picks), happy_hour (scout nearby happy hours), "
+            "bravo_scout (reality TV monitor), familia_meal_planner (Venezuelan-American-Asian "
+            "fusion meal plan), brain (knowledge queries). Do NOT call this to answer a question, "
+            "give a recipe or advice, or in reply to a bare 'yes'/'sure'/'send it' following a "
+            "conversational offer — only when the message itself names a job and asks for it to run."
         ),
         params=(
             ToolParam(
