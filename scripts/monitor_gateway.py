@@ -52,6 +52,16 @@ STATE_PATH = os.path.join(PROJECT_ROOT, "logs", "gateway_monitor_state.json")
 REALERT_INTERVAL_SECONDS = 3600
 HEALTH_CHECK_ATTEMPTS = 3
 HEALTH_CHECK_RETRY_DELAY_SECONDS = 2.5
+# A "down" verdict is re-checked once after this pause before alerting. The
+# gateway deliberately exits and lets launchd relaunch it when chat.db access
+# is lost (main.py: _escalate_poller_restart); that restart takes ~5-10 s, and
+# the first probe after the Mac wakes from sleep can also fail while the
+# network stack is still coming up. Neither is an outage worth a text.
+DOWN_RECHECK_DELAY_SECONDS = 20
+# "degraded" (alive, /ready failing) must be seen on two consecutive runs
+# before it is alerted: right after wake-from-sleep the poller's heartbeat is
+# a few seconds stale and /ready reports it unhealthy for one cycle.
+DEGRADED_CONSECUTIVE_RUNS_BEFORE_ALERT = 2
 
 
 def _probe_once(url: str):
@@ -141,13 +151,30 @@ def main() -> int:
     now = time.time()
     timestamp = datetime.now(timezone.utc).isoformat()
     new_status, reason = check_gateway()
+    if new_status == "down":
+        time.sleep(DOWN_RECHECK_DELAY_SECONDS)
+        new_status, reason = check_gateway()
 
     state = load_state()
     prev_status = state.get("status")
 
+    # Debounce "degraded": count consecutive sightings, alert on the Nth.
+    degraded_streak = (state.get("degraded_streak", 0) + 1) if new_status == "degraded" else 0
+    state["degraded_streak"] = degraded_streak
+    suppress_transition = (
+        new_status == "degraded"
+        and prev_status == "up"
+        and degraded_streak < DEGRADED_CONSECUTIVE_RUNS_BEFORE_ALERT
+    )
+
     alert_text = None
     if prev_status is None:
         print(f"[{timestamp}] first run, establishing baseline: gateway status={new_status} ({reason})")
+    elif suppress_transition:
+        print(
+            f"[{timestamp}] gateway status=degraded ({reason}) — first sighting, "
+            f"waiting for confirmation before alerting"
+        )
     elif new_status != prev_status:
         if new_status == "down":
             alert_text = (
@@ -176,7 +203,9 @@ def main() -> int:
         if prev_status is not None:
             print(f"[{timestamp}] gateway status={new_status} ({reason}), no alert needed")
 
-    state["status"] = new_status
+    # Keep reporting "up" until a degraded reading is confirmed, so the
+    # eventual confirmed alert still reads as an up->degraded transition.
+    state["status"] = prev_status if suppress_transition else new_status
     state["reason"] = reason
     save_state(state)
     return 0

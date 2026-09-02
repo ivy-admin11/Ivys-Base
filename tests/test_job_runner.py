@@ -7,8 +7,21 @@ launchctl command against a live scheduled job.
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from job_runner import Job, JobRunner, JobStatus
 from job_runner import job_runner as global_job_runner
+
+
+@pytest.fixture
+def unavailable_bravo(monkeypatch):
+    """Bravo Scout is a real, runnable job now (b7eb065). These tests need
+    *some* registered-but-unavailable job, so mark it unavailable for the
+    duration of the test — never let a test launch the real agent."""
+    job = global_job_runner.find_job("bravo")
+    monkeypatch.setattr(job, "available", False)
+    monkeypatch.setattr(job, "unavailable_reason", "proactive_agents/bravo_scout.py does not exist (test fixture)")
+    return job
 
 
 def test_meals_alias_resolves_to_familia_not_phantom_weekly_planner():
@@ -32,7 +45,15 @@ def test_wrong_job_alias_does_not_silently_match_another_job():
     assert picks_job.name == "sharp_picks"
 
 
-def test_bravo_scout_marked_unavailable_with_reason():
+def test_bravo_scout_is_a_registered_runnable_job():
+    job = global_job_runner.find_job("bravo")
+    assert job is not None
+    assert job.name == "bravo_scout"
+    assert job.entrypoint == "proactive_agents.bravo_scout:run"
+    assert job.available is True, job.unavailable_reason
+
+
+def test_unavailable_job_reports_reason(unavailable_bravo):
     job = global_job_runner.find_job("bravo")
     assert job.available is False
     assert "does not exist" in job.unavailable_reason
@@ -42,7 +63,7 @@ def test_gateway_is_not_registered_as_a_job():
     assert global_job_runner.find_job("gateway") is None
 
 
-def test_run_job_unavailable_never_touches_subprocess():
+def test_run_job_unavailable_never_touches_subprocess(unavailable_bravo):
     with patch("job_runner.subprocess.run") as mock_run, \
          patch("job_runner.subprocess.Popen") as mock_popen:
         status, message = global_job_runner.run_job("bravo")
@@ -57,13 +78,15 @@ def test_run_job_not_found_returns_available_jobs_list():
     assert "Sharp Picks" in message
 
 
-def test_run_job_records_a_receipt_regardless_of_outcome():
+def test_run_job_records_a_receipt_regardless_of_outcome(unavailable_bravo):
     """Regression test: unavailable/not-found attempts used to return
     before receipts.record_start() was ever called, so they never showed
     up in execution history at all."""
     from ivy_core import receipts
 
-    global_job_runner.run_job("bravo", requester="pytest")
+    with patch("job_runner.subprocess.Popen") as mock_popen:
+        global_job_runner.run_job("bravo", requester="pytest")
+    mock_popen.assert_not_called()
     recent = receipts.list_recent(limit=5, job_name="bravo_scout")
     assert recent, "bravo_scout attempt was not recorded"
     assert recent[0]["status"] == "unavailable"

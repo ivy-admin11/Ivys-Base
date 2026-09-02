@@ -14,7 +14,8 @@
 - Keep text replies short, concise, and direct (under 40 words).
 - Endpoints require the `X-API-Key` header to match `ADMIN_SECRET`. The process fails closed — it refuses to start at all if `ADMIN_SECRET` is unset (set `ALLOW_INSECURE_ADMIN_SECRET=true` for local/test use only).
 - Job execution is automatic when the user mentions running jobs via iMessage — Ivy will offer and execute them.
-- Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it.
+- Never claim a job ran, a message sent, or a file attached unless a real runtime receipt (see `/executions`, `logs/executions.db`) supports it. For attachments the receipt is chat.db itself: `ivy_core.messaging.send_imessage_attachment` sends via Messages' `participant … of account` scripting verb first, verifies the row through `GET /imessage/attachments`, and only falls back to clipboard-paste UI automation when the screen is unlocked. AppleScript's "SUCCESS" return is not evidence of delivery.
+- The iMessage poller keeps the last 8 turns per sender for 45 minutes (`conversation_history` in `main.py`) so "yes, the full recipe" is answered in context instead of dispatched as a job. `run_job` fires only on an explicit run/start/send request.
 
 ## Job Execution System
 Ivy can run background jobs on-demand via natural language, dispatched through the single registry in `job_runner.py` — job names, aliases, and entrypoints live there. Run `./ivy list` (or `GET /capabilities`) to see them all, including unavailable ones.

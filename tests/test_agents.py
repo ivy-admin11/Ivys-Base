@@ -36,7 +36,10 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
 
     result = sports_bettor.run(force=True, send=False)
 
-    assert result["result_type"] == "no_picks"
+    from ivy_core.pipeline_status import PipelineStatus
+
+    assert result["status"] == PipelineStatus.NO_QUALIFYING_PICKS.value
+    assert result["picks"] == 0
     assert result["sent"] is False
     assert sent == []
 
@@ -72,13 +75,17 @@ def test_sports_bettor_attaches_pdf_not_just_text(monkeypatch):
     assert result["attached"] is True
 
 
-def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch):
+def test_familia_meal_planner_attaches_pdf_not_just_text(monkeypatch, tmp_path):
+    # The outbox copies the PDF before sending, so the fake must really exist.
+    fake_pdf = tmp_path / "fake_meal.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(Familia_meal_planner._outbox, "OUTBOX_DIR", tmp_path / "outbox")
     monkeypatch.setattr(Familia_meal_planner, "check_48h_gate", lambda force=False: True)
     monkeypatch.setattr(
         Familia_meal_planner, "generate_family_meal_plan",
         lambda: {"status": "success", "recipe_count": 2, "recipes": []},
     )
-    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: "/tmp/fake_meal.pdf")
+    monkeypatch.setattr(Familia_meal_planner, "format_meal_plan_pdf", lambda data: str(fake_pdf))
     monkeypatch.setattr(Familia_meal_planner, "load_state", lambda: {"execution_history": []})
     monkeypatch.setattr(Familia_meal_planner, "save_state", lambda state: None)
 
@@ -99,12 +106,15 @@ def test_familia_meal_planner_force_bypasses_48h_gate():
     assert Familia_meal_planner.check_48h_gate(force=True) is True
 
 
-def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch):
+def test_happy_hour_scout_attaches_pdf_not_just_text(monkeypatch, tmp_path):
+    fake_pdf = tmp_path / "fake_hh.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+    monkeypatch.setattr(happy_hour_scout._outbox, "OUTBOX_DIR", tmp_path / "outbox")
     monkeypatch.setattr(
         happy_hour_scout, "fetch_local_specials",
         lambda: {"venues": [{"name": "Bar"}], "specials": [{"detail": "half off"}]},
     )
-    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: "/tmp/fake_hh.pdf")
+    monkeypatch.setattr(happy_hour_scout, "format_happy_hour_pdf", lambda data: str(fake_pdf))
 
     attach_calls = []
     monkeypatch.setattr(
