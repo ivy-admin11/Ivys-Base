@@ -41,7 +41,7 @@ import subprocess
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any, Callable
+from typing import List, Optional, Dict, Any, Callable, Tuple
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
@@ -76,8 +76,10 @@ from config import (
 from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 from ivy_core import receipts
 from ivy_core import outbox as _outbox
+from ivy_core import attachment_verify
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import build_attachment_failure_notice
+from utils.applescript import AppleScriptRunner
 
 # Import prompt caching manager
 try:
@@ -354,26 +356,86 @@ def _probe_gemini() -> Dict[str, Any]:
         }
 
 
-def probe_providers(*, force: bool = False) -> Dict[str, Any]:
-    """Return per-provider auth status. Cached for _PROVIDER_PROBE_TTL seconds
-    so repeated /health polls don't hammer external APIs.
-
-    Pass force=True to bypass the cache (e.g., after a key rotation)."""
-    import time as _time
-    now = _time.monotonic()
+def _provider_cache_snapshot() -> Tuple[Dict[str, Any], float]:
     with _PROVIDER_PROBE_LOCK:
         cached_at = _PROVIDER_PROBE_CACHE.get("_ts", 0.0)
-        if not force and (now - cached_at) < _PROVIDER_PROBE_TTL:
-            return {k: v for k, v in _PROVIDER_PROBE_CACHE.items() if k != "_ts"}
+        return {k: v for k, v in _PROVIDER_PROBE_CACHE.items() if k != "_ts"}, cached_at
 
-        result: Dict[str, Any] = {
-            "deepseek": _probe_deepseek(),
-            "gemini": _probe_gemini(),
-            "_ts": now,
-        }
+
+def probe_providers(*, force: bool = False) -> Dict[str, Any]:
+    """Return per-provider auth status, making live (~1-token) calls when the
+    cache is older than _PROVIDER_PROBE_TTL seconds. BLOCKS for up to ~16 s
+    on the network — never call this from /health or /ready; they use
+    cached_provider_status() and refresh in the background.
+
+    Pass force=True to bypass the cache (e.g., after a key rotation)."""
+    snapshot, cached_at = _provider_cache_snapshot()
+    if not force and snapshot and (time.monotonic() - cached_at) < _PROVIDER_PROBE_TTL:
+        return snapshot
+
+    # Network calls happen OUTSIDE the lock so a slow provider can never
+    # stall a reader that only wants the cached value.
+    result: Dict[str, Any] = {
+        "deepseek": _probe_deepseek(),
+        "gemini": _probe_gemini(),
+    }
+    with _PROVIDER_PROBE_LOCK:
         _PROVIDER_PROBE_CACHE.clear()
         _PROVIDER_PROBE_CACHE.update(result)
-        return {k: v for k, v in result.items() if k != "_ts"}
+        _PROVIDER_PROBE_CACHE["_ts"] = time.monotonic()
+    return result
+
+
+_PROVIDER_PROBE_THREAD: Optional[threading.Thread] = None
+
+
+def _refresh_provider_probe_async() -> Optional[threading.Thread]:
+    """Start a background probe unless one is already running."""
+    global _PROVIDER_PROBE_THREAD
+    if _PROVIDER_PROBE_THREAD is not None and _PROVIDER_PROBE_THREAD.is_alive():
+        return _PROVIDER_PROBE_THREAD
+    thread = threading.Thread(
+        target=probe_providers, kwargs={"force": True},
+        daemon=True, name="provider-probe",
+    )
+    _PROVIDER_PROBE_THREAD = thread
+    thread.start()
+    return thread
+
+
+def _pending_provider_status() -> Dict[str, Any]:
+    out = {}
+    for name, env_var, role in (("deepseek", "DEEPSEEK_API_KEY", "primary"),
+                                ("gemini", "GEMINI_API_KEY", "failover")):
+        configured = bool(os.environ.get(env_var, "").strip())
+        out[name] = {
+            "configured": configured, "authenticated": False, "reachable": False,
+            "role": role, "status": "pending" if configured else "unconfigured",
+            "reason": "auth probe not finished yet" if configured else f"{env_var} not set",
+        }
+    return out
+
+
+def cached_provider_status(*, wait_for_first: float = 0.0) -> Dict[str, Any]:
+    """Provider status WITHOUT touching the network on the caller's thread.
+
+    Returns the last probe result, kicking off a background refresh when it
+    is stale. Before the very first probe completes it returns a "pending"
+    placeholder — optionally waiting up to ``wait_for_first`` seconds for the
+    in-flight probe so /ready is accurate seconds after startup.
+
+    History: /health used to call probe_providers() inline. Every 60 s the
+    cache expired and the next /health blocked on two live LLM calls (8 s
+    timeout each); the monitor's 5 s request timeout expired three times in
+    a row and texted Henry "gateway DOWN" while the process was fine.
+    """
+    snapshot, cached_at = _provider_cache_snapshot()
+    if not snapshot or (time.monotonic() - cached_at) >= _PROVIDER_PROBE_TTL:
+        thread = _refresh_provider_probe_async()
+        if not snapshot and wait_for_first > 0 and thread is not None:
+            thread.join(timeout=wait_for_first)
+            snapshot, _ = _provider_cache_snapshot()
+    return snapshot or _pending_provider_status()
 
 
 
@@ -416,7 +478,9 @@ async def lifespan(app: FastAPI):
     if VOICE_ASSISTANT_AVAILABLE:
         logger.info("Voice session manager initialized and ready.")
 
-    # Start iMessage poller if enabled
+    # Warm the provider auth cache off the request path so /health and
+    # /ready never wait on the network.
+    _refresh_provider_probe_async()
 
     # Start iMessage poller if enabled
     if ENABLE_IMESSAGE_POLLER:
@@ -712,24 +776,22 @@ def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
 # ============================================================================
 
 
+_GATEWAY_APPLESCRIPT = AppleScriptRunner()
+
+
 def run_local_applescript_send(target: str, body: str) -> str:
-    """Send iMessage via AppleScript."""
-    recipient = "me" if target.lower() == "me" else target
-    script_lines = [
-        'tell application "Messages"',
-        "    try",
-        '        set targetService to first service whose service type is iMessage',
-        f'        set targetBuddy to buddy "{recipient}" of targetService',
-        f'        send "{body}" to targetBuddy',
-        '        return "SUCCESS"',
-        "    on error errMsg",
-        '        return "ERROR: " & errMsg',
-        "    end try",
-        "end tell",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip()
+    """Send an iMessage reply. Returns "SUCCESS" or an "ERROR: ..." string.
+
+    Routed through the argv-based runner: the body is passed as a process
+    argument, never interpolated into AppleScript source. The old f-string
+    version broke on any reply containing a double quote (a recipe calling
+    for "00" flour never reached Henry on 2026-08-28) and had no timeout, so
+    a hung Messages.app could wedge the poller thread indefinitely.
+    """
+    result = _GATEWAY_APPLESCRIPT.send_imessage_argv(target, body)
+    if result != "SUCCESS":
+        logger.error("iMessage reply to %s was NOT sent: %s", target, result[:200])
+    return result
 
 
 # ============================================================================
@@ -737,8 +799,17 @@ def run_local_applescript_send(target: str, body: str) -> str:
 # ============================================================================
 
 
-def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
-    """Execute call via DeepSeek API with tool calling support."""
+def execute_deepseek_call(
+    text_content: str,
+    system_instruction: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Execute call via DeepSeek API with tool calling support.
+
+    ``history`` is the sender's recent turns (see conversation_history) so a
+    follow-up like "yes, the full recipe" is read against what Ivy just
+    offered instead of as a standalone command.
+    """
     active_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not active_key:
         logger.warning("DeepSeek call attempted with no DEEPSEEK_API_KEY configured.")
@@ -749,12 +820,15 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
     url = "https://api.deepseek.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {active_key}", "Content-Type": "application/json"}
 
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_instruction}]
+    for turn in history or []:
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": text_content})
+
     payload = {
         "model": "deepseek-v4-flash",
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": text_content},
-        ],
+        "messages": messages,
         "tools": DEEPSEEK_TOOL_SCHEMA,
         "temperature": 0.1,
     }
@@ -798,14 +872,20 @@ def execute_deepseek_call(text_content: str, system_instruction: str) -> str:
 # ============================================================================
 
 
-def _gemini_backup_reply(text: str) -> Optional[str]:
+def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = None) -> Optional[str]:
     """Gemini backup: prompt-cached generate_content call with real tool
     execution and a real follow-up round-trip. Raises on provider failure
     (caller treats that as "no backup available" and gives up); returns None
     if Gemini responded but had nothing usable to say.
+
+    Recent conversation turns are folded into the user message as plain text
+    (the cached-request helper only takes a single user string).
     """
     if not os.environ.get("GEMINI_API_KEY", "").strip():
         raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    if history:
+        text = format_history_for_prompt(history) + "\n\nCurrent message: " + text
 
     # ✅ USE CACHED PROMPTS IF ENABLED
     use_caching = ENABLE_PROMPT_CACHING and CACHING_AVAILABLE
@@ -934,7 +1014,10 @@ def query_llm_with_tools(prompt_text: str) -> str:
 
 
 def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
-    """Fetch next message from chat.db with retry logic and read-only mode."""
+    """Fetch next message from chat.db with retry logic and read-only mode.
+
+    Raises the last sqlite3 error if every attempt fails."""
+    last_error: Exception = sqlite3.OperationalError("chat.db read failed")
     for attempt in range(DB_RETRY_ATTEMPTS):
         try:
             # Use read-only mode to prevent accidental mutations
@@ -957,6 +1040,7 @@ def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
             conn.close()
             return row
         except sqlite3.OperationalError as e:
+            last_error = e
             backoff = DB_RETRY_BACKOFF * (2 ** attempt)
             logger.warning(
                 "Database read attempt %d failed: %s. Retrying in %.1f seconds...",
@@ -965,7 +1049,9 @@ def safe_fetch_last_message(last_id: int) -> Optional[tuple]:
                 backoff,
             )
             time.sleep(backoff)
-    return None
+    # Returning None here would be indistinguishable from "no new message"
+    # and would let the poller mark a failed read as a healthy cycle.
+    raise last_error
 
 
 def get_last_message_id() -> Optional[int]:
@@ -1138,6 +1224,53 @@ def handle_resend_command(text: str, sender: str) -> Optional[str]:
 POLLER_MAX_BACKOFF_SECONDS = 60
 POLLER_ESCALATE_AFTER_SECONDS = int(os.environ.get("POLLER_ESCALATE_AFTER_SECONDS", "300"))
 POLLER_STALE_AFTER_SECONDS = int(os.environ.get("POLLER_STALE_AFTER_SECONDS", "300"))
+# macOS TCC "authorization denied" on chat.db is never transient for a
+# running process — observed 2026-07-16, 2026-08-24 and 2026-09-01, each time
+# only a fresh process got access back. So it is escalated after this many
+# consecutive failures (~10 s) instead of after POLLER_ESCALATE_AFTER_SECONDS,
+# which left Ivy deaf for five minutes and gave the monitor time to page.
+POLLER_AUTH_DENIED_MAX_FAILURES = int(os.environ.get("POLLER_AUTH_DENIED_MAX_FAILURES", "3"))
+
+# Per-sender short-term memory so follow-ups ("yes", "the full recipe") are
+# answered in context. Without it, "Yes, I want the full recipe" arrived as a
+# standalone message and DeepSeek launched the Familia Meal Planner job
+# (2026-08-28) instead of giving the pizza-dough recipe it had just offered.
+CONVERSATION_MAX_MESSAGES = int(os.environ.get("CONVERSATION_MAX_MESSAGES", "8"))
+CONVERSATION_TTL_SECONDS = int(os.environ.get("CONVERSATION_TTL_SECONDS", "2700"))
+_CONVERSATIONS: Dict[str, List[Dict[str, Any]]] = {}
+_CONVERSATIONS_LOCK = threading.Lock()
+
+
+def conversation_history(sender: str) -> List[Dict[str, str]]:
+    """Recent turns for ``sender`` as [{role, content}], oldest first.
+    Entries older than CONVERSATION_TTL_SECONDS are dropped."""
+    cutoff = time.time() - CONVERSATION_TTL_SECONDS
+    with _CONVERSATIONS_LOCK:
+        turns = [t for t in _CONVERSATIONS.get(sender, []) if t["ts"] >= cutoff]
+        _CONVERSATIONS[sender] = turns
+        return [{"role": t["role"], "content": t["content"]} for t in turns]
+
+
+def remember_turn(sender: str, user_text: str, reply_text: Optional[str]) -> None:
+    now = time.time()
+    with _CONVERSATIONS_LOCK:
+        turns = _CONVERSATIONS.setdefault(sender, [])
+        turns.append({"role": "user", "content": user_text, "ts": now})
+        if reply_text:
+            turns.append({"role": "assistant", "content": str(reply_text), "ts": now})
+        del turns[:-CONVERSATION_MAX_MESSAGES]
+
+
+def format_history_for_prompt(history: List[Dict[str, str]]) -> str:
+    lines = ["Recent conversation (oldest first):"]
+    for turn in history:
+        speaker = "User" if turn.get("role") == "user" else "Ivy"
+        lines.append(f"{speaker}: {turn.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _is_tcc_denial(exc: BaseException) -> bool:
+    return "authorization denied" in str(exc).lower()
 # Escape hatch: a developer running `uvicorn main:app` by hand does not want a
 # broken chat.db to kill their foreground server after five minutes.
 POLLER_EXIT_ON_UNRECOVERABLE = os.environ.get("POLLER_EXIT_ON_UNRECOVERABLE", "true").lower() == "true"
@@ -1190,7 +1323,10 @@ def poller_healthy() -> bool:
     reference = POLLER_STATE["last_success_ts"] or POLLER_STATE["started_at"]
     if reference is None:
         return False
-    return (time.time() - reference) < POLLER_STALE_AFTER_SECONDS
+    # monotonic, not wall-clock: on macOS it does not advance while the Mac
+    # sleeps, so the first /ready after wake doesn't see a "stale" heartbeat
+    # that is really just the nap the whole machine took.
+    return (time.monotonic() - reference) < POLLER_STALE_AFTER_SECONDS
 
 
 def background_imessage_worker() -> None:
@@ -1203,7 +1339,7 @@ def background_imessage_worker() -> None:
     
     POLLER_STATE.update({
         "running": True,
-        "started_at": time.time(),
+        "started_at": time.monotonic(),
         "consecutive_failures": 0,
         "last_error": None,
     })
@@ -1225,6 +1361,14 @@ def background_imessage_worker() -> None:
         if (time.time() - startup_began) >= POLLER_ESCALATE_AFTER_SECONDS:
             _escalate_poller_restart("chat.db unreadable throughout poller startup")
             return
+        if startup_attempt >= POLLER_AUTH_DENIED_MAX_FAILURES and not (
+            os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK)
+        ):
+            _escalate_poller_restart(
+                f"chat.db access denied at startup ({startup_attempt} attempts) — "
+                "Full Disk Access is missing for the interpreter launchd starts"
+            )
+            return
         time.sleep(min(2 ** startup_attempt, POLLER_MAX_BACKOFF_SECONDS))
         last_id = get_last_message_id()
 
@@ -1244,7 +1388,7 @@ def background_imessage_worker() -> None:
         first_failure_ts = None
         POLLER_STATE["consecutive_failures"] = 0
         POLLER_STATE["last_error"] = None
-        POLLER_STATE["last_success_ts"] = time.time()
+        POLLER_STATE["last_success_ts"] = time.monotonic()
 
     while True:
         try:
@@ -1300,10 +1444,12 @@ def background_imessage_worker() -> None:
                 _mark_poll_success()
                 continue
 
+            history = conversation_history(sender)
+
             # ========== PHASE 1: DEEPSEEK PRIMARY ==========
             try:
-                logger.info("🧠 Querying Primary Engine (DeepSeek)...")
-                reply = execute_deepseek_call(text, deepseek_sys_instruction)
+                logger.info("🧠 Querying Primary Engine (DeepSeek, %d prior turns)...", len(history))
+                reply = execute_deepseek_call(text, deepseek_sys_instruction, history=history)
             except Exception as deepseek_err:
                 logger.error(
                     "❌ DeepSeek Primary Layer Fault: %s. Switching to Backup Protocol...",
@@ -1315,7 +1461,7 @@ def background_imessage_worker() -> None:
             if not reply:
                 try:
                     logger.info("🛡️ Primary Engine Offline. Engaging Backup Core (Gemini SDK)...")
-                    reply = _gemini_backup_reply(text)
+                    reply = _gemini_backup_reply(text, history=history)
                 except Exception as gemini_err:
                     logger.error(
                         "❌ Gemini Backup Layer Fault: %s\nException type: %s\nFull traceback: %s.",
@@ -1327,10 +1473,13 @@ def background_imessage_worker() -> None:
 
             # ========== DISPATCH RESPONSE ==========
             if reply:
-                logger.info("📤 Clean prose payload dispatched back via local AppleScript link.")
-                run_local_applescript_send(sender, str(reply))
+                send_result = run_local_applescript_send(sender, str(reply))
+                if send_result == "SUCCESS":
+                    logger.info("📤 Reply delivered to Messages for %s (%d chars).", sender, len(str(reply)))
+                remember_turn(sender, text, str(reply))
             else:
                 logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
+                remember_turn(sender, text, None)
 
             _mark_poll_success()
 
@@ -1347,7 +1496,13 @@ def background_imessage_worker() -> None:
                 failing_for,
                 str(database_err),
             )
-            if failing_for >= POLLER_ESCALATE_AFTER_SECONDS:
+            if _is_tcc_denial(database_err) and consecutive_failures >= POLLER_AUTH_DENIED_MAX_FAILURES:
+                _escalate_poller_restart(
+                    f"chat.db access revoked — 'authorization denied' {consecutive_failures}x in "
+                    f"{failing_for:.0f}s; only a relaunch gets Full Disk Access back"
+                )
+                first_failure_ts = time.time()  # only reached when exit is disabled
+            elif failing_for >= POLLER_ESCALATE_AFTER_SECONDS:
                 _escalate_poller_restart(
                     f"{consecutive_failures} consecutive polling failures over {failing_for:.0f}s"
                 )
@@ -1368,9 +1523,10 @@ def health_endpoint(authenticated: bool = Depends(verify_api_key)):
 
     Reports configured/authenticated/reachable for each LLM provider so the
     difference between a missing key and a rejected key is always visible.
-    Results are cached for 60 s to avoid hammering external APIs on every poll.
+    Never touches the network on the request thread — provider auth comes
+    from the background probe cache (see cached_provider_status).
     """
-    providers = probe_providers()
+    providers = cached_provider_status()
     return {
         "status": "ok",
         "providers": providers,
@@ -1417,8 +1573,9 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
         logger.warning("Receipts DB check failed: %s", exc)
         checks["receipts_db_writable"] = False
 
-    # Use cached probe result so /ready doesn't trigger a new network call.
-    providers = probe_providers()
+    # Cached probe only — waits briefly for the first probe right after
+    # startup, never runs one on this thread.
+    providers = cached_provider_status(wait_for_first=4.0)
     any_authenticated = any(p.get("authenticated") for p in providers.values())
     checks["llm_provider_authenticated"] = any_authenticated
 
@@ -1427,6 +1584,31 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     if not ready:
         raise HTTPException(status_code=503, detail=payload)
     return payload
+
+
+@app.get("/imessage/attachments")
+def imessage_attachments_endpoint(
+    since: float,
+    filename: Optional[str] = None,
+    handle: Optional[str] = None,
+    limit: int = 20,
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Outgoing attachment rows from chat.db newer than ``since`` (unix
+    seconds), optionally narrowed to one ``filename`` (the name the recipient
+    sees) and/or one ``handle`` (phone number). Each row carries a ``state``
+    of delivered / failed / pending.
+
+    This is how job subprocesses — which lack Full Disk Access — verify that
+    a PDF they just sent actually left the Mac (ivy_core.attachment_verify).
+    """
+    try:
+        rows = attachment_verify.fetch_outgoing_attachments(
+            since_ts=since, filename=filename or None, handle=handle or None, limit=limit,
+        )
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"chat.db unreadable: {exc}")
+    return {"attachments": rows, "count": len(rows)}
 
 
 @app.get("/version")
