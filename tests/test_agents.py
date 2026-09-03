@@ -272,3 +272,26 @@ def test_sports_bettor_stays_quiet_on_an_unchanged_below_bar_board(monkeypatch, 
     sports_bettor.run(force=False, send=True)
 
     assert sent == [], "an unchanged below-the-bar board must not nag"
+
+
+def test_player_props_do_not_borrow_the_game_market_price():
+    """Live run 2026-09-02: 'David Peterson Under 4.5 Strikeouts' was texted with
+    '(Over 8 (-117) / Under 8 (-103))' — the game's run total, not the prop's
+    price, and a contradicting number besides."""
+    games = [{
+        "away": "Milwaukee Brewers", "home": "Chicago Cubs", "sport": "MLB",
+        "total": "Over 8 (-117) / Under 8 (-103)",
+        "moneyline": "MIL +105 / CHC -125", "spread": "MIL +1.5",
+        "commence": "2026-09-03T23:15:00Z",
+    }]
+    picks = [
+        {"matchup": "Milwaukee Brewers @ Chicago Cubs",
+         "side": "David Peterson Under 4.5 Strikeouts"},
+        {"matchup": "Milwaukee Brewers @ Chicago Cubs", "side": "Under 8.5"},
+    ]
+    sports_bettor.attach_odds(picks, games)
+
+    assert not picks[0].get("odds"), "a prop must not inherit the game total"
+    assert picks[0]["sport"] == "MLB", "sport and start time still backfill"
+    assert picks[0]["start"] == "2026-09-03T23:15:00Z"
+    assert picks[1]["odds"] == "Over 8 (-117) / Under 8 (-103)", "real game totals still fill"

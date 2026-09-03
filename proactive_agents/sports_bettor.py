@@ -496,6 +496,32 @@ def _odds_for_side(side, game):
     return ml or spread or total
 
 
+# Stat words that mark a bet as a PLAYER PROP rather than a game market. The
+# odds feed carries moneyline/spread/total for the game only, so a prop has no
+# matching market in it — see _is_player_prop.
+_PROP_STAT_HINTS = (
+    "strikeout", "strike out", " k's", " ks ", "punchout",
+    "point", "rebound", "assist", "three", "3pt", "block", "steal", "double-double",
+    "yard", "reception", "completion", "touchdown", "carries", "attempt", "sack",
+    "hit", "rbi", "run scored", "total base", "home run", "walk", "steal",
+    "shot", "save", "goal", "ace", "birdie", "pra", "pts",
+)
+
+
+def _is_player_prop(side):
+    """True when a bet is on a player's stat line, not a game market.
+
+    The game total is not the price of 'Peterson Under 4.5 Strikeouts', and
+    printing it next to the pick puts two contradicting numbers in the same
+    line of the text. When the feed has no matching market, show no price.
+    """
+    s = str(side or "").lower()
+    if not s:
+        return False
+    # "Under 4.5 Strikeouts" — a threshold followed (anywhere) by a stat word.
+    return any(hint.strip() in s for hint in _PROP_STAT_HINTS)
+
+
 def attach_odds(merged, games):
     """Backfill each pick's sport/odds from the live feed (ground truth) by matchup."""
     for e in merged:
@@ -509,7 +535,9 @@ def attach_odds(merged, games):
             if not e.get("sport"):
                 e["sport"] = best["sport"]
             # Fill odds from the market that matches the actual bet type.
-            if not e.get("odds"):
+            # Player props are deliberately left blank: the feed only carries
+            # game markets, and a wrong price is worse than no price.
+            if not e.get("odds") and not _is_player_prop(e.get("side")):
                 e["odds"] = _odds_for_side(e.get("side"), best)
             # The odds feed is authoritative for the scheduled start time.
             if best.get("commence"):
