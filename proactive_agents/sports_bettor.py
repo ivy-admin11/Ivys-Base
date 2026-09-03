@@ -47,13 +47,10 @@ from zoneinfo import ZoneInfo
 import requests
 from filelock import FileLock, Timeout
 
-from ivy_core import require_env, send_imessage, send_imessage_attachment
+from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
-from ivy_core.report_fallback import (
-    build_attachment_failure_notice,
-    split_imessage_content,
-)
+from ivy_core.text_delivery import build_detail, deliver_report
 from picks_formatter import PicksReportFormatter
 from ivy_core.pipeline_status import (
     PipelineStatus,
@@ -896,6 +893,135 @@ def format_picks_by_sport(merged):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Text-first delivery: concise digest + the detail behind MORE / WHY
+# ---------------------------------------------------------------------------
+
+# How many picks ride in the first message. The rest are one "MORE" away.
+DIGEST_TOP_N = 5
+
+# Below-the-bar boards get a shorter list — it's context, not a play.
+NEAR_MISS_TOP_N = 3
+
+_SPORT_EMOJI = {
+    "MLB": "\u26be", "NBA": "\U0001F3C0", "NFL": "\U0001F3C8", "NHL": "\U0001F3D2",
+    "NCAAF": "\U0001F3C8", "NCAAB": "\U0001F3C0", "MLS": "\u26bd", "Soccer": "\u26bd",
+    "World Cup": "\u26bd", "Tennis": "\U0001F3BE", "Golf": "\u26f3", "UFC": "\U0001F94A",
+}
+
+
+def _rank_picks(merged):
+    """Order picks the way a bettor reads them: consensus first, then by how
+    many sharps back the play, then by sport for a stable tiebreak."""
+    return sorted(
+        merged,
+        key=lambda e: (
+            0 if e.get("is_consensus") else 1,
+            -int(e.get("consensus_count") or len(e.get("handicappers") or []) or 1),
+            _norm(e.get("sport")),
+            _norm(e.get("matchup")),
+        ),
+    )
+
+
+def _pick_headline(e, n):
+    """One numbered line for a pick — the unit both the digest and MORE send."""
+    emoji = _SPORT_EMOJI.get(e.get("sport") or "", "\U0001F4CA")
+    matchup = e.get("matchup") or "TBD"
+    side = e.get("side") or ""
+    odds = f" ({e['odds']})" if e.get("odds") else ""
+    grade, count = _confidence(e)
+    when = _pick_when(e)
+    line = f"{n}. {emoji} {matchup} \u2014 {side}{odds}".rstrip()
+    meta = [f"{grade} \u00b7 {count} sharp{'' if count == 1 else 's'}"]
+    if when:
+        meta.append(when)
+    line += "\n   " + " \u00b7 ".join(meta)
+    return line
+
+
+def _pick_reasoning(e, n):
+    """The WHY <n> answer: why this bet, in the sharps' own terms."""
+    grade, count = _confidence(e)
+    handles = e.get("handicappers") or []
+    matchup = e.get("matchup") or "TBD"
+    side = e.get("side") or ""
+    odds = f" ({e['odds']})" if e.get("odds") else ""
+
+    lines = [f"\U0001F50E #{n} \u2014 {matchup}: {side}{odds}".rstrip()]
+    when = _pick_when(e)
+    if when:
+        lines.append(f"\U0001F551 {when}")
+    credit = ", ".join(f"@{h}" for h in handles) if handles else f"{count} sharp{'' if count == 1 else 's'}"
+    lines.append(f"\U0001F4CA Confidence {grade} \u00b7 backed by {credit}")
+
+    enr = e.get("enrichment") or {}
+    take = enr.get("take")
+    if not _is_placeholder(take):
+        lines.append("")
+        lines.append(str(take))
+
+    extras = []
+    if enr.get("line_movement"):
+        extras.append(f"Line: {enr['line_movement']}")
+    if enr.get("injury"):
+        extras.append(f"Inj: {enr['injury']}")
+    if enr.get("sharp_public"):
+        extras.append(str(enr["sharp_public"]))
+    if extras:
+        lines.append("")
+        lines.append(" \u00b7 ".join(extras))
+
+    if len(lines) <= 3:
+        lines.append("")
+        lines.append(
+            "No extra context came back on this one \u2014 it is on the board purely "
+            "because the sharps above are on it."
+        )
+    return "\n".join(lines)
+
+
+def format_picks_digest(merged, top_n=DIGEST_TOP_N):
+    """Return ``(body, detail)`` for the text-first picks report.
+
+    ``body`` is the concise iMessage: header, counts, and the top plays only.
+    ``detail`` carries every pick's headline and reasoning so the inbound
+    poller can answer MORE and WHY <n> without re-running the sweep.
+    """
+    ranked = _rank_picks(merged)
+    consensus_n = sum(1 for e in ranked if e.get("is_consensus"))
+    shown = min(top_n, len(ranked))
+
+    header = f"\U0001F512 Ivy's Sharp Picks \u2014 {datetime.now():%b %-d, %-I:%M %p}"
+    counts = (
+        f"{len(ranked)} pick{'' if len(ranked) == 1 else 's'} \u00b7 "
+        f"{consensus_n} consensus"
+    )
+
+    blocks = [f"{header}\n{counts}"]
+    if consensus_n:
+        blocks.append("\U0001F525 TOP PLAYS")
+    for i, e in enumerate(ranked[:shown], 1):
+        blocks.append(_pick_headline(e, i))
+
+    remaining = len(ranked) - shown
+    if remaining > 0:
+        blocks.append(
+            f"+{remaining} more pick{'' if remaining == 1 else 's'} \u2014 reply MORE"
+        )
+
+    detail = build_detail(
+        title=header,
+        items=[
+            {"headline": _pick_headline(e, i), "detail": _pick_reasoning(e, i)}
+            for i, e in enumerate(ranked, 1)
+        ],
+        shown=shown,
+        more_intro="\U0001F4CC The rest of today's board:",
+    )
+    return "\n\n".join(blocks), detail
+
+
 def format_picks_pdf(merged) -> str:
     """Generate a professional PDF report of sharp picks.
 
@@ -1154,6 +1280,41 @@ def _run_pipeline(
         result.picks_count = 0
         result.consensus_count = 0
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
+
+        # A sweep that surfaced real picks and then filtered them all out used
+        # to return here in total silence — which reads, from the phone, as the
+        # job simply not running. Ivy says what she saw instead, deduped by the
+        # same fingerprint so an unchanged board doesn't nag.
+        near_signature = _report_signature(merged)
+        last = load_last_report()
+        if not send:
+            return result.to_dict()
+        if not force and last.get("signature") == near_signature:
+            print("🔁 Same below-the-bar board as last report — staying quiet.")
+            return result.to_dict()
+
+        body, detail = format_picks_digest(merged, top_n=NEAR_MISS_TOP_N)
+        body = body.replace(
+            "\U0001F512 Ivy's Sharp Picks", "\U0001F440 Ivy's Sharp Picks \u2014 nothing bettable", 1
+        )
+        body += (
+            "\n\nNone of these cleared the bar (needs 2+ sharps, or one sharp at "
+            "medium/high confidence), so I'm not calling them plays \u2014 just "
+            "showing you what the sweep saw."
+        )
+        delivery = deliver_report(
+            HENRY_PHONE,
+            job_name="sharp_picks",
+            body=body,
+            detail=detail,
+            content_summary=f"{len(merged)} below-threshold pick(s) — {datetime.now():%b %-d}",
+            commands=("MORE", "WHY <n>"),
+        )
+        if delivery.delivered:
+            save_last_report(near_signature, body)
+            result.report_id = delivery.report_id
+            result.sent = True
+            print(f"📨 Sent below-threshold summary to Henry ({len(merged)} pick(s)).")
         return result.to_dict()
     
     consensus_n = sum(1 for p in filtered_picks if p["is_consensus"])
@@ -1191,63 +1352,58 @@ def _run_pipeline(
         result.status = PipelineStatus.SUCCESS
         return result.to_dict()
 
-    # Generate PDF report and send as a real iMessage attachment.
-    print("📄 Generating PDF picks report...")
-    pdf_path = format_picks_pdf(filtered_picks)
-    print(f"✅ PDF generated: {pdf_path}")
+    # Text-first delivery. The PDF is generated and archived, never pushed:
+    # attachment sends came back "submitted_unverified" far more often than
+    # they came back delivered, and the old code treated that as success —
+    # which is exactly how reports went missing with no fallback text.
+    body, detail = format_picks_digest(filtered_picks)
 
-    receipt = send_imessage_attachment(HENRY_PHONE, pdf_path, report_id=report_id)
+    pdf_path = None
     try:
-        _outbox.save_report(
-            report_id, pdf_path,
-            job_name="sharp_picks",
-            recipient=HENRY_PHONE,
-            content_summary=content_summary,
-        )
-        _outbox.update_report_status(
-            report_id, getattr(receipt, "status", "submitted_unverified"),
-            attempts=getattr(receipt, "attempts", 1),
-        )
-    except Exception as _oe:
-        print(f"⚠️  Outbox tracking skipped: {_oe}")
+        pdf_path = format_picks_pdf(filtered_picks)
+        print(f"📄 PDF archived for on-request delivery: {pdf_path}")
+    except Exception as _pe:
+        # A broken PDF must never cost Henry the picks themselves.
+        print(f"⚠️  PDF generation skipped: {_pe}")
 
-    if receipt:
-        save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via PDF.")
-        result.sent = True
-        result.attached = True
-        result.status = PipelineStatus.SUCCESS
-        result.message = f"Report {report_id} sent successfully."
-        return result.to_dict()
-
-    # Fallback: PDF attachment failed — send text instead, never fail silently.
-    print("⚠️  PDF attachment failed — falling back to text")
-    notice = build_attachment_failure_notice(
-        report_name="Sharp Picks",
+    delivery = deliver_report(
+        HENRY_PHONE,
+        job_name="sharp_picks",
+        body=body,
         report_id=report_id,
-        resend_command="RESEND PICKS",
-        retry_queued=True,
+        detail=detail,
+        pdf_path=pdf_path,
+        content_summary=content_summary,
+        commands=("MORE", "WHY <n>", "PDF"),
     )
-    send_imessage(HENRY_PHONE, notice)
-    report_text = format_picks_by_sport(filtered_picks)
-    bubbles = split_imessage_content(report_text)
-    delivered_text = all(send_imessage(HENRY_PHONE, b) for b in bubbles)
 
-    if delivered_text:
-        save_last_report(signature, signature)
-        print(f"✅ {len(filtered_picks)} pick(s) reported to Henry ({consensus_n} consensus) via text fallback.")
+    if delivery.delivered:
+        save_last_report(signature, body)
+        print(
+            f"✅ {len(filtered_picks)} pick(s) texted to Henry "
+            f"({consensus_n} consensus) in {delivery.bubbles_total} bubble(s)."
+        )
         result.sent = True
         result.attached = False
         result.status = PipelineStatus.SUCCESS
-        result.message = f"Report {report_id} sent (text fallback)."
+        result.message = f"Report {report_id} sent as text."
         return result.to_dict()
 
-    # Fallback if text send also failed
-    print("⚠️  Text delivery also failed")
-    print(f"Report ID {report_id} queued for retry")
-    result.sent = False
+    # Partial or total text failure. Do NOT stamp the fingerprint — the next
+    # run must be free to try the same slate again.
+    print(
+        f"⚠️  Text delivery {delivery.status}: "
+        f"{delivery.bubbles_sent}/{delivery.bubbles_total} bubble(s) sent."
+    )
+    print(f"Report ID {report_id} preserved in the outbox for retry")
+    result.sent = delivery.bubbles_sent > 0
     result.status = PipelineStatus.INTERNAL_ERROR
-    result.message = f"Report {report_id} failed to send — queued for retry"
+    result.message = (
+        f"Report {report_id} only partially delivered "
+        f"({delivery.bubbles_sent}/{delivery.bubbles_total} bubbles)."
+        if delivery.bubbles_sent
+        else f"Report {report_id} failed to send — preserved for retry"
+    )
     return result.to_dict()
 
 

@@ -11,10 +11,17 @@ Report IDs
 - HH-YYYYMMDD-HHMM   — Happy Hour Scout
 - MP-YYYYMMDD-HHMM   — Familia Meal Planner
 
-Each report is stored as two files:
+Each report is stored as up to three files:
 
-    data/outbox/{report_id}.pdf   — the finalized PDF
-    data/outbox/{report_id}.json  — metadata (no secrets)
+    data/outbox/{report_id}.pdf         — the finalized PDF, when the job
+                                          still builds one. Since 2026-09-03
+                                          this is an ARCHIVE, not the delivery:
+                                          reports go out as text and the PDF is
+                                          sent only on request (see
+                                          :mod:`ivy_core.text_delivery`).
+    data/outbox/{report_id}.json        — metadata (no secrets)
+    data/outbox/{report_id}.detail.json — per-item payload backing the MORE and
+                                          WHY <n> reply commands
 
 Metadata keys: report_id, job_name, recipient, content_summary,
 generated_at (ISO-8601 UTC), status, send_attempts, latest_status.
@@ -60,6 +67,10 @@ def _pdf_path(report_id: str) -> Path:
     return OUTBOX_DIR / f"{report_id}.pdf"
 
 
+def _detail_path(report_id: str) -> Path:
+    return OUTBOX_DIR / f"{report_id}.detail.json"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -82,22 +93,28 @@ def make_report_id(job_name: str) -> str:
 
 def save_report(
     report_id: str,
-    pdf_path: str,
+    pdf_path: Optional[str],
     job_name: str,
     recipient: str,
     content_summary: str,
     *,
     status: str = "pending",
-) -> Path:
-    """Copy the finalized PDF to the outbox and write metadata.
+) -> Optional[Path]:
+    """Record a report in the outbox, copying its PDF when there is one.
 
-    Returns the destination PDF path. Excludes all secrets from metadata.
+    ``pdf_path`` may be None: text-only jobs still get an outbox entry so the
+    reply commands (MORE / WHY / PDF) can find the report by ID. Returns the
+    destination PDF path, or None when the report has no PDF.
     """
     _ensure_outbox()
 
-    dest = _pdf_path(report_id)
-    shutil.copy2(pdf_path, dest)
-    logger.info("Outbox: saved %s (%d bytes)", report_id, dest.stat().st_size)
+    dest: Optional[Path] = None
+    if pdf_path:
+        dest = _pdf_path(report_id)
+        shutil.copy2(pdf_path, dest)
+        logger.info("Outbox: saved %s (%d bytes)", report_id, dest.stat().st_size)
+    else:
+        logger.info("Outbox: saved %s (text-only, no PDF)", report_id)
 
     meta: Dict[str, Any] = {
         "report_id": report_id,
@@ -108,6 +125,7 @@ def save_report(
         "status": status,
         "send_attempts": 0,
         "latest_status": status,
+        "has_pdf": dest is not None,
     }
     _meta_path(report_id).write_text(json.dumps(meta, indent=2))
     return dest
@@ -154,6 +172,8 @@ def find_newest_pending(job_name: str) -> Optional[str]:
     _ensure_outbox()
     candidates: List[tuple] = []
     for meta_file in OUTBOX_DIR.glob("*.json"):
+        if meta_file.name.endswith(".detail.json"):
+            continue
         try:
             meta = json.loads(meta_file.read_text())
             if (
@@ -161,6 +181,57 @@ def find_newest_pending(job_name: str) -> Optional[str]:
                 and meta.get("status") in ("pending", "failed")
             ):
                 candidates.append((meta["generated_at"], meta["report_id"]))
+        except Exception:
+            pass
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def save_detail(report_id: str, job_name: str, detail: Dict[str, Any]) -> Path:
+    """Persist the per-item payload backing the MORE / WHY reply commands."""
+    _ensure_outbox()
+    payload = dict(detail)
+    payload["report_id"] = report_id
+    payload["job_name"] = job_name
+    payload["saved_at"] = datetime.now(timezone.utc).isoformat()
+    path = _detail_path(report_id)
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def load_detail(report_id: str) -> Optional[Dict[str, Any]]:
+    """Load a report's per-item payload. None if absent or unparseable."""
+    path = _detail_path(report_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception as exc:
+        logger.warning("Outbox: could not parse detail for %s: %s", report_id, exc)
+        return None
+
+
+def find_newest(job_name: str, *, with_detail: bool = False) -> Optional[str]:
+    """Newest report ID for a job regardless of status.
+
+    ``find_newest_pending`` only sees pending/failed reports, which is the
+    wrong lens for reply commands: a report that was delivered as text is
+    exactly the one MORE / WHY / PDF should act on.
+    """
+    _ensure_outbox()
+    candidates: List[tuple] = []
+    for meta_file in OUTBOX_DIR.glob("*.json"):
+        if meta_file.name.endswith(".detail.json"):
+            continue
+        try:
+            meta = json.loads(meta_file.read_text())
+            if meta.get("job_name") != job_name:
+                continue
+            if with_detail and not _detail_path(meta["report_id"]).exists():
+                continue
+            candidates.append((meta["generated_at"], meta["report_id"]))
         except Exception:
             pass
     if not candidates:
@@ -184,6 +255,8 @@ def cleanup_old_reports() -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=OUTBOX_TTL_HOURS)
     deleted = 0
     for meta_file in list(OUTBOX_DIR.glob("*.json")):
+        if meta_file.name.endswith(".detail.json"):
+            continue
         try:
             meta = json.loads(meta_file.read_text())
             if meta.get("status") == "pending":
@@ -200,6 +273,7 @@ def cleanup_old_reports() -> int:
                 pdf = _pdf_path(report_id)
                 if pdf.exists():
                     pdf.unlink()
+                _detail_path(report_id).unlink(missing_ok=True)
                 deleted += 1
                 logger.debug("Outbox: cleaned up %s", report_id)
         except Exception as exc:

@@ -78,7 +78,7 @@ from ivy_core import receipts
 from ivy_core import outbox as _outbox
 from ivy_core import attachment_verify
 from ivy_core.messaging import send_imessage_attachment
-from ivy_core.report_fallback import build_attachment_failure_notice
+from ivy_core.report_fallback import split_imessage_content
 from utils.applescript import AppleScriptRunner
 
 # Import prompt caching manager
@@ -1106,9 +1106,25 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 
 import re as _re
 
-_RESEND_PATTERN = _re.compile(
-    r"^\s*resend\s+"
-    r"(picks|sharp\s+picks|happy\s+hour|meal\s+plan|[A-Z]{2}-\d{8}-\d{4}(?::\d{2})?)\s*$",
+_REPORT_ID_RE = r"[A-Za-z]{2}-\d{8}-\d{4}(?::\d{2})?"
+
+# PDF | RESEND [target] — send the archived attachment on request.
+_PDF_PATTERN = _re.compile(
+    rf"^\s*(?:resend|pdf|send\s+pdf)"
+    rf"(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
+    _re.IGNORECASE,
+)
+
+# MORE [target] — the items the concise report didn't show.
+_MORE_PATTERN = _re.compile(
+    rf"^\s*more(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
+    _re.IGNORECASE,
+)
+
+# WHY <n> [target] — the reasoning behind one numbered item.
+_WHY_PATTERN = _re.compile(
+    rf"^\s*why\s+#?(\d{{1,2}})"
+    rf"(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
     _re.IGNORECASE,
 )
 
@@ -1129,71 +1145,168 @@ _RESEND_REPORT_NAMES: Dict[str, str] = {
     "sharp_picks": "Sharp Picks",
     "happy_hour": "Happy Hour Scout",
     "familia_meal_planner": "Familia Meal Plan",
+    "bravo_scout": "Bravo Scout",
 }
 
+_HELP_HINT = "Try MORE, WHY 2, or PDF."
 
-def handle_resend_command(text: str, sender: str) -> Optional[str]:
-    """Deterministic RESEND handler — never calls an LLM.
 
-    Returns a user-facing reply string if the text is a RESEND command,
-    or None if the text is not a RESEND command (caller should proceed to LLM).
+def _resolve_report(target: Optional[str]) -> tuple:
+    """Map a command's optional target to ``(report_id, job_name, error)``.
 
-    Supported commands:
-      RESEND PICKS / RESEND SHARP PICKS
-      RESEND HAPPY HOUR
-      RESEND MEAL PLAN
-      RESEND <REPORT_ID>          e.g. RESEND SP-20260719-1430
+    A bare command (no target) resolves to the most recent report Ivy sent,
+    whichever job it came from — so "MORE" right after a picks text means the
+    picks, without Henry having to name the job.
     """
-    m = _RESEND_PATTERN.match(text.strip())
-    if not m:
-        return None
+    target = (target or "").strip().lower()
 
-    target = m.group(1).strip().lower()
-    job_name: Optional[str] = None
-    report_id: Optional[str] = None
-
-    # Is this an explicit report ID (e.g. SP-20260719-1430)?
-    if _re.match(r"^[a-z]{2}-\d{8}-\d{4}", target, _re.IGNORECASE):
+    if target and _re.match(rf"^{_REPORT_ID_RE}$", target, _re.IGNORECASE):
         report_id = target.upper()
         job_name = _outbox.job_name_for_report_id(report_id)
         if not job_name:
-            return "I don't recognise that report ID. Try RESEND PICKS, RESEND HAPPY HOUR, or RESEND MEAL PLAN."
-    else:
+            return None, None, f"I don't recognise that report ID. {_HELP_HINT}"
+        return report_id, job_name, None
+
+    if target:
         job_name = _RESEND_ALIASES.get(target)
         if not job_name:
-            return "I didn't understand that resend command. Try RESEND PICKS, RESEND HAPPY HOUR, or RESEND MEAL PLAN."
-        report_id = _outbox.find_newest_pending(job_name)
+            return None, None, f"I didn't understand that. {_HELP_HINT}"
+        report_id = _outbox.find_newest(job_name)
         if not report_id:
-            return f"No pending {_RESEND_REPORT_NAMES.get(job_name, job_name)} report found to resend."
+            name = _RESEND_REPORT_NAMES.get(job_name, job_name)
+            return None, None, f"I don't have a recent {name} report to work from."
+        return report_id, job_name, None
 
-    meta = _outbox.load_report_meta(report_id)
-    if not meta:
-        return f"Report {report_id} metadata not found. It may have expired."
+    newest_id, newest_job = None, None
+    newest_at = ""
+    for job in _RESEND_ALIASES.values():
+        rid = _outbox.find_newest(job)
+        if not rid:
+            continue
+        meta = _outbox.load_report_meta(rid) or {}
+        when = meta.get("generated_at", "")
+        if when > newest_at:
+            newest_at, newest_id, newest_job = when, rid, job
+    if not newest_id:
+        return None, None, "I haven't sent a report recently — nothing to pull up."
+    return newest_id, newest_job, None
 
-    pdf_path = _outbox.get_outbox_pdf_path(report_id)
-    if not pdf_path:
-        return f"The PDF for {report_id} is no longer available. You may need to run the job again."
 
-    logger.info("RESEND: retrying attachment for %s → %s", report_id, sender)
-    receipt = send_imessage_attachment(sender, str(pdf_path), report_id=report_id)
-    attempts = (meta.get("send_attempts") or 0) + receipt.attempts
-    _outbox.update_report_status(report_id, receipt.status, attempts=attempts)
+def handle_more_command(text: str, sender: str) -> Optional[List[str]]:
+    """MORE — send the items the concise report held back."""
+    m = _MORE_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    report_id, job_name, error = _resolve_report(m.group(1))
+    if error:
+        return [error]
+
+    detail = _outbox.load_detail(report_id)
+    if not detail:
+        name = _RESEND_REPORT_NAMES.get(job_name, job_name)
+        return [f"I don't have the full {name} list any more (ref {report_id}). Run the job again for a fresh one."]
+
+    items = detail.get("items") or []
+    shown = int(detail.get("shown") or 0)
+    rest = items[shown:]
+    if not rest:
+        return [f"That was the whole list — all {len(items)} of them are in the report above."]
+
+    intro = detail.get("more_intro") or "The rest of the list:"
+    body = "\n\n".join([intro] + [i["headline"] for i in rest if i.get("headline")])
+    body += "\n\n\u2014\nReply WHY <n> for the reasoning \u00b7 PDF for the file"
+    return split_imessage_content(body)
+
+
+def handle_why_command(text: str, sender: str) -> Optional[List[str]]:
+    """WHY <n> — the reasoning behind one numbered item."""
+    m = _WHY_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    n = int(m.group(1))
+    report_id, job_name, error = _resolve_report(m.group(2))
+    if error:
+        return [error]
+
+    detail = _outbox.load_detail(report_id)
+    if not detail:
+        name = _RESEND_REPORT_NAMES.get(job_name, job_name)
+        return [f"I don't have the detail for that {name} report any more (ref {report_id})."]
+
+    items = detail.get("items") or []
+    if not 1 <= n <= len(items):
+        return [f"There's no #{n} in that report — it has {len(items)} item(s)."]
+
+    return split_imessage_content(items[n - 1].get("detail") or "No extra detail on that one.")
+
+
+def handle_pdf_command(text: str, sender: str) -> Optional[List[str]]:
+    """PDF / RESEND — send the archived attachment for a report.
+
+    Reports are delivered as text now, so this is the only path that pushes a
+    PDF, and it only runs because Henry asked for it.
+    """
+    m = _PDF_PATTERN.match(text.strip())
+    if not m:
+        return None
+
+    report_id, job_name, error = _resolve_report(m.group(1))
+    if error:
+        return [error]
 
     report_name = _RESEND_REPORT_NAMES.get(job_name, job_name)
-    resend_cmd = _RESEND_COMMANDS.get(job_name, "RESEND")
+    pdf_path = _outbox.get_outbox_pdf_path(report_id)
+    if not pdf_path:
+        return [f"There's no PDF stored for {report_id} — the {report_name} content was texted to you. Reply MORE for the full list."]
 
-    if receipt:
-        return f"✅ {report_name} PDF resent (ref: {report_id})."
+    meta = _outbox.load_report_meta(report_id) or {}
+    logger.info("PDF request: sending %s → %s", report_id, sender)
+    receipt = send_imessage_attachment(sender, str(pdf_path), report_id=report_id)
+    attempts = (meta.get("send_attempts") or 0) + receipt.attempts
+    _outbox.update_report_status(report_id, f"pdf_{receipt.status}", attempts=attempts)
 
-    # Attachment failed again.
-    notice = build_attachment_failure_notice(
-        report_name=report_name,
-        report_id=report_id,
-        resend_command=resend_cmd,
-        retry_queued=False,
-    )
-    run_local_applescript_send(sender, notice)
-    return f"PDF delivery failed again. The report ({report_id}) is preserved in the outbox."
+    if receipt.status == "verified_delivered":
+        return [f"\u2705 {report_name} PDF sent (ref: {report_id})."]
+    if receipt.status == "submitted_unverified":
+        # Honest wording: Messages accepted it but chat.db never confirmed the
+        # upload. Saying "sent" here is what hid a month of missing reports.
+        return [(
+            f"I handed the {report_name} PDF to Messages but couldn't confirm it "
+            f"landed (ref: {report_id}). If it didn't show up, reply PDF to try "
+            f"again \u2014 the text version above has the same content."
+        )]
+    return [(
+        f"The {report_name} PDF wouldn't send (ref: {report_id}). "
+        f"The text version above has everything in it \u2014 reply MORE for the full list."
+    )]
+
+
+def handle_report_command(text: str, sender: str) -> Optional[List[str]]:
+    """Deterministic report commands — never calls an LLM.
+
+    Returns the message(s) to send back, or None when the text is not a report
+    command (the caller then proceeds to the LLM).
+
+    Supported:
+      MORE / MORE PICKS / MORE <REPORT_ID>
+      WHY 3 / WHY 3 PICKS / WHY 3 <REPORT_ID>
+      PDF / PDF PICKS / RESEND PICKS / RESEND <REPORT_ID>
+    """
+    for handler in (handle_more_command, handle_why_command, handle_pdf_command):
+        reply = handler(text, sender)
+        if reply is not None:
+            return reply
+    return None
+
+
+def handle_resend_command(text: str, sender: str) -> Optional[str]:
+    """Backwards-compatible single-string wrapper around handle_report_command."""
+    reply = handle_report_command(text, sender)
+    if reply is None:
+        return None
+    return "\n\n".join(reply)
 
 
 # ============================================================================
@@ -1437,10 +1550,11 @@ def background_imessage_worker() -> None:
             logger.info("📩 Inbound Trigger Isolated: %s", text)
             reply = None
 
-            # ========== RESEND COMMAND (deterministic, no LLM) ==========
-            resend_reply = handle_resend_command(text, sender)
-            if resend_reply is not None:
-                run_local_applescript_send(sender, resend_reply)
+            # ===== REPORT COMMANDS: MORE / WHY <n> / PDF (deterministic) =====
+            report_reply = handle_report_command(text, sender)
+            if report_reply is not None:
+                for _bubble in report_reply:
+                    run_local_applescript_send(sender, _bubble)
                 _mark_poll_success()
                 continue
 

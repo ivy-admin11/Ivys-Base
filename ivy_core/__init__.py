@@ -8,6 +8,12 @@ from ivy_core.env import MissingEnvironmentVariable, require_env
 from ivy_core.llm import query_llm, strip_json_fence
 from ivy_core.messaging import send_imessage, send_imessage_attachment
 from ivy_core.report_fallback import AttachmentDeliveryReceipt
+from ivy_core.text_delivery import (
+    TextDeliveryResult,
+    build_detail,
+    build_footer,
+    deliver_report,
+)
 
 __all__ = [
     "MissingEnvironmentVariable",
@@ -17,4 +23,8 @@ __all__ = [
     "send_imessage",
     "send_imessage_attachment",
     "AttachmentDeliveryReceipt",
+    "TextDeliveryResult",
+    "build_detail",
+    "build_footer",
+    "deliver_report",
 ]

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +195,40 @@ def split_imessage_content(text: str, max_chars: int = 1200) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Interactive report detail (backs the MORE / WHY <n> reply commands)
+# ---------------------------------------------------------------------------
+
+def build_detail(
+    *,
+    title: str,
+    items: Sequence[Dict[str, Any]],
+    shown: int = 0,
+    more_intro: str = "",
+) -> Dict[str, Any]:
+    """Shape the per-item payload that powers MORE / WHY replies.
+
+    ``items`` entries use two keys:
+      headline — the one-line form of the item (what MORE sends)
+      detail   — the reasoning/extra context (what WHY <n> sends)
+    ``shown`` is how many items the main text already covered, so MORE knows
+    where to pick up.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for i, item in enumerate(items, 1):
+        normalized.append({
+            "n": i,
+            "headline": str(item.get("headline") or "").strip(),
+            "detail": str(item.get("detail") or "").strip(),
+        })
+    return {
+        "title": title,
+        "shown": max(0, int(shown)),
+        "more_intro": more_intro,
+        "items": normalized,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Happy Hour text fallback
 # ---------------------------------------------------------------------------
 
@@ -238,6 +272,142 @@ def format_happy_hour_text(discovery_data: dict) -> str:
         lines.append("\n".join(entry_lines))
 
     return "\n\n".join(lines)
+
+
+def build_happy_hour_report(discovery_data: dict, top_n: int = 3) -> tuple:
+    """Return ``(body, detail)`` for the text-first Happy Hour report.
+
+    The body names the top few verified specials; every special (with its
+    hours and neighbourhood) is kept in the detail payload for MORE / WHY.
+    """
+    specials = discovery_data.get("specials") or []
+    venues = {v.get("name", ""): v for v in (discovery_data.get("venues") or [])}
+    timestamp = datetime.now().strftime("%b %-d")
+    header = f"\U0001F379 Happy Hour Scout \u2014 {timestamp}"
+
+    usable = [s for s in specials if s.get("venue") and s.get("detail")]
+    if not usable:
+        return f"{header}\n\nNo verified specials found today.", build_detail(
+            title=header, items=[], shown=0,
+        )
+
+    def _hours(s):
+        return s.get("days_hours") or s.get("hours") or ""
+
+    def _region(s):
+        return (venues.get(s.get("venue", ""), {}) or {}).get("region", "Frisco/Dallas, TX")
+
+    def _headline(s, n):
+        return f"{n}. {s['venue']}\n   {s['detail']}"
+
+    def _detail(s, n):
+        lines = [f"\U0001F50E #{n} \u2014 {s['venue']}", s["detail"]]
+        if _hours(s):
+            lines.append(f"\U0001F551 {_hours(s)}")
+        lines.append(f"\U0001F4CD {_region(s)}")
+        return "\n".join(lines)
+
+    shown = min(top_n, len(usable))
+    blocks = [f"{header}\n{len(usable)} verified special{'' if len(usable) == 1 else 's'}"]
+    for i, s in enumerate(usable[:shown], 1):
+        block = _headline(s, i)
+        if _hours(s):
+            block += f"\n   \U0001F551 {_hours(s)}"
+        blocks.append(block)
+
+    remaining = len(usable) - shown
+    if remaining > 0:
+        blocks.append(
+            f"+{remaining} more spot{'' if remaining == 1 else 's'} \u2014 reply MORE"
+        )
+
+    detail = build_detail(
+        title=header,
+        items=[
+            {"headline": _headline(s, i), "detail": _detail(s, i)}
+            for i, s in enumerate(usable, 1)
+        ],
+        shown=shown,
+        more_intro="\U0001F4CC The rest of tonight's list:",
+    )
+    return "\n\n".join(blocks), detail
+
+
+def build_meal_report(meal_data: dict, top_n: int = 3) -> tuple:
+    """Return ``(body, detail)`` for the text-first Familia meal plan.
+
+    The body lists the first few dinners; the full week, with ingredients and
+    the toddler adaptation, lives in the detail payload.
+    """
+    recipes = meal_data.get("recipes") or []
+    timestamp = datetime.now().strftime("%b %-d")
+    header = f"\U0001F37D\uFE0F Familia Meal Plan \u2014 week of {timestamp}"
+
+    if not recipes:
+        return f"{header}\n\nNo recipes in this plan.", build_detail(
+            title=header, items=[], shown=0,
+        )
+
+    def _name(r, n):
+        return r.get("recipe_name") or r.get("name") or f"Recipe {n}"
+
+    def _minutes(r):
+        return (r.get("prep_time_minutes") or 0) + (r.get("cooking_time_minutes") or 0)
+
+    def _headline(r, n):
+        meta = [x for x in (r.get("cuisine_origin") or r.get("cuisine") or "",
+                            f"{_minutes(r)} min" if _minutes(r) else "") if x]
+        line = f"{n}. {_name(r, n)}"
+        if meta:
+            line += "\n   " + " \u00b7 ".join(meta)
+        return line
+
+    def _detail(r, n):
+        lines = [f"\U0001F50E #{n} \u2014 {_name(r, n)}"]
+        meta = [x for x in (r.get("cuisine_origin") or r.get("cuisine") or "",
+                            f"{_minutes(r)} min total" if _minutes(r) else "") if x]
+        if meta:
+            lines.append(" \u00b7 ".join(meta))
+        ingredients = r.get("ingredients") or []
+        if ingredients:
+            lines.append("")
+            lines.append("\U0001F6D2 " + ", ".join(str(i) for i in ingredients[:12]))
+        adaptations = r.get("toddler_adaptations") or []
+        if adaptations:
+            lines.append("")
+            lines.append("\U0001F476 " + ", ".join(str(a) for a in adaptations[:3]))
+        macros = r.get("macros") or {}
+        if macros:
+            lines.append(
+                "\U0001F4AA "
+                + " \u00b7 ".join(f"{k.replace('_g', '')}: {v}g" for k, v in macros.items())
+            )
+        return "\n".join(lines)
+
+    shown = min(top_n, len(recipes))
+    blocks = [(
+        f"{header}\n{len(recipes)} dinner{'' if len(recipes) == 1 else 's'} "
+        f"\u00b7 Venezuelan-American-Asian \u00b7 toddler-friendly"
+    )]
+    for i, r in enumerate(recipes[:shown], 1):
+        blocks.append(_headline(r, i))
+
+    remaining = len(recipes) - shown
+    if remaining > 0:
+        blocks.append(
+            f"+{remaining} more meal{'' if remaining == 1 else 's'} \u2014 reply MORE"
+        )
+
+    detail = build_detail(
+        title=header,
+        items=[
+            {"headline": _headline(r, i), "detail": _detail(r, i)}
+            for i, r in enumerate(recipes, 1)
+        ],
+        shown=shown,
+        more_intro="\U0001F4CC The rest of the week:",
+    )
+    return "\n\n".join(blocks), detail
 
 
 # ---------------------------------------------------------------------------
