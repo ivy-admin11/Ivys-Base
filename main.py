@@ -41,6 +41,7 @@ import subprocess
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import re as _re
 from typing import List, Optional, Dict, Any, Callable, Tuple
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -758,10 +759,72 @@ TOOL_HANDLERS: Dict[str, Callable[..., str]] = {
 }
 
 
-def _execute_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
+# A message that points BACKWARD at something Ivy already sent. Deliberately
+# separate from the report-command matcher: this one is the last line of
+# defence for phrasings the matcher misses, and it only ever suppresses a job.
+_BACKWARD_REFERENCE_RE = _re.compile(
+    r"\b(you\s+sent|sent\s+me|you\s+just\s+sent|earlier|last\s+one|last\s+report|"
+    r"that\s+report|those\s+picks|the\s+other\s+picks|from\s+(?:this\s+)?(?:morning|afternoon))\b",
+    _re.IGNORECASE,
+)
+
+# ... unless the message also asks for a NEW run.
+_RUN_INTENT_RE = _re.compile(
+    r"\b(run|rerun|re-run|start|refresh|new|again|latest|update)\b", _re.IGNORECASE
+)
+
+
+def _rerun_would_be_wrong(tool_name: str, tool_args: Dict[str, Any], inbound_text: str) -> Optional[str]:
+    """Return a reply instead of running a job, when the message was asking
+    about a report Ivy already sent.
+
+    On 2026-09-03 "More of the 3pm picks you sent me" made DeepSeek call
+    run_job(sharp_picks): a full X sweep, live-odds spend, and a second report
+    that answered a question about the first one. The matcher catches that
+    exact phrasing now; this catches the ones it doesn't.
+    """
+    if tool_name != "run_job" or not inbound_text:
+        return None
+    if not _BACKWARD_REFERENCE_RE.search(inbound_text):
+        return None
+    if _RUN_INTENT_RE.search(inbound_text):
+        return None  # they really do want a fresh run
+
+    job_name = _RESEND_ALIASES.get(
+        str(tool_args.get("job_name", "")).strip().lower()
+    ) or str(tool_args.get("job_name", "")).strip()
+    reports = _outbox.list_reports(job_name if job_name in _RESEND_REPORT_NAMES else None)
+    if not reports:
+        return None
+
+    report_id = reports[0]["report_id"]
+    name = _RESEND_REPORT_NAMES.get(reports[0].get("job_name", ""), "report")
+    logger.info(
+        "Suppressed run_job(%s): message refers back to %s", job_name or "?", report_id
+    )
+    return (
+        f"That was my {name} from earlier ({report_id}) — I won't re-run it. "
+        f"Reply MORE for the rest of it, WHY <n> for the reasoning on one, or "
+        f"PDF for the file. Say \"run picks\" if you do want a fresh sweep."
+    )
+
+
+def _execute_tool_call(
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    inbound_text: str = "",
+) -> str:
     """Execute a registered tool by name. Both the Gemini and DeepSeek paths
     call through here, so neither can dispatch to anything but a real,
-    registered tool, and DeepSeek gets the same run_job access Gemini has."""
+    registered tool, and DeepSeek gets the same run_job access Gemini has.
+
+    ``inbound_text`` is the message that produced the tool call; it is used
+    only to refuse a job re-run that is really a question about the last one.
+    """
+    guard = _rerun_would_be_wrong(tool_name, tool_args, inbound_text)
+    if guard is not None:
+        return guard
+
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Function {tool_name} is undefined."
@@ -860,7 +923,7 @@ def execute_deepseek_call(
                 args,
             )
 
-            return _execute_tool_call(func_name, args)
+            return _execute_tool_call(func_name, args, inbound_text=text)
 
         return message_node.get("content", "").strip()
     except Exception as e:
@@ -883,6 +946,11 @@ def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = No
     """
     if not os.environ.get("GEMINI_API_KEY", "").strip():
         raise ValueError("GEMINI_API_KEY not configured in environment")
+
+    # Keep the raw message: `text` is about to absorb the conversation history,
+    # and the re-run guard must judge what was said NOW, not what was said
+    # three turns ago.
+    inbound_text = text
 
     if history:
         text = format_history_for_prompt(history) + "\n\nCurrent message: " + text
@@ -949,7 +1017,7 @@ def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = No
         if tool_name in ["add_apple_reminder", "fetch_apple_reminders"]:
             tool_args["list_name"] = "Household"
         logger.info("🛠️ Executing Tool: %s with arguments %s", tool_name, tool_args)
-        tool_result = _execute_tool_call(tool_name, tool_args)
+        tool_result = _execute_tool_call(tool_name, tool_args, inbound_text=inbound_text)
         logger.info("📤 Tool Output: %s", tool_result)
         tool_results.append((tool_name, tool_result))
 
@@ -1104,29 +1172,67 @@ def load_store_configs() -> Dict[str, Dict[str, str]]:
 # RESEND COMMAND HANDLER
 # ============================================================================
 
-import re as _re
 
 _REPORT_ID_RE = r"[A-Za-z]{2}-\d{8}-\d{4}(?::\d{2})?"
 
-# PDF | RESEND [target] — send the archived attachment on request.
-_PDF_PATTERN = _re.compile(
-    rf"^\s*(?:resend|pdf|send\s+pdf)"
-    rf"(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
+# Command verbs, matched at the START of the message only.
+#
+# These are deliberately loose about what FOLLOWS the verb, because real
+# replies are not typed like commands. On 2026-09-03 Henry replied "More",
+# got a "what would you like more of?" from DeepSeek, then wrote "More of the
+# 3pm picks you sent me" — which DeepSeek answered by re-running the entire
+# sweep and texting a brand-new report. Both should have been served from the
+# outbox without a model call.
+_MORE_VERB = _re.compile(
+    r"^\s*(?:more|the\s+rest|rest|others?|what\s+else|show\s+me\s+(?:the\s+)?(?:rest|more|others?))\b",
+    _re.IGNORECASE,
+)
+_WHY_VERB = _re.compile(r"^\s*why\s+(?:is\s+|on\s+)?#?(\d{1,2})\b", _re.IGNORECASE)
+_PDF_VERB = _re.compile(
+    r"^\s*(?:resend|pdf|send\s+(?:me\s+)?(?:the\s+)?pdf|the\s+pdf)\b",
     _re.IGNORECASE,
 )
 
-# MORE [target] — the items the concise report didn't show.
-_MORE_PATTERN = _re.compile(
-    rf"^\s*more(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
+# What the tail of a loose command may refer to before we treat it as a report
+# command rather than conversation. "more picks" / "more of the 3pm ones you
+# sent" qualify; "more info about tomorrow" does not.
+_REPORT_NOUN = _re.compile(
+    r"\b(pick|picks|report|list|play|plays|board|special|specials|meal|meals|"
+    r"recipe|recipes|spot|spots|happy\s*hour|them|those|these|ones?|it|that|"
+    r"you\s+sent|sent\s+me|earlier|last\s+one)\b",
     _re.IGNORECASE,
 )
 
-# WHY <n> [target] — the reasoning behind one numbered item.
-_WHY_PATTERN = _re.compile(
-    rf"^\s*why\s+#?(\d{{1,2}})"
-    rf"(?:\s+(picks|sharp\s+picks|happy\s+hour|meal\s+plan|{_REPORT_ID_RE}))?\s*$",
+# "3pm", "3 pm", "9:00 AM" — a clock reference identifying WHICH report.
+_CLOCK_RE = _re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\b", _re.IGNORECASE)
+# Coarser references, mapped to the hour a report would carry.
+_PERIOD_HOURS = {
+    "this morning": 9, "morning": 9,
+    "this afternoon": 15, "afternoon": 15,
+    "this evening": 20, "evening": 20, "tonight": 20,
+    "last night": 21, "yesterday": 21,
+}
+
+# Politeness that carries no meaning; stripped before deciding whether a tail
+# refers to a report, so "pdf please" reads the same as "pdf".
+_FILLER_RE = _re.compile(
+    r"\b(please|pls|plz|thanks|thank\s+you|thx|now|again|for\s+me)\b", _re.IGNORECASE
+)
+
+# Words that make a message a REQUEST rather than a reference to something
+# already sent. "more chicken in the meal plan next week" is a preference for a
+# future run, not a command to re-read the last one.
+_FUTURE_INTENT_RE = _re.compile(
+    r"\b(next\s+(week|time|run|month)|tomorrow|future|from\s+now\s+on|going\s+forward)\b",
     _re.IGNORECASE,
 )
+
+# A loose command has to stay short — a long message is conversation.
+# "More of the 3pm picks you sent me" is 8 words, and that is the ceiling.
+_LOOSE_MAX_WORDS = 8
+
+# How far a clock reference may sit from a report's own timestamp, in hours.
+_CLOCK_TOLERANCE_H = 2.0
 
 _RESEND_ALIASES: Dict[str, str] = {
     "picks": "sharp_picks",
@@ -1151,54 +1257,130 @@ _RESEND_REPORT_NAMES: Dict[str, str] = {
 _HELP_HINT = "Try MORE, WHY 2, or PDF."
 
 
-def _resolve_report(target: Optional[str]) -> tuple:
-    """Map a command's optional target to ``(report_id, job_name, error)``.
+def _target_hour(tail: str) -> Optional[int]:
+    """Hour (0-23) a message points at, or None.
 
-    A bare command (no target) resolves to the most recent report Ivy sent,
-    whichever job it came from — so "MORE" right after a picks text means the
-    picks, without Henry having to name the job.
+    Report IDs already carry local HHMM, so "the 3pm picks" resolves by
+    comparing against that rather than re-deriving timestamps.
     """
-    target = (target or "").strip().lower()
+    m = _CLOCK_RE.search(tail)
+    if m:
+        hour = int(m.group(1)) % 12
+        if m.group(3).lower() == "p":
+            hour += 12
+        return hour
+    low = tail.lower()
+    for phrase, hour in _PERIOD_HOURS.items():
+        if phrase in low:
+            return hour
+    return None
 
-    if target and _re.match(rf"^{_REPORT_ID_RE}$", target, _re.IGNORECASE):
-        report_id = target.upper()
+
+def _job_from_tail(tail: str) -> Optional[str]:
+    """Job named in a command tail, or None."""
+    low = tail.lower()
+    for alias, job in _RESEND_ALIASES.items():
+        if alias in low:
+            return job
+    return None
+
+
+def _resolve_report(tail: Optional[str]) -> tuple:
+    """Map a command's tail to ``(report_id, job_name, error)``.
+
+    Resolution order: an explicit report ID, then a named job, then a clock
+    reference ("the 3pm picks"), then simply the most recent report Ivy sent —
+    so a bare "MORE" right after a picks text means those picks.
+    """
+    tail = (tail or "").strip()
+
+    m = _re.search(_REPORT_ID_RE, tail, _re.IGNORECASE)
+    if m:
+        report_id = m.group(0).upper()
         job_name = _outbox.job_name_for_report_id(report_id)
         if not job_name:
             return None, None, f"I don't recognise that report ID. {_HELP_HINT}"
         return report_id, job_name, None
 
-    if target:
-        job_name = _RESEND_ALIASES.get(target)
-        if not job_name:
-            return None, None, f"I didn't understand that. {_HELP_HINT}"
-        report_id = _outbox.find_newest(job_name)
-        if not report_id:
+    job_name = _job_from_tail(tail)
+    hour = _target_hour(tail)
+
+    candidates = _outbox.list_reports(job_name)
+    if not candidates:
+        if job_name:
             name = _RESEND_REPORT_NAMES.get(job_name, job_name)
             return None, None, f"I don't have a recent {name} report to work from."
-        return report_id, job_name, None
-
-    newest_id, newest_job = None, None
-    newest_at = ""
-    for job in _RESEND_ALIASES.values():
-        rid = _outbox.find_newest(job)
-        if not rid:
-            continue
-        meta = _outbox.load_report_meta(rid) or {}
-        when = meta.get("generated_at", "")
-        if when > newest_at:
-            newest_at, newest_id, newest_job = when, rid, job
-    if not newest_id:
         return None, None, "I haven't sent a report recently — nothing to pull up."
-    return newest_id, newest_job, None
+
+    if hour is not None:
+        def _distance(meta):
+            rid = meta.get("report_id", "")
+            try:
+                hhmm = rid.split("-")[2]
+                report_hour = int(hhmm[:2]) + int(hhmm[2:4]) / 60.0
+            except (IndexError, ValueError):
+                return 99.0
+            return abs(report_hour - hour)
+
+        best = min(candidates, key=_distance)
+        if _distance(best) <= _CLOCK_TOLERANCE_H:
+            return best["report_id"], best.get("job_name"), None
+        # A clock reference that matches nothing is worth saying out loud,
+        # rather than silently serving a different report.
+        when = f"{hour % 12 or 12}{'pm' if hour >= 12 else 'am'}"
+        return None, None, (
+            f"I don't have a report from around {when}. The most recent one is "
+            f"{candidates[0]['report_id']} — reply MORE {candidates[0]['report_id']} for that one."
+        )
+
+    return candidates[0]["report_id"], candidates[0].get("job_name"), None
+
+
+def _match_command(text: str) -> Optional[tuple]:
+    """Classify a message as a report command.
+
+    Returns ``(verb, tail, number)`` — verb in {"more", "why", "pdf"} — or None
+    when the message is ordinary conversation and belongs to the LLM.
+
+    A bare verb always counts. A verb with a tail counts only when the message
+    is short AND the tail refers to a report, which is what keeps "why did you
+    pick the Yankees?" and "more info about tomorrow" out of here.
+    """
+    stripped = text.strip().rstrip("?!.").strip()
+    if not stripped:
+        return None
+
+    for verb, pattern in (("why", _WHY_VERB), ("more", _MORE_VERB), ("pdf", _PDF_VERB)):
+        m = pattern.match(stripped)
+        if not m:
+            continue
+        tail = stripped[m.end():].strip(" ,.:;-")
+        number = int(m.group(1)) if verb == "why" else None
+
+        if _FUTURE_INTENT_RE.search(tail):
+            return None  # a preference for the next run, not a lookup
+
+        tail = _FILLER_RE.sub(" ", tail).strip(" ,.:;-")
+        if not tail:
+            return verb, "", number
+        if len(stripped.split()) > _LOOSE_MAX_WORDS:
+            return None
+        if _REPORT_NOUN.search(tail) or _target_hour(tail) is not None or _re.search(
+            _REPORT_ID_RE, tail, _re.IGNORECASE
+        ):
+            return verb, tail, number
+        return None
+    return None
 
 
 def handle_more_command(text: str, sender: str) -> Optional[List[str]]:
     """MORE — send the items the concise report held back."""
-    m = _MORE_PATTERN.match(text.strip())
-    if not m:
+    match = _match_command(text)
+    if not match or match[0] != "more":
         return None
+    _, tail, _ = match
 
-    report_id, job_name, error = _resolve_report(m.group(1))
+    report_id, job_name, error = _resolve_report(tail)
     if error:
         return [error]
 
@@ -1221,12 +1403,12 @@ def handle_more_command(text: str, sender: str) -> Optional[List[str]]:
 
 def handle_why_command(text: str, sender: str) -> Optional[List[str]]:
     """WHY <n> — the reasoning behind one numbered item."""
-    m = _WHY_PATTERN.match(text.strip())
-    if not m:
+    match = _match_command(text)
+    if not match or match[0] != "why":
         return None
+    _, tail, n = match
 
-    n = int(m.group(1))
-    report_id, job_name, error = _resolve_report(m.group(2))
+    report_id, job_name, error = _resolve_report(tail)
     if error:
         return [error]
 
@@ -1248,11 +1430,12 @@ def handle_pdf_command(text: str, sender: str) -> Optional[List[str]]:
     Reports are delivered as text now, so this is the only path that pushes a
     PDF, and it only runs because Henry asked for it.
     """
-    m = _PDF_PATTERN.match(text.strip())
-    if not m:
+    match = _match_command(text)
+    if not match or match[0] != "pdf":
         return None
+    _, tail, _ = match
 
-    report_id, job_name, error = _resolve_report(m.group(1))
+    report_id, job_name, error = _resolve_report(tail)
     if error:
         return [error]
 
@@ -1284,15 +1467,15 @@ def handle_pdf_command(text: str, sender: str) -> Optional[List[str]]:
 
 
 def handle_report_command(text: str, sender: str) -> Optional[List[str]]:
-    """Deterministic report commands — never calls an LLM.
+    """Deterministic report commands — never calls an LLM, never runs a job.
 
     Returns the message(s) to send back, or None when the text is not a report
     command (the caller then proceeds to the LLM).
 
-    Supported:
-      MORE / MORE PICKS / MORE <REPORT_ID>
-      WHY 3 / WHY 3 PICKS / WHY 3 <REPORT_ID>
-      PDF / PDF PICKS / RESEND PICKS / RESEND <REPORT_ID>
+    Supported, in strict or conversational form:
+      MORE / more picks / more of the 3pm picks you sent me / MORE <REPORT_ID>
+      WHY 3 / why 3 picks / why #3 of the 9am report
+      PDF / send me the pdf / RESEND PICKS / RESEND <REPORT_ID>
     """
     for handler in (handle_more_command, handle_why_command, handle_pdf_command):
         reply = handler(text, sender)

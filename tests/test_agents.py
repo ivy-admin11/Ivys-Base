@@ -295,3 +295,32 @@ def test_player_props_do_not_borrow_the_game_market_price():
     assert picks[0]["sport"] == "MLB", "sport and start time still backfill"
     assert picks[0]["start"] == "2026-09-03T23:15:00Z"
     assert picks[1]["odds"] == "Over 8 (-117) / Under 8 (-103)", "real game totals still fill"
+
+
+def test_home_run_props_do_not_borrow_the_game_moneyline():
+    """Sep 3 9am report: 'Coby Mayo HR (Baltimore Orioles +108 / Boston Red Sox
+    -126)' — the game moneyline beside a home-run prop. 'HR' matched none of the
+    long-form stat words, so the prop guard let it through."""
+    games = [{
+        "away": "Boston Red Sox", "home": "Baltimore Orioles", "sport": "MLB",
+        "moneyline": "Baltimore Orioles +108 / Boston Red Sox -126",
+        "total": "Over 9 (-110)", "spread": "BAL +1.5",
+        "commence": "2026-09-03T23:15:00Z",
+    }]
+    picks = [
+        {"matchup": "Boston Red Sox @ Baltimore Orioles", "side": "Coby Mayo HR"},
+        {"matchup": "Boston Red Sox @ Baltimore Orioles", "side": "Baltimore Orioles ML"},
+    ]
+    sports_bettor.attach_odds(picks, games)
+
+    assert not picks[0].get("odds"), "an HR prop must not inherit the game moneyline"
+    assert picks[1]["odds"] == "Baltimore Orioles +108 / Boston Red Sox -126"
+
+
+def test_prop_guard_does_not_fire_on_team_names():
+    """'KT Wiz' contains a K; 'Hanwha' contains hr. Whole words only."""
+    assert not sports_bettor._is_player_prop("KT Wiz ML")
+    assert not sports_bettor._is_player_prop("Hanwha Eagles ML")
+    assert not sports_bettor._is_player_prop("Los Angeles Dodgers -1.5")
+    assert sports_bettor._is_player_prop("Coby Mayo HR")
+    assert sports_bettor._is_player_prop("Luka 30+ PTS")

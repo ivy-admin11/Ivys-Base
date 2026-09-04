@@ -277,3 +277,157 @@ def test_commands_with_no_report_say_so(box, monkeypatch):
     monkeypatch.setattr(main._outbox, "OUTBOX_DIR", outbox.OUTBOX_DIR)
     reply = "\n".join(main.handle_report_command("MORE", "+15555550100"))
     assert "recently" in reply.lower() or "nothing" in reply.lower()
+
+
+# ---------------------------------------------------------------------------
+# Conversational report commands
+#
+# Sep 3, from the actual thread: "More" was answered by DeepSeek with "what
+# would you like more of?", and "More of the 3pm picks you sent me" made it
+# re-run the entire sweep and text a brand-new report. Both belong here.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def two_reports(box, monkeypatch):
+    """A 9am and a 3pm picks report, both with held-back items."""
+    import main
+
+    monkeypatch.setattr(main._outbox, "OUTBOX_DIR", outbox.OUTBOX_DIR)
+    made = {}
+    for rid, label, n in (("SP-20260903-0900", "9am", 4), ("SP-20260903-1500", "3pm", 10)):
+        detail = build_detail(
+            title=f"Sharp Picks {label}",
+            items=[{"headline": f"{i}. {label} game {i}", "detail": f"{label} reasoning {i}"}
+                   for i in range(1, n + 1)],
+            shown=3,
+        )
+        text_delivery.deliver_report(
+            "+15555550100", job_name="sharp_picks", body=f"{label} digest",
+            report_id=rid, detail=detail, sender=lambda p, b: True,
+        )
+        made[label] = rid
+    return main, made
+
+
+def test_bare_more_is_handled_without_an_llm(two_reports):
+    main, made = two_reports
+    reply = main.handle_report_command("More", "+15555550100")
+    assert reply is not None, "'More' must never reach the LLM"
+    assert "3pm game 4" in "\n".join(reply), "a bare MORE means the most recent report"
+
+
+def test_more_of_the_3pm_picks_you_sent_me(two_reports):
+    """Verbatim from the thread — this re-ran the whole job."""
+    main, made = two_reports
+    reply = main.handle_report_command("More of the 3pm picks you sent me", "+15555550100")
+    assert reply is not None, "this must not fall through to run_job"
+    text = "\n".join(reply)
+    assert "3pm game 4" in text
+    assert "9am" not in text, "the clock reference must pick the 3pm report"
+
+
+def test_clock_reference_selects_the_earlier_report(two_reports):
+    main, made = two_reports
+    reply = "\n".join(main.handle_report_command("more of the 9am picks", "+15555550100"))
+    assert "9am game 4" in reply
+    assert "3pm" not in reply
+
+
+def test_clock_reference_with_no_matching_report_says_so(two_reports):
+    main, made = two_reports
+    reply = "\n".join(main.handle_report_command("more of the 6am picks", "+15555550100"))
+    assert "6am" in reply
+    assert "SP-20260903-1500" in reply, "it should offer the report it does have"
+
+
+@pytest.mark.parametrize("phrasing", [
+    "More",
+    "more",
+    "MORE PICKS",
+    "more picks please",
+    "the rest",
+    "rest of them",
+    "show me the rest",
+    "More of the 3pm picks you sent me",
+    "more of those",
+])
+def test_conversational_more_phrasings_are_all_handled(two_reports, phrasing):
+    main, _ = two_reports
+    assert main.handle_report_command(phrasing, "+15555550100") is not None, phrasing
+
+
+@pytest.mark.parametrize("phrasing", [
+    "why did you pick the Yankees?",
+    "more info about tomorrow's weather please",
+    "can you tell me more about how the sweep works",
+    "hey ivy",
+    "why is the sky blue",
+    "run sports picks",
+    "more chicken in the meal plan next week please thanks",
+])
+def test_conversation_still_reaches_the_llm(two_reports, phrasing):
+    main, _ = two_reports
+    assert main.handle_report_command(phrasing, "+15555550100") is None, phrasing
+
+
+def test_why_accepts_conversational_forms(two_reports):
+    main, _ = two_reports
+    for phrasing in ("WHY 2", "why 2", "why #2", "why 2 picks", "why #2 of the 3pm picks"):
+        reply = main.handle_report_command(phrasing, "+15555550100")
+        assert reply is not None, phrasing
+        assert "reasoning 2" in "\n".join(reply), phrasing
+
+
+def test_pdf_accepts_conversational_forms(two_reports):
+    main, _ = two_reports
+    for phrasing in ("PDF", "pdf please", "send me the pdf", "RESEND PICKS"):
+        assert main.handle_report_command(phrasing, "+15555550100") is not None, phrasing
+
+
+# ---------------------------------------------------------------------------
+# run_job re-run guard — the last line of defence for phrasings the matcher
+# misses. On Sep 3 a question about the 3pm report triggered a whole new sweep.
+# ---------------------------------------------------------------------------
+
+def test_backward_looking_question_does_not_rerun_the_job(two_reports):
+    main, _ = two_reports
+    reply = main._execute_tool_call(
+        "run_job", {"job_name": "sharp_picks"},
+        inbound_text="can you show me the other picks from the report you sent me",
+    )
+    assert "won't re-run" in reply
+    assert "SP-20260903-1500" in reply
+    assert "MORE" in reply
+
+
+def test_explicit_run_request_still_runs(two_reports, monkeypatch):
+    main, _ = two_reports
+    called = []
+    monkeypatch.setitem(main.TOOL_HANDLERS, "run_job",
+                        lambda job_name: called.append(job_name) or "started")
+
+    for phrasing in ("run sports picks", "run picks again", "send me a new set of picks",
+                     "refresh the picks you sent me"):
+        called.clear()
+        main._execute_tool_call("run_job", {"job_name": "sharp_picks"}, inbound_text=phrasing)
+        assert called == ["sharp_picks"], phrasing
+
+
+def test_guard_is_inert_without_the_inbound_text(two_reports, monkeypatch):
+    """The endpoint path passes no text; it must never be blocked."""
+    main, _ = two_reports
+    called = []
+    monkeypatch.setitem(main.TOOL_HANDLERS, "run_job",
+                        lambda job_name: called.append(job_name) or "started")
+    main._execute_tool_call("run_job", {"job_name": "sharp_picks"})
+    assert called == ["sharp_picks"]
+
+
+def test_guard_only_touches_run_job(two_reports, monkeypatch):
+    main, _ = two_reports
+    monkeypatch.setitem(main.TOOL_HANDLERS, "check_apple_calendar", lambda timeframe: "ok")
+    out = main._execute_tool_call(
+        "check_apple_calendar", {"timeframe": "today"},
+        inbound_text="what was on the calendar you sent me earlier",
+    )
+    assert out == "ok"

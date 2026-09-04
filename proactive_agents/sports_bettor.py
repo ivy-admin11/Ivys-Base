@@ -500,26 +500,38 @@ def _odds_for_side(side, game):
 # odds feed carries moneyline/spread/total for the game only, so a prop has no
 # matching market in it — see _is_player_prop.
 _PROP_STAT_HINTS = (
-    "strikeout", "strike out", " k's", " ks ", "punchout",
+    "strikeout", "strike out", "punchout",
     "point", "rebound", "assist", "three", "3pt", "block", "steal", "double-double",
     "yard", "reception", "completion", "touchdown", "carries", "attempt", "sack",
-    "hit", "rbi", "run scored", "total base", "home run", "walk", "steal",
-    "shot", "save", "goal", "ace", "birdie", "pra", "pts",
+    "hit", "run scored", "total base", "home run", "walk",
+    "shot", "save", "goal", "ace", "birdie",
+)
+
+# The same thing written the way handicappers actually post it. These are
+# matched as whole words only: "hr" must not fire on "Hanwha", and "k" must not
+# fire on "KT Wiz". Added after the Sep 3 9am report texted "Coby Mayo HR" with
+# the Orioles/Red Sox moneyline stapled to it — "HR" was in none of the long
+# forms above, so the prop guard let it through.
+_PROP_STAT_ABBREVS = re.compile(
+    r"\b(hrs?|ks?|sos?|rbis?|tbs?|pra|pts|rebs?|asts?|blks?|stls?|tds?)\b",
+    re.IGNORECASE,
 )
 
 
 def _is_player_prop(side):
     """True when a bet is on a player's stat line, not a game market.
 
-    The game total is not the price of 'Peterson Under 4.5 Strikeouts', and
-    printing it next to the pick puts two contradicting numbers in the same
-    line of the text. When the feed has no matching market, show no price.
+    The game total is not the price of 'Peterson Under 4.5 Strikeouts', and the
+    game moneyline is not the price of 'Coby Mayo HR'. Printing either next to
+    the pick puts a number in the text that contradicts the bet, so when the
+    feed has no matching market we show no price at all.
     """
     s = str(side or "").lower()
     if not s:
         return False
-    # "Under 4.5 Strikeouts" — a threshold followed (anywhere) by a stat word.
-    return any(hint.strip() in s for hint in _PROP_STAT_HINTS)
+    if any(hint in s for hint in _PROP_STAT_HINTS):
+        return True
+    return bool(_PROP_STAT_ABBREVS.search(s))
 
 
 def attach_odds(merged, games):

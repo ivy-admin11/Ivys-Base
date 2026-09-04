@@ -240,6 +240,31 @@ def find_newest(job_name: str, *, with_detail: bool = False) -> Optional[str]:
     return candidates[0][1]
 
 
+def list_reports(job_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """All report metadata, newest first — optionally for one job.
+
+    Reply commands need to look across every report Ivy sent (a bare "MORE"
+    means the last one, whatever job it came from) and to pick one by the
+    clock ("the 3pm picks"), neither of which find_newest* can express.
+    """
+    _ensure_outbox()
+    metas: List[Dict[str, Any]] = []
+    for meta_file in OUTBOX_DIR.glob("*.json"):
+        if meta_file.name.endswith(".detail.json"):
+            continue
+        try:
+            meta = json.loads(meta_file.read_text())
+        except Exception:
+            continue
+        if not meta.get("report_id"):
+            continue
+        if job_name and meta.get("job_name") != job_name:
+            continue
+        metas.append(meta)
+    metas.sort(key=lambda m: m.get("generated_at", ""), reverse=True)
+    return metas
+
+
 def job_name_for_report_id(report_id: str) -> Optional[str]:
     """Derive the job name from a report ID's prefix (fast, no I/O)."""
     prefix = report_id.split("-", 1)[0].upper()
