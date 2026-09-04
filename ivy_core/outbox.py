@@ -35,6 +35,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTBOX_DIR = PROJECT_ROOT / "data" / "outbox"
 OUTBOX_TTL_HOURS = 72
 
+# A report whose delivery was never confirmed outlives the normal TTL — it may
+# still be resent — but not forever. Without a cap, one stuck "pending" entry
+# stays on disk indefinitely.
+PENDING_TTL_DAYS = 30
+
 # Recognized job prefixes and their canonical job names
 _PREFIX_TO_JOB: Dict[str, str] = {
     "SP": "sharp_picks",
@@ -110,6 +115,15 @@ def save_report(
         "latest_status": status,
     }
     _meta_path(report_id).write_text(json.dumps(meta, indent=2))
+
+    # Self-prune on every write. cleanup_old_reports() has implemented a TTL
+    # since the outbox was added, but nothing ever called it, so retention
+    # was never actually enforced. Doing it here means it holds without
+    # depending on any scheduled job being installed.
+    try:
+        cleanup_old_reports()
+    except Exception as exc:  # never let housekeeping break a delivery
+        logger.warning("Outbox: cleanup after save failed: %s", exc)
     return dest
 
 
@@ -180,25 +194,51 @@ def job_name_for_report_id(report_id: str) -> Optional[str]:
 
 
 def cleanup_old_reports() -> int:
-    """Remove outbox entries older than OUTBOX_TTL_HOURS unless still pending.
+    """Remove aged-out outbox entries.
+
+    Three retention rules:
+
+    1. The newest report of each job is ALWAYS kept, whatever its age. The
+       MORE / WHY <n> / PDF reply commands resolve against it, and the weekly
+       jobs (Happy Hour, the meal planner) sit past the 72h TTL for four days
+       out of every seven — enforcing the TTL alone leaves "MORE HAPPY HOUR"
+       answering "I don't have a recent report" most of the week.
+    2. A pending report survives the TTL up to PENDING_TTL_DAYS.
+    3. Everything else goes once past OUTBOX_TTL_HOURS.
 
     Returns the number of report pairs deleted.
     """
     _ensure_outbox()
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=OUTBOX_TTL_HOURS)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=OUTBOX_TTL_HOURS)
+    pending_cutoff = now - timedelta(days=PENDING_TTL_DAYS)
+
+    # Rule 1: newest report id per job, exempt from every age check.
+    newest_per_job: Dict[str, tuple] = {}
+    for meta_file in OUTBOX_DIR.glob("*.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+            job, when, rid = meta.get("job_name"), meta.get("generated_at", ""), meta["report_id"]
+        except Exception:
+            continue
+        if job and when > newest_per_job.get(job, ("", ""))[0]:
+            newest_per_job[job] = (when, rid)
+    keep_ids = {rid for _, rid in newest_per_job.values()}
+
     deleted = 0
     for meta_file in list(OUTBOX_DIR.glob("*.json")):
         try:
             meta = json.loads(meta_file.read_text())
-            if meta.get("status") == "pending":
-                continue  # Never remove a pending report
             raw_ts = meta.get("generated_at", "")
             if not raw_ts:
                 continue
             ts = datetime.fromisoformat(raw_ts)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            if ts < cutoff:
+            if meta["report_id"] in keep_ids:
+                continue  # newest for its job — never aged out
+            deadline = pending_cutoff if meta.get("status") == "pending" else cutoff
+            if ts < deadline:
                 report_id = meta["report_id"]
                 meta_file.unlink(missing_ok=True)
                 pdf = _pdf_path(report_id)

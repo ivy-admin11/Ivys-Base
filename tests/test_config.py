@@ -109,8 +109,13 @@ def test_production_dependencies_are_exactly_pinned():
 
     assert direct_requirements
     assert all("==" in requirement for requirement in direct_requirements)
-    assert "google-genai==1.2.0" in direct_requirements
-    assert "httpx==0.26.0" in direct_requirements
+    # Bumped together 2026-09-04: google-genai 1.2.x is a *requests*-based
+    # build, so CI was exercising a different HTTP transport than the
+    # httpx-based client the code actually constructs. Moving it forces
+    # httpx>=0.28.1, which in turn requires the fastapi/starlette bump.
+    assert "google-genai==1.47.0" in direct_requirements
+    assert "httpx==0.28.1" in direct_requirements
+    assert "fastapi==0.141.1" in direct_requirements
     assert "pydantic==2.13.4" in direct_requirements
     assert "filelock==3.32.2" in direct_requirements
 
