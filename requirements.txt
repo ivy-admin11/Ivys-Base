@@ -1,14 +1,17 @@
-fastapi==0.110.0
+# fastapi/starlette/httpx move as ONE unit: starlette's TestClient passed
+# httpx's `app=` shortcut until 0.37.2, and httpx removed it in 0.28, so
+# bumping httpx alone breaks every TestClient test at collection time.
+fastapi==0.141.1
 uvicorn==0.28.0
 python-dotenv==1.0.1
 google-api-python-client==2.122.0
 google-auth==2.29.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
-google-genai==1.2.0
-requests==2.31.0
+google-genai==1.47.0
+requests==2.34.2
 feedparser==6.0.12
-httpx==0.26.0
+httpx==0.28.1
 pydantic==2.13.4
 reportlab==5.0.0
 xai-sdk==1.17.0
