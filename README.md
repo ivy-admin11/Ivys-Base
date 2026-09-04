@@ -113,6 +113,12 @@ Jobs run automatically via launchd:
 
 ## Troubleshooting
 
+### Gateway Not Answering
+The live gateway is the launchd label `com.ivy.gateway` (`.venv/bin/python -m uvicorn main:app`).
+Its logs are `logs/ivy-gateway.log` and `logs/ivy-gateway-error.log` — ignore any root-level
+`ivy_error.log` / `ivy_output.log`, which belonged to the retired `com.lexi.ivy` duplicate.
+Check `GET /ready` first; for the restart recipe and the TCC caveat see `.claude/skills/ivy-ops/SKILL.md`.
+
 ### Jobs Not Running
 Check launchd status:
 ```bash

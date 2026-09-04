@@ -440,6 +440,22 @@ def cached_provider_status(*, wait_for_first: float = 0.0) -> Dict[str, Any]:
 
 
 
+# The interpreter the gateway's Full Disk Access / Automation grants were
+# issued against. Empty string disables the check (e.g. on another machine).
+TCC_GRANTED_INTERPRETER = os.environ.get(
+    "TCC_GRANTED_INTERPRETER",
+    "/Users/lexi/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12",
+)
+
+
+def _interpreter_matches_tcc_grant() -> bool:
+    """True when the running interpreter is still the TCC-granted binary."""
+    if not TCC_GRANTED_INTERPRETER:
+        return True
+    running = os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+    return running == os.path.realpath(TCC_GRANTED_INTERPRETER)
+
+
 def print_startup_banner() -> None:
     """Colorful ANSI banner of every tool's health."""
     GREEN, RED, YELLOW, BOLD, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[1m", "\033[0m"
@@ -581,6 +597,18 @@ def fetch_readwise_highlights() -> str:
 
 
 # ============================================================================
+# APPLESCRIPT RUNNER (shared by every osascript caller below)
+# ============================================================================
+#
+# Every AppleScript invocation in this module goes through this runner so that
+# untrusted content is passed as process argv rather than interpolated into
+# script source, and so that no call can block forever — these run on the
+# poller thread, and a bare subprocess.run() with no timeout wedges it.
+
+_GATEWAY_APPLESCRIPT = AppleScriptRunner()
+
+
+# ============================================================================
 # APPLE CALENDAR INTEGRATION
 # ============================================================================
 
@@ -608,10 +636,11 @@ def check_apple_calendar(timeframe: str) -> str:
         "return totalEvents",
     ]
     script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
+    raw_output = _GATEWAY_APPLESCRIPT.run(script)
 
-    if "Error:" in raw_output:
+    # The script's own failure path returns "Error: ..."; the runner returns
+    # "ERROR: ..." for a timeout or a non-zero osascript exit. Catch both.
+    if raw_output.startswith("ERROR:") or "Error:" in raw_output:
         return f"❌ AppleScript Database Error: {raw_output}"
     if not raw_output:
         return "Your Hilla calendar has no upcoming events listed."
@@ -668,23 +697,35 @@ def check_apple_calendar(timeframe: str) -> str:
 # ============================================================================
 
 
+# The only Reminders lists Ivy is allowed to touch. Both LLM system prompts and
+# registry.py tell the model "must strictly be 'Household'", but that is prose
+# aimed at a model, not a check: the Gemini paths clamped list_name while the
+# DeepSeek path — the primary brain — passed the model's raw value straight
+# through, so an inbound text could name any list and the add script would
+# create it on demand. Enforced here so every provider path shares one rule.
+_ALLOWED_REMINDER_LISTS = ("Household", "Meal Plan")
+
+
+def _clamp_reminder_list(list_name: str) -> str:
+    return list_name if list_name in _ALLOWED_REMINDER_LISTS else "Household"
+
+
 def fetch_apple_reminders(list_name: str = "Household") -> str:
-    """Read uncompleted tasks from Apple Reminders."""
-    script = f'''
-    tell application "Reminders"
-        try
-            tell list "{list_name}"
-                set remNames to name of every reminder whose completed is false
-                set AppleScript's text item delimiters to ", "
-                return remNames as text
-            end tell
-        on error errMsg
-            return "ERROR: " & errMsg
-        end try
-    end tell
-    '''
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return res.stdout.strip() if res.stdout.strip() else "No active reminders found."
+    """Read uncompleted tasks from Apple Reminders.
+
+    ``list_name`` is passed as a process argument, never interpolated into
+    AppleScript source (see utils.applescript).
+    """
+    list_name = _clamp_reminder_list(list_name)
+    result = _GATEWAY_APPLESCRIPT.fetch_reminders_argv(list_name)
+
+    # An empty read and a failed read used to be indistinguishable: the old
+    # code answered "No active reminders found." whenever stdout was empty,
+    # including when osascript had errored outright.
+    if result.startswith("ERROR:"):
+        logger.error("Reminders read failed for list %r: %s", list_name, result[:200])
+        return f"❌ Couldn't read your '{list_name}' list: {result[len('ERROR:'):].strip()}"
+    return result or "No active reminders found."
 
 
 def add_apple_reminder(title: str, list_name: str = "Household") -> str:
@@ -695,29 +736,18 @@ def add_apple_reminder(title: str, list_name: str = "Household") -> str:
     elif any(word in list_name.lower() for word in ["house", "chore", "clean", "task"]):
         list_name = "Household"
 
-    script_lines = [
-        'tell application "Reminders"',
-        "    try",
-        f'        if not (exists list "{list_name}") then',
-        f'            make new list with properties {{name:"{list_name}"}}',
-        "        end if",
-        f'        set targetList to list "{list_name}"',
-        "        tell targetList",
-        f'            make new reminder with properties {{name:"{title}"}}',
-        "        end tell",
-        '        return "SUCCESS"',
-        "    on error err",
-        '        return "Error: " & err',
-        "    end try",
-        "end tell",
-    ]
-    script = "\n".join(script_lines)
-    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    raw_output = res.stdout.strip()
+    # After the keyword auto-categorisation above, so "meal"/"chore" routing
+    # still works — but an arbitrary or dash-leading name cannot get through.
+    list_name = _clamp_reminder_list(list_name)
+    result = _GATEWAY_APPLESCRIPT.add_reminder_argv(list_name, title)
 
-    if "SUCCESS" in raw_output:
+    # Exact match, not a substring test: the old `"SUCCESS" in raw_output`
+    # would also fire on an error message that happened to quote a title
+    # containing the word.
+    if result == "SUCCESS":
         return f"✅ Added to your '{list_name}' list: {title}"
-    return f"❌ Reminders Integration Error: {raw_output}"
+    logger.error("Reminder add failed for list %r: %s", list_name, result[:200])
+    return f"❌ Reminders Integration Error: {result}"
 
 
 def run_job(job_name: str) -> str:
@@ -839,9 +869,6 @@ def _execute_tool_call(
 # ============================================================================
 
 
-_GATEWAY_APPLESCRIPT = AppleScriptRunner()
-
-
 def run_local_applescript_send(target: str, body: str) -> str:
     """Send an iMessage reply. Returns "SUCCESS" or an "ERROR: ..." string.
 
@@ -923,7 +950,7 @@ def execute_deepseek_call(
                 args,
             )
 
-            return _execute_tool_call(func_name, args, inbound_text=text)
+            return _execute_tool_call(func_name, args, inbound_text=text_content)
 
         return message_node.get("content", "").strip()
     except Exception as e:
@@ -1859,6 +1886,10 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     """
     checks: Dict[str, Any] = {
         "chat_db_readable": os.path.exists(CHAT_DB_PATH) and os.access(CHAT_DB_PATH, os.R_OK),
+        # Sits next to chat_db_readable deliberately: these two fail together.
+        # If uv ever repoints the interpreter, the Full Disk Access grant is
+        # silently lost and chat.db reads start failing with no stated cause.
+        "interpreter_matches_tcc_grant": _interpreter_matches_tcc_grant(),
         # os.access() only proves the file is readable, not that the poller is
         # actually consuming it — the distinction that hid the 2026-08-24 outage.
         "imessage_poller_healthy": poller_healthy(),
@@ -1933,6 +1964,13 @@ def version_endpoint(authenticated: bool = Depends(verify_api_key)):
         "dirty_working_tree": dirty,
         "project_root": PROJECT_ROOT_DIR,
         "python_executable": sys.executable,
+        # The resolved binary, not the venv symlink. macOS records Full Disk
+        # Access against the real interpreter path, and .venv/bin/python points
+        # into uv's store via a floating minor-version symlink — so the symlink
+        # alone hides the one fact needed to diagnose a lost FDA grant.
+        "python_base_executable": os.path.realpath(
+            getattr(sys, "_base_executable", sys.executable)
+        ),
         "pid": os.getpid(),
         "process_started_at": PROCESS_STARTED_AT.isoformat(),
         "hostname": socket.gethostname(),

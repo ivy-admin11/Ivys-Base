@@ -56,7 +56,7 @@ def _fake_chat_db(path, rows):
         CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, transfer_name TEXT,
             transfer_state INTEGER, total_bytes INTEGER);
         CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
-        INSERT INTO handle VALUES (1, '+12147334061'), (2, '+18179138648');
+        INSERT INTO handle VALUES (1, '+15555550100'), (2, '+15555550101');
         """
     )
     for i, r in enumerate(rows, start=1):
@@ -79,10 +79,10 @@ def test_fetch_outgoing_attachments_filters_by_name_time_and_handle(tmp_path):
         {"ts": now - 4, "name": "picks.pdf", "handle": 2, "error": 25},
     ])
     rows = attachment_verify.fetch_outgoing_attachments(
-        since_ts=now - 60, filename="picks.pdf", handle="(214) 733-4061", db_path=str(db)
+        since_ts=now - 60, filename="picks.pdf", handle="(555) 555-0100", db_path=str(db)
     )
     assert len(rows) == 1
-    assert rows[0]["handle"] == "+12147334061"
+    assert rows[0]["handle"] == "+15555550100"
     assert rows[0]["state"] == "delivered"
 
     rows = attachment_verify.fetch_outgoing_attachments(since_ts=now - 60, db_path=str(db))
@@ -474,6 +474,9 @@ def test_monitor_alerts_when_still_down_after_recheck(monkeypatch, tmp_path):
         {"status": "up"},
     )
     assert len(alerts) == 1 and "DOWN" in alerts[0]
+    # The alert must name the label that actually serves port 8000. It said
+    # com.lexi.ivy for weeks after com.ivy.gateway took over (2026-09-02).
+    assert "com.ivy.gateway" in alerts[0]
     assert state["status"] == "down"
 
 
@@ -494,4 +497,5 @@ def test_monitor_needs_two_degraded_sightings(monkeypatch, tmp_path):
         monkeypatch, tmp_path, [("up", "/health and /ready both passing")], state,
     )
     assert len(alerts) == 1 and "back UP" in alerts[0]
+    assert "com.ivy.gateway" in alerts[0]
     assert state["degraded_streak"] == 0

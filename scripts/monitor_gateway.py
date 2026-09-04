@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone health check for com.lexi.ivy (the real iMessage gateway).
+"""Standalone health check for com.ivy.gateway (the real iMessage gateway).
 
 Runs as its own launchd job (com.ivy.gateway_monitor), independent of the
 gateway process itself, so it can still alert Henry when the gateway is
@@ -178,7 +178,7 @@ def main() -> int:
     elif new_status != prev_status:
         if new_status == "down":
             alert_text = (
-                "⚠️ Ivy gateway (com.lexi.ivy) is DOWN — "
+                "⚠️ Ivy gateway (com.ivy.gateway) is DOWN — "
                 "/health check failed. iMessage replies won't work until it's restarted."
             )
         elif new_status == "degraded":
@@ -187,7 +187,7 @@ def main() -> int:
                 "It can still text out; incoming iMessages may not be processed."
             )
         else:
-            alert_text = "✅ Ivy gateway (com.lexi.ivy) is back UP — /health and /ready passing."
+            alert_text = "✅ Ivy gateway (com.ivy.gateway) is back UP — /health and /ready passing."
     elif new_status != "up" and (now - state.get("last_alert_ts", 0.0)) > REALERT_INTERVAL_SECONDS:
         alert_text = (
             f"⚠️ Ivy gateway is STILL {new_status.upper()} — {reason}. Has not recovered."

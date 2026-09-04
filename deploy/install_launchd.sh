@@ -4,9 +4,9 @@
 #
 # SAFE BY DEFAULT: with no flags, this only prints what WOULD change. It
 # never writes a file and never calls launchctl. Even with --apply, it
-# refuses to touch any of Ivy's currently-installed LIVE labels (com.lexi.ivy,
-# com.ivy.gateway, com.ivy.sharppicks, com.ivy.happy_hour_scout, com.ivy.brain)
-# unless --yes-i-know-this-is-live is also passed. This script never itself
+# refuses to touch any of Ivy's currently-installed LIVE labels (com.ivy.gateway,
+# com.ivy.sharppicks, com.ivy.happy_hour_scout, com.ivy.brain) unless
+# --yes-i-know-this-is-live is also passed. This script never itself
 # runs `launchctl bootstrap/load/kickstart` — writing the file and loading it
 # into launchd are kept as two separate, deliberate steps.
 #
@@ -46,7 +46,11 @@ if [ ! -x "$VENV_PYTHON" ]; then
     exit 1
 fi
 
-LIVE_LABELS=("com.lexi.ivy" "com.ivy.gateway" "com.ivy.sharppicks" "com.ivy.happy_hour_scout" "com.ivy.brain")
+# com.lexi.ivy (the original /usr/bin/python3 gateway) was retired 2026-09-02:
+# it duplicated com.ivy.gateway, lost the port-8000 race at every boot, and
+# crash-looped every ~10 s. Its plist lives in $TARGET_DIR/disabled/ — do not
+# reintroduce the label here or as a template.
+LIVE_LABELS=("com.ivy.gateway" "com.ivy.sharppicks" "com.ivy.happy_hour_scout" "com.ivy.brain")
 
 is_live_label() {
     local label="$1"
@@ -87,7 +91,10 @@ for template in "$TEMPLATE_DIR"/*.plist.template; do
     echo "=== $label ($([ "$already_installed" = true ] && echo "currently installed" || echo "not installed")) ==="
 
     if [ "$already_installed" = true ]; then
-        if diff -q <(printf '%s' "$rendered") "$target_path" > /dev/null 2>&1; then
+        # Compare with trailing newlines stripped on BOTH sides: $(...) already
+        # strips them from $rendered, and a hand-installed plist usually ends
+        # with one, which used to make a byte-identical file show as a diff.
+        if diff -q <(printf '%s' "$rendered") <(printf '%s' "$(cat "$target_path" 2>/dev/null)") > /dev/null 2>&1; then
             echo "  No changes."
             echo
             continue
@@ -131,6 +138,10 @@ for obsolete in com.ivy.weeklyplanner com.ivy.bravoscout; do
         echo "  - $obsolete.plist — points at a script that has never existed in this repo; no replacement template is installed for it."
     fi
 done
+if [ -f "$TARGET_DIR/com.lexi.ivy.plist" ]; then
+    found_obsolete=true
+    echo "  - com.lexi.ivy.plist — RETIRED 2026-09-02. Duplicate of com.ivy.gateway on /usr/bin/python3; it crash-loops on port 8000 whenever com.ivy.gateway is up. Move it back to $TARGET_DIR/disabled/ and 'launchctl bootout gui/\$(id -u)/com.lexi.ivy'."
+fi
 if [ "$found_obsolete" = false ]; then
     echo "  (none found)"
 fi

@@ -18,7 +18,7 @@ file, see ivy_core.messaging).
 
 Who can read chat.db
 --------------------
-Only a process with Full Disk Access — the gateway (com.lexi.ivy) has it;
+Only a process with Full Disk Access — the gateway (com.ivy.gateway) has it;
 job subprocesses launched by launchd generally do not. So the lookup tries a
 direct read first and falls back to the gateway's ``/imessage/attachments``
 endpoint over localhost. If neither works, verification is "unknown" and the
@@ -87,8 +87,8 @@ def from_apple_ns(apple_ns: int) -> float:
 
 
 def _handle_suffix(handle: Optional[str]) -> Optional[str]:
-    """Last 10 digits of a phone number, so '+1 (214) 733-4061' and
-    '+12147334061' match the same chat.db handle."""
+    """Last 10 digits of a phone number, so '+1 (555) 555-0100' and
+    '+15555550100' match the same chat.db handle."""
     if not handle:
         return None
     digits = re.sub(r"\D", "", handle)

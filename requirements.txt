@@ -1,23 +1,31 @@
-fastapi==0.110.0
+# Web layer. fastapi/starlette/httpx move as ONE unit: starlette's TestClient
+# passed httpx's `app=` shortcut until 0.37.2, and httpx removed it in 0.28.
+# Staying on starlette 0.36.3 also carried 7 advisories (through CVE-2026-48818).
+fastapi==0.141.1
 uvicorn==0.28.0
+httpx==0.28.1
+
 python-dotenv==1.0.1
-cryptography==42.0.5
-google-api-python-client==2.122.0
-google-auth==2.29.0
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.0
-google-genai==1.2.0
+requests==2.34.2
+
+# Google
+google-api-python-client==2.198.0
+google-auth==2.55.1
+google-auth-httplib2==0.4.0
+google-genai==1.47.0
 google-generativeai==0.8.6
-requests==2.31.0
-httpx==0.27.2
-aiofiles==24.1.0
-slowapi==0.1.9
-pydantic>=2.7,<3
+
+# Exact pin, not a range: `pydantic>=2.7,<3` let CI resolve the 2.14.0b1 beta.
+pydantic==2.13.4
+
 reportlab==5.0.0
-pillow==11.3.0
 xai-sdk==1.17.0
 openai==2.37.0
-pymupdf==1.28.0
-playwright==1.44.0
 filelock>=3.14
 feedparser==6.0.12
+
+# Transitives pinned only as CVE floors (nothing imports them directly).
+cryptography>=49.0.0
+pillow>=12.3.0
+aiohttp>=3.14.3
+pyasn1>=0.6.4

@@ -72,7 +72,7 @@ except ImportError:
 
 
 # ========================= CONFIG =========================
-HENRY_PHONE = "+12147334061"
+HENRY_PHONE = require_env("HENRY_PHONE")
 XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
 # The Odds API (https://the-odds-api.com) — live Vegas lines + scheduled games.
@@ -1297,12 +1297,9 @@ def _run_pipeline(
     attach_odds(merged, games)
     enrich_picks(merged, games)
     
-    # Filter picks by minimum quality threshold
-    # A valid pick should have:
-    #   - confidence level (not just 55% single-sharp noise)
-    #   - At least 2 sharps for consensus, OR 1 sharp with medium+ confidence
-    min_confidence_single = "medium"  # Only accept high-confidence single-sharp picks
-    min_sharps_consensus = 2
+    # Filter picks by minimum quality threshold. A pick clears the bar when it
+    # is a consensus play (2+ sharps) or a single sharp at medium/high
+    # confidence — not 55% single-sharp noise. Applied inline in the loop below.
     
     filtered_picks = []
     for p in merged:

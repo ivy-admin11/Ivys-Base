@@ -40,7 +40,7 @@ if os.path.exists(_ENV_PATH):
 
 # send_imessage / _outbox are re-exported here on purpose: delivery now goes
 # through deliver_report, but both names stay patchable by the test suite.
-from ivy_core import send_imessage, query_llm, strip_json_fence  # noqa: F401
+from ivy_core import require_env, send_imessage, query_llm, strip_json_fence  # noqa: F401
 from ivy_core import outbox as _outbox  # noqa: F401
 from ivy_core.report_fallback import build_meal_report
 from ivy_core.text_delivery import deliver_report
@@ -82,8 +82,8 @@ MEAL_PLAN_CONFIG = {
 
 # Alert recipients
 ALERT_RECIPIENTS = {
-    "henry": os.environ.get("HENRY_PHONE", "+12147334061"),
-    "lexi": os.environ.get("LEXI_PHONE", "+18179138648"),
+    "henry": require_env("HENRY_PHONE"),
+    "lexi": require_env("LEXI_PHONE"),
 }
 
 # Initialize state threshold: July 15, 2026 8am America/Chicago (handles DST

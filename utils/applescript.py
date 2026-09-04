@@ -99,6 +99,54 @@ end run
 """
 
 
+# Reminders access. `list`/`title` arrive as argv, so a name containing a double
+# quote is inert data instead of script text. The f-string versions these
+# replaced built `list "<name>"` directly into the source, which any inbound
+# iMessage could close early (verified 2026-09-02).
+#
+# Both address the list by variable (`list listNameValue`), which compiles and
+# behaves identically to the literal form.
+
+REMINDERS_FETCH_ARGV_SCRIPT = """
+on run argv
+    set listNameValue to item 1 of argv
+    tell application "Reminders"
+        try
+            set targetList to list listNameValue
+            tell targetList
+                set remNames to name of every reminder whose completed is false
+                set AppleScript's text item delimiters to ", "
+                return remNames as text
+            end tell
+        on error errMsg
+            return "ERROR: " & errMsg
+        end try
+    end tell
+end run
+"""
+
+REMINDERS_ADD_ARGV_SCRIPT = """
+on run argv
+    set listNameValue to item 1 of argv
+    set titleValue to item 2 of argv
+    tell application "Reminders"
+        try
+            if not (exists list listNameValue) then
+                make new list with properties {name:listNameValue}
+            end if
+            set targetList to list listNameValue
+            tell targetList
+                make new reminder with properties {name:titleValue}
+            end tell
+            return "SUCCESS"
+        on error err
+            return "ERROR: " & err
+        end try
+    end tell
+end run
+"""
+
+
 def escape_applescript_string(value: str) -> str:
     """Escape a Python string for safe embedding inside an AppleScript string literal.
 
@@ -187,7 +235,16 @@ class AppleScriptRunner:
         """
         try:
             result = subprocess.run(
-                ["osascript", "-e", script_source, *args],
+                # "--" terminates osascript's own option parsing. Without it an
+                # argument that begins with "-" is read as an option, not as
+                # data: a value of "-e" makes the NEXT argument a second script
+                # fragment (osascript documents that multiple -e build up one
+                # script), and an AppleScript `property` initializer runs at
+                # load time — before the run handler — so `do shell script`
+                # would execute. Verified 2026-09-03; argv passing alone was
+                # not sufficient, it only moved the injection to the command
+                # line.
+                ["osascript", "-e", script_source, "--", *args],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
@@ -218,6 +275,20 @@ class AppleScriptRunner:
         the screen is locked). Outcome must be verified in chat.db."""
         target = "me" if (recipient or "").lower() == "me" else recipient
         return self.run_argv(SEND_FILE_SCRIPTING_ARGV_SCRIPT, [target, file_path])
+
+    def fetch_reminders_argv(self, list_name: str) -> str:
+        """Names of uncompleted reminders in ``list_name``, comma-separated.
+
+        Returns "ERROR: ..." when the list is missing or Reminders refused.
+        """
+        return self.run_argv(REMINDERS_FETCH_ARGV_SCRIPT, [list_name])
+
+    def add_reminder_argv(self, list_name: str, title: str) -> str:
+        """Create ``title`` in ``list_name``, creating the list if absent.
+
+        Returns exactly "SUCCESS", or "ERROR: ...".
+        """
+        return self.run_argv(REMINDERS_ADD_ARGV_SCRIPT, [list_name, title])
 
     def send_imessage_file_argv(self, recipient: str, file_path: str) -> str:
         """Send a file attachment by emulating a human paste into the Messages

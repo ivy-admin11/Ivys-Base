@@ -35,7 +35,14 @@ def test_admin_secret_fails_closed_when_unset(tmp_path):
 
 def test_admin_secret_escape_hatch_allows_import(tmp_path):
     isolated_dir = _isolated_config_dir(tmp_path)
-    env = {"PATH": os.environ.get("PATH", ""), "ALLOW_INSECURE_ADMIN_SECRET": "true"}
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "ALLOW_INSECURE_ADMIN_SECRET": "true",
+        # Contacts are required with no default (see the contact tests below);
+        # supplied here so this test isolates the ADMIN_SECRET escape hatch.
+        "HENRY_PHONE": "+15555550100",
+        "LEXI_PHONE": "+15555550101",
+    }
     result = subprocess.run(
         [sys.executable, "-c", "import config; print(config.ADMIN_SECRET)"],
         cwd=str(isolated_dir),
@@ -83,3 +90,52 @@ def test_optional_keys_do_not_raise_when_missing():
     )
     assert result.returncode == 0
     assert "ok" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Contact configuration (B5)
+# ---------------------------------------------------------------------------
+
+def _run_config(tmp_path, env_overrides):
+    """Import config.py with ONLY the given env, isolated from the repo .env."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("HENRY_PHONE", "LEXI_PHONE", "Henry_PHONE")
+    }
+    env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, "-c", "import config; print(config.HENRY_PHONE)"],
+        cwd=str(_isolated_config_dir(tmp_path)),
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_missing_contact_fails_loudly_instead_of_using_a_default(tmp_path):
+    """A real phone number used to be the default here, so an unset variable
+    silently delivered to it. There must be no fallback at all."""
+    res = _run_config(tmp_path, {"ADMIN_SECRET": "x", "LEXI_PHONE": "+15555550101"})
+    assert res.returncode != 0
+    assert "HENRY_PHONE is not set" in res.stderr
+
+
+def test_mis_cased_contact_key_is_not_silently_accepted(tmp_path):
+    """The actual bug: .env said 'Henry_PHONE' while the code reads
+    'HENRY_PHONE', so the override was ignored and the hardcoded default won.
+    Editing .env appeared to do nothing."""
+    res = _run_config(tmp_path, {
+        "ADMIN_SECRET": "x",
+        "LEXI_PHONE": "+15555550101",
+        "Henry_PHONE": "+15555559999",   # wrong case — must NOT satisfy it
+    })
+    assert res.returncode != 0
+    assert "case-sensitive" in res.stderr.lower()
+
+
+def test_contacts_come_from_the_environment_when_set(tmp_path):
+    res = _run_config(tmp_path, {
+        "ADMIN_SECRET": "x",
+        "HENRY_PHONE": "+15555550100",
+        "LEXI_PHONE": "+15555550101",
+    })
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "+15555550100"

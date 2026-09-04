@@ -95,10 +95,25 @@ if not ADMIN_SECRET:
             "For local/test use only, set ALLOW_INSECURE_ADMIN_SECRET=true instead."
         )
 
-HENRY_PHONE: str = os.environ.get("HENRY_PHONE", "+12147334061")
+# Recipients are required, with no fallback. A real phone number used to sit
+# here as the default, which meant two things: the number was committed to the
+# repo, and an unset (or, as happened, MIS-CASED — .env said "Henry_PHONE"
+# while the code reads "HENRY_PHONE") variable silently delivered to it anyway.
+# Editing .env appeared to do nothing. Fail loudly instead.
+def _require_contact(var_name: str) -> str:
+    value = os.environ.get(var_name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"{var_name} is not set. Add it to your .env (see .env.example). "
+            "Environment variable names are case-sensitive."
+        )
+    return value
+
+
+HENRY_PHONE: str = _require_contact("HENRY_PHONE")
 """Primary authorized contact for approval workflows"""
 
-LEXI_PHONE: str = os.environ.get("LEXI_PHONE", "+18179138648")
+LEXI_PHONE: str = _require_contact("LEXI_PHONE")
 """Secondary authorized contact for approval workflows"""
 
 # ============================================================================

@@ -23,10 +23,26 @@ export DEEPSEEK_API_KEY="broken_key_test" && uvicorn main:app --host 127.0.0.1 -
 
 DeepSeek should fail and Gemini (`gemini-2.5-flash`) should take over. Failover is for provider failure, timeout, or empty response only — never for an answer DeepSeek gave honestly.
 
-## Restarting the live gateway (com.lexi.ivy)
+## Restarting the live gateway (com.ivy.gateway)
 
-Prefer letting launchd do the relaunch: `kill $(launchctl list | grep com.lexi.ivy | cut -f1)`.
-KeepAlive brings it back in ~5 s. Then confirm `GET /ready` shows `chat_db_readable: true`.
+Prefer letting launchd do the relaunch — kill the PID by exact label and let `KeepAlive`
+bring it back (within ~10 s; `ThrottleInterval` only delays a respawn if it died young):
+
+```
+kill $(launchctl list | awk '$3=="com.ivy.gateway"{print $1}')
+```
+
+Never `grep ivy.gateway | kill` — `com.ivy.gateway_monitor` shares the prefix. The
+alternative, `launchctl kickstart -k gui/$(id -u)/com.ivy.gateway`, relaunches immediately
+but once produced a TCC-denied relaunch when run from a Claude shell (2026-09-01); the
+kill form is the evidence-backed default. Then confirm `GET /ready` shows
+`chat_db_readable: true`.
+
+The gateway runs `.venv/bin/python` (uv-managed CPython 3.12). Its Full Disk Access and
+Messages Automation grants are keyed to that exact binary, so `uv python install/upgrade`
+silently strips them — re-grant in System Settings from an unlocked session if the
+interpreter is ever replaced. `com.lexi.ivy` (the old `/usr/bin/python3` duplicate) was
+retired 2026-09-02; if it ever reappears in `launchctl list`, boot it out.
 
 If the new process logs `Cannot access chat.db … Retrying`, macOS TCC is denying the
 relaunched interpreter Full Disk Access. The poller self-heals by exiting after 3 denials
