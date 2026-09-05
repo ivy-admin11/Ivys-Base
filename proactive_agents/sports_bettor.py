@@ -480,6 +480,82 @@ def merge_picks(picks):
     return result
 
 
+def _game_key(matchup):
+    """Order-insensitive identity for a game, so 'A @ B' and 'B @ A' match."""
+    return " vs ".join(sorted(_team_tokens(matchup)))
+
+
+def _side_direction(pick):
+    """Which way a pick leans within its market: 'over'/'under', or the team.
+
+    Returns None when the direction can't be read, which means the pick is
+    never treated as conflicting with anything.
+    """
+    side = pick.get("side") or ""
+    family = _market_family(side)
+    s = _norm(side)
+    if family == "total":
+        if "over" in s or re.search(r"\bo\s?\d", s):
+            return "over"
+        if "under" in s or re.search(r"\bu\s?\d", s):
+            return "under"
+        return None
+    if family in ("spread", "moneyline"):
+        matchup = pick.get("matchup") or ""
+        parts = re.split(r"\s+@\s+|\s+vs\.?\s+", matchup)
+        if len(parts) != 2:
+            return None
+        side_tokens = _team_tokens(side)
+        hits = [t for t in parts if side_tokens & _team_tokens(t)]
+        # Identify the team itself, not its position in the string — "A @ B"
+        # and "B vs A" are the same game, and a positional tag would call two
+        # opposing picks identical.
+        return " ".join(sorted(_team_tokens(hits[0]))) if len(hits) == 1 else None
+    return None
+
+
+def drop_conflicting_picks(merged):
+    """Remove picks that take both sides of the same bet.
+
+    The 09:49 board carried "Liberty Flames +6" and "James Madison -6" — the
+    same game, opposite sides, both from @cappersforfree. Together they are a
+    guaranteed loss after vig, and presenting them as two plays is worse than
+    presenting neither.
+
+    Only genuinely opposed picks are dropped: same game, same market family,
+    same period, opposite direction. A spread and a total on one game are
+    different bets, and a first-half line does not conflict with a full game.
+
+    Returns ``(kept, conflicts)`` where conflicts is a list of the dropped
+    groups, so the caller can say what happened instead of silently shrinking.
+    """
+    buckets = {}
+    for e in merged:
+        family = _market_family(e.get("side"))
+        if family not in ("total", "spread", "moneyline"):
+            continue
+        direction = _side_direction(e)
+        if direction is None:
+            continue
+        # Spread and moneyline both express "which team wins", so a team taken
+        # on the spread and the same team on the ML are NOT opposed — but the
+        # two different teams are. Bucket them together.
+        group = "line" if family in ("spread", "moneyline") else "total"
+        period = "period" if _is_period_bet(e.get("side")) else "full"
+        buckets.setdefault((_game_key(e.get("matchup")), group, period), []).append((direction, e))
+
+    dropped_ids, conflicts = set(), []
+    for (_game, _group, _period), entries in buckets.items():
+        directions = {d for d, _ in entries}
+        if len(directions) > 1:
+            group_picks = [e for _, e in entries]
+            conflicts.append(group_picks)
+            dropped_ids.update(id(e) for e in group_picks)
+
+    kept = [e for e in merged if id(e) not in dropped_ids]
+    return kept, conflicts
+
+
 def _team_tokens(text):
     """Word set for fuzzy matchup matching, dropping connective noise."""
     stop = {"vs", "v", "at", "the", "and"}
@@ -547,8 +623,83 @@ def _is_player_prop(side):
     return bool(_PROP_STAT_ABBREVS.search(s))
 
 
+# A bet on a period ("1H -6.5", "2Q Over 14") has no counterpart in the feed,
+# which only carries full-game markets. Real board 2026-09-05: "LSU Tigers 1H
+# -6.5" was printed with the full-game spread of -10.5 beside it.
+_PERIOD_RE = re.compile(r"\b([12](?:h|q|st|nd)|first\s+half|second\s+half|1st\s+half|2nd\s+half)\b",
+                        re.IGNORECASE)
+
+
+def _is_period_bet(side):
+    return bool(_PERIOD_RE.search(str(side or "")))
+
+
+def _market_family(side):
+    """Which market a side belongs to: total, spread, moneyline, or other."""
+    s = _norm(side)
+    if any(k in s for k in ("over", "under", "total")) or re.search(r"\b[ou]\s?\d", s):
+        return "total"
+    if "moneyline" in s or "money line" in s or "ml" in s.split():
+        return "moneyline"
+    if any(k in s for k in ("spread", "run line", "runline", "puck line", "puckline",
+                            "handicap", " pk")) or re.search(r"[+-]\d", s):
+        return "spread"
+    return "other"
+
+
+def _price_for_side(side, market, matchup=""):
+    """Narrow a two-sided market string down to the side actually taken.
+
+    The feed renders a market as both halves — "Clemson Tigers +10.5 (-118) /
+    LSU Tigers -10.5 (-104)" — and the report used to print the whole thing,
+    which is unreadable and names a price for a bet nobody made. Returns the
+    matching half, or "" when it can't be determined: no price beats a price
+    for the other side.
+    """
+    market = str(market or "").strip()
+    if not market:
+        return ""
+    if _is_period_bet(side):
+        return ""
+    halves = [h.strip() for h in market.split(" / ") if h.strip()]
+    if len(halves) != 2:
+        return market  # already one-sided
+
+    s = _norm(side)
+    family = _market_family(side)
+
+    if family == "total":
+        want = "over" if "over" in s or re.search(r"\bo\s?\d", s) else (
+            "under" if "under" in s or re.search(r"\bu\s?\d", s) else None)
+        if want:
+            for h in halves:
+                if _norm(h).startswith(want):
+                    return h
+        return ""
+
+    # Spread / moneyline: pick the half whose team name the side names.
+    side_tokens = _team_tokens(side)
+    scored = []
+    for h in halves:
+        # Strip the number and price so only the team name is compared.
+        name = re.split(r"[+-]?\d", h)[0]
+        scored.append((len(side_tokens & _team_tokens(name)), h))
+    scored.sort(reverse=True)
+    if scored[0][0] >= 1 and scored[0][0] > scored[1][0]:
+        return scored[0][1]
+
+    # Fall back on the sign: "-7" takes the favourite's half.
+    m = re.search(r"([+-])\s?\d", str(side or ""))
+    if m and family == "spread":
+        want_sign = m.group(1)
+        matching = [h for h in halves if re.search(rf"\{want_sign}\d", h)]
+        if len(matching) == 1:
+            return matching[0]
+    return ""
+
+
 def attach_odds(merged, games):
-    """Backfill each pick's sport/odds from the live feed (ground truth) by matchup."""
+    """Backfill each pick's sport/odds/start from the live feed (ground truth)."""
     for e in merged:
         mtokens = _team_tokens(e.get("matchup"))
         best, best_score = None, 0
@@ -556,17 +707,33 @@ def attach_odds(merged, games):
             score = len(mtokens & _team_tokens(f"{g['away']} {g['home']}"))
             if score > best_score:
                 best, best_score = g, score
+
         if best and best_score >= 2:
             if not e.get("sport"):
                 e["sport"] = best["sport"]
             # Fill odds from the market that matches the actual bet type.
-            # Player props are deliberately left blank: the feed only carries
-            # game markets, and a wrong price is worse than no price.
+            # Player props and team totals are deliberately left blank: the feed
+            # only carries full-game markets, and a wrong price is worse than
+            # no price.
             if not e.get("odds") and not _is_player_prop(e.get("side")):
-                e["odds"] = _odds_for_side(e.get("side"), best)
+                market = _odds_for_side(e.get("side"), best)
+                e["odds"] = _price_for_side(e.get("side"), market, e.get("matchup"))
             # The odds feed is authoritative for the scheduled start time.
             if best.get("commence"):
                 e["start"] = best["commence"]
+
+        # Grok is asked to copy the price "for that side" out of the slate, but
+        # routinely copies the whole two-sided line. Narrow whatever we ended up
+        # with, whichever source it came from.
+        if e.get("odds") and " / " in str(e["odds"]):
+            # A two-sided market next to a prop or team total is a GAME market
+            # that got copied across — the feed has no price for that bet, so
+            # drop it rather than narrowing it to a confidently wrong half.
+            # (A real prop price arrives as a single number, "+450", and is kept.)
+            if _is_player_prop(e.get("side")):
+                e["odds"] = ""
+            else:
+                e["odds"] = _price_for_side(e.get("side"), e["odds"], e.get("matchup"))
     return merged
 
 
@@ -1355,6 +1522,16 @@ def _run_pipeline(
 
     merged = merge_picks(picks)
     attach_odds(merged, games)
+
+    # A board carrying both sides of one game is a guaranteed loss after vig;
+    # presenting them as two plays is worse than presenting neither.
+    merged, conflicts = drop_conflicting_picks(merged)
+    for group in conflicts:
+        print(
+            "\u2696\ufe0f  Dropped opposing picks on "
+            f"{group[0].get('matchup')}: " + " vs ".join(g.get("side", "?") for g in group)
+        )
+
     enrich_picks(merged, games)
     
     # Filter picks by minimum quality threshold. A pick clears the bar when it
@@ -1399,6 +1576,17 @@ def _run_pipeline(
             "medium/high confidence), so I'm not calling them plays \u2014 just "
             "showing you what the sweep saw."
         )
+        # Naming the CAUSE matters: a board sourced from one handle can never
+        # reach a 2-sharp consensus, so "nothing qualified" is about coverage,
+        # not about a quiet day.
+        sources = {h for e in merged for h in (e.get("handicappers") or [])}
+        if len(sources) == 1:
+            only = next(iter(sources))
+            body += (
+                f"\n\nEvery one of these came from @{only}. With a single source "
+                "nothing can reach the 2-sharp bar \u2014 that's a coverage gap, "
+                "not a quiet slate."
+            )
         delivery = deliver_report(
             HENRY_PHONE,
             job_name="sharp_picks",

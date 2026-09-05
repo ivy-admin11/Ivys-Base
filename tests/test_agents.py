@@ -294,7 +294,8 @@ def test_player_props_do_not_borrow_the_game_market_price():
     assert not picks[0].get("odds"), "a prop must not inherit the game total"
     assert picks[0]["sport"] == "MLB", "sport and start time still backfill"
     assert picks[0]["start"] == "2026-09-03T23:15:00Z"
-    assert picks[1]["odds"] == "Over 8 (-117) / Under 8 (-103)", "real game totals still fill"
+    # "Under 8.5" takes the under half, not the whole market.
+    assert picks[1]["odds"] == "Under 8 (-103)", "real game totals still fill, narrowed to the side"
 
 
 def test_home_run_props_do_not_borrow_the_game_moneyline():
@@ -314,7 +315,8 @@ def test_home_run_props_do_not_borrow_the_game_moneyline():
     sports_bettor.attach_odds(picks, games)
 
     assert not picks[0].get("odds"), "an HR prop must not inherit the game moneyline"
-    assert picks[1]["odds"] == "Baltimore Orioles +108 / Boston Red Sox -126"
+    # Narrowed to the side taken — the full two-sided market is the old bug.
+    assert picks[1]["odds"] == "Baltimore Orioles +108"
 
 
 def test_prop_guard_does_not_fire_on_team_names():
@@ -530,10 +532,146 @@ def test_team_totals_do_not_borrow_the_game_total():
     ]
     sports_bettor.attach_odds(picks, games)
     assert not picks[0].get("odds"), "a team total must not inherit the game total"
-    assert picks[1]["odds"] == "Over 58.5 (-115) / Under 58.5 (-105)", "real game totals still fill"
+    assert picks[1]["odds"] == "Over 58.5 (-115)", "real game totals still fill, narrowed to the side"
 
 
 def test_prop_guard_leaves_ordinary_spreads_alone():
     assert not sports_bettor._is_player_prop("Auburn Tigers -7")
     assert not sports_bettor._is_player_prop("Oregon Ducks -24")
     assert sports_bettor._is_player_prop("Auburn Tigers TT Over 34.5")
+
+
+class TestOddsNarrowing:
+    """The Odds column printed the whole two-sided market. Real 09:49 board:
+    "LSU Tigers 1H -6.5" was shown with "Clemson Tigers +10.5 (-118) / LSU
+    Tigers -10.5 (-104)" — both sides, and a full-game line beside a 1H bet."""
+
+    SPREAD = "Clemson Tigers +10.5 (-118) / LSU Tigers -10.5 (-104)"
+    TOTAL = "Over 58.5 (-115) / Under 58.5 (-105)"
+    ML = "Baltimore Orioles +108 / Boston Red Sox -126"
+
+    def test_spread_takes_the_side_actually_bet(self):
+        assert sports_bettor._price_for_side("Clemson Tigers +10.5", self.SPREAD) == "Clemson Tigers +10.5 (-118)"
+        assert sports_bettor._price_for_side("LSU Tigers -10.5", self.SPREAD) == "LSU Tigers -10.5 (-104)"
+
+    def test_totals_take_the_matching_half(self):
+        assert sports_bettor._price_for_side("Over 58.5", self.TOTAL) == "Over 58.5 (-115)"
+        assert sports_bettor._price_for_side("Under 58.5", self.TOTAL) == "Under 58.5 (-105)"
+
+    def test_moneyline_takes_the_named_team(self):
+        assert sports_bettor._price_for_side("Baltimore Orioles ML", self.ML) == "Baltimore Orioles +108"
+
+    def test_period_bets_get_no_price(self):
+        """A 1H line has no counterpart in a full-game feed."""
+        for side in ("LSU Tigers 1H -6.5", "Oregon 2H -3", "Army first half Over 24"):
+            assert sports_bettor._price_for_side(side, self.SPREAD) == "", side
+
+    def test_unreadable_side_gets_no_price_rather_than_a_guess(self):
+        assert sports_bettor._price_for_side("something odd", self.SPREAD) == ""
+
+    def test_one_sided_market_passes_through(self):
+        assert sports_bettor._price_for_side("Auburn -7.5", "Auburn -7.5 (-105)") == "Auburn -7.5 (-105)"
+
+    def test_grok_supplied_two_sided_odds_are_narrowed_too(self):
+        picks = [{"matchup": "Clemson Tigers @ LSU Tigers", "side": "Clemson Tigers +10.5",
+                  "odds": self.SPREAD}]
+        sports_bettor.attach_odds(picks, [])
+        assert picks[0]["odds"] == "Clemson Tigers +10.5 (-118)"
+
+
+class TestConflictingPicks:
+    """The 09:49 board carried Liberty +6 and James Madison -6 — same game,
+    opposite sides, same handle. Together they lose to the vig."""
+
+    def test_opposing_spreads_are_both_dropped(self):
+        board = [
+            {"matchup": "Liberty Flames @ James Madison Dukes", "side": "Liberty Flames +6"},
+            {"matchup": "Liberty Flames @ James Madison Dukes", "side": "James Madison -6"},
+        ]
+        kept, conflicts = sports_bettor.drop_conflicting_picks(board)
+        assert kept == []
+        assert len(conflicts) == 1 and len(conflicts[0]) == 2
+
+    def test_over_and_under_on_one_game_are_dropped(self):
+        board = [
+            {"matchup": "Bryant @ Army", "side": "Over 50.5"},
+            {"matchup": "Bryant @ Army", "side": "Under 50.5"},
+        ]
+        kept, _ = sports_bettor.drop_conflicting_picks(board)
+        assert kept == []
+
+    def test_a_spread_and_a_total_on_one_game_both_survive(self):
+        board = [
+            {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers -7"},
+            {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers TT Over 34.5"},
+        ]
+        kept, conflicts = sports_bettor.drop_conflicting_picks(board)
+        assert len(kept) == 2 and conflicts == []
+
+    def test_a_period_bet_does_not_conflict_with_the_full_game(self):
+        board = [
+            {"matchup": "Clemson Tigers @ LSU Tigers", "side": "LSU Tigers 1H -6.5"},
+            {"matchup": "Clemson Tigers @ LSU Tigers", "side": "Clemson Tigers +10.5"},
+        ]
+        kept, conflicts = sports_bettor.drop_conflicting_picks(board)
+        assert len(kept) == 2 and conflicts == []
+
+    def test_same_team_on_spread_and_moneyline_is_not_a_conflict(self):
+        board = [
+            {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers -7"},
+            {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers ML"},
+        ]
+        kept, conflicts = sports_bettor.drop_conflicting_picks(board)
+        assert len(kept) == 2 and conflicts == []
+
+    def test_reversed_matchup_order_still_matches_the_same_game(self):
+        board = [
+            {"matchup": "Liberty Flames @ James Madison Dukes", "side": "Liberty Flames +6"},
+            {"matchup": "James Madison Dukes vs Liberty Flames", "side": "James Madison Dukes -6"},
+        ]
+        kept, _ = sports_bettor.drop_conflicting_picks(board)
+        assert kept == []
+
+
+def test_below_threshold_board_names_a_single_source_as_the_cause(monkeypatch, tmp_path):
+    """14 picks from one handle can never reach a 2-sharp consensus. Saying
+    'nothing qualified' without saying why reads as a quiet slate."""
+    monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["g"])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@x"}])
+    monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
+        {"is_consensus": False, "consensus_count": 1, "handicappers": ["cappersforfree"],
+         "sport": "NCAAF", "matchup": f"A{i} @ B{i}", "side": "B -3", "odds": "-110",
+         "enrichment": {"confidence": "low"}} for i in range(5)
+    ])
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda p, report_date=None: None)
+    monkeypatch.setattr(sports_bettor, "attach_odds", lambda m, g: None)
+    monkeypatch.setattr(sports_bettor, "enrich_picks", lambda m, g: None)
+    monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda s, m: None)
+
+    sent = []
+    monkeypatch.setattr(text_delivery, "send_imessage", lambda phone, body: sent.append(body) or True)
+    monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
+
+    sports_bettor.run(force=True, send=True)
+
+    joined = "\n".join(sent)
+    assert "@cappersforfree" in joined
+    assert "coverage gap" in joined
+
+
+def test_a_game_market_copied_onto_a_prop_is_cleared_not_narrowed():
+    """Real 09:49 board: "Auburn Tigers TT Over 34.5" arrived carrying the
+    game total. Narrowing it to "Over 58.5" is still the wrong bet's price."""
+    picks = [{"matchup": "Baylor Bears @ Auburn Tigers",
+              "side": "Auburn Tigers TT Over 34.5",
+              "odds": "Over 58.5 (-115) / Under 58.5 (-105)"}]
+    sports_bettor.attach_odds(picks, [])
+    assert picks[0]["odds"] == ""
+
+
+def test_a_genuine_prop_price_from_grok_survives():
+    picks = [{"matchup": "A @ B", "side": "Coby Mayo HR", "odds": "+450"}]
+    sports_bettor.attach_odds(picks, [])
+    assert picks[0]["odds"] == "+450"
