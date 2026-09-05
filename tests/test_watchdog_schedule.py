@@ -25,7 +25,13 @@ JOB_PLISTS = {
     "sharp_picks": "com.ivy.sharppicks",
     "happy_hour": "com.ivy.happy_hour_scout",
     "familia_meal_planner": "com.ivy.familia_meal_planner",
+    "ivy_brain": "com.ivy.brain",
 }
+
+# com.ivy.brain has no StartCalendarInterval: it is a KeepAlive daemon that
+# launchd restarts on any exit. Its threshold is a liveness heuristic, not a
+# derived schedule, so the gap check does not apply to it.
+DAEMONS = {"ivy_brain"}
 
 
 def _load(label: str) -> dict:
@@ -57,6 +63,8 @@ def longest_scheduled_gap_h(plist: dict) -> float:
 
 @pytest.mark.parametrize("job,label", sorted(JOB_PLISTS.items()))
 def test_watchdog_thresholds_match_plists(job: str, label: str) -> None:
+    if job in DAEMONS:
+        pytest.skip(f"{job} is an always-on daemon, not a scheduled job")
     gap = longest_scheduled_gap_h(_load(label))
     limit = EXPECTED_SILENCE_H[job]
 
@@ -95,3 +103,41 @@ def test_every_plist_template_is_valid_xml(template: str) -> None:
     have silently killed the job.
     """
     plistlib.loads((TEMPLATES / template).read_bytes())
+
+
+@pytest.mark.parametrize("job", sorted(DAEMONS))
+def test_daemons_are_keepalive_with_no_schedule(job: str) -> None:
+    """A daemon's threshold cannot be derived, so pin what it actually is.
+
+    com.ivy.brain runs KeepAlive=true with no calendar interval -- launchd
+    relaunches it on any exit, so it should never be quiet for long. It went
+    silent on 2026-07-16 and nothing reported it for seven weeks, because the
+    watchdog only knew about the three scheduled agents.
+    """
+    plist = _load(JOB_PLISTS[job])
+    assert plist.get("KeepAlive") is True
+    assert "StartCalendarInterval" not in plist
+    assert EXPECTED_SILENCE_H[job] > 0
+
+
+def test_a_daemon_log_outside_the_repo_still_resolves(tmp_path, monkeypatch) -> None:
+    """brain's log lives in ~/ai-admin-api, not in this repo."""
+    from datetime import datetime, timezone
+
+    from ivy_core import agent_watchdog as wd
+
+    log = tmp_path / "ivy_brain_output.log"
+    log.write_text("alive\n")
+    monkeypatch.setitem(wd.LOG_FILES, "ivy_brain", str(log))   # absolute
+    seen = wd.last_activity("ivy_brain")
+    assert seen is not None, "an absolute log path must be readable"
+    assert (datetime.now(timezone.utc) - seen).total_seconds() < 120
+
+
+def test_a_missing_daemon_log_does_not_false_alarm(tmp_path, monkeypatch) -> None:
+    """No log at all is 'no evidence', not 'stopped' -- the machine may simply
+    not have that project checked out."""
+    from ivy_core import agent_watchdog as wd
+
+    monkeypatch.setitem(wd.LOG_FILES, "ivy_brain", str(tmp_path / "absent.log"))
+    assert wd.last_activity("ivy_brain") is None

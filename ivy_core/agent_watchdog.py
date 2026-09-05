@@ -55,12 +55,20 @@ EXPECTED_SILENCE_H: Dict[str, int] = {
     "sharp_picks": 20,           # daily at 09/15/21 -> 12h worst gap
     "happy_hour": 192,           # Sundays 12:00 -> 168h between runs
     "familia_meal_planner": 192, # Sundays 08:00 -> 168h between runs
+    # com.ivy.brain is not scheduled -- it is a KeepAlive daemon, so launchd
+    # restarts it on any exit and it should never be silent for long. This
+    # threshold is a liveness heuristic rather than a schedule: a week with no
+    # output from an always-on process means it is not doing anything. It went
+    # quiet on 2026-07-16 and nothing noticed for seven weeks, which is the
+    # whole reason it is listed here.
+    "ivy_brain": 168,
 }
 
 FRIENDLY_NAMES = {
     "sharp_picks": "Sharp Picks",
     "happy_hour": "Happy Hour Scout",
     "familia_meal_planner": "Familia Meal Planner",
+    "ivy_brain": "Ivy Brain (ai-admin-api)",
 }
 
 # Log files are the second source of truth: a job that ran and produced no
@@ -69,6 +77,7 @@ LOG_FILES = {
     "sharp_picks": "logs/sharppicks_scheduled.log",
     "happy_hour": "logs/happy_hour_scheduled.log",
     "familia_meal_planner": "logs/familia_meal_planner.log",
+    "ivy_brain": "~/ai-admin-api/ivy_brain_output.log",
 }
 
 # Never re-alert about the same job more often than this.
@@ -79,7 +88,10 @@ def _log_mtime(job: str) -> Optional[datetime]:
     rel = LOG_FILES.get(job)
     if not rel:
         return None
-    path = PROJECT_ROOT / rel
+    # com.ivy.brain's implementation and logs live outside this repo, so a
+    # log path may be absolute or ~-relative rather than repo-relative.
+    expanded = Path(rel).expanduser()
+    path = expanded if expanded.is_absolute() else PROJECT_ROOT / rel
     try:
         if path.exists():
             return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -134,7 +146,8 @@ def stale_agents(now: Optional[datetime] = None) -> List[dict]:
 
 def format_alert(stale: List[dict]) -> str:
     """The text Henry receives. Names the fix, not just the symptom."""
-    lines = ["\U0001F6A8 A scheduled job has stopped running."]
+    plural = "jobs have" if len(stale) > 1 else "job has"
+    lines = [f"\U0001F6A8 A background {plural} stopped running."]
     for s in stale:
         days = s["silent_hours"] / 24.0
         when = "a day" if days < 1.5 else f"{days:.0f} days"

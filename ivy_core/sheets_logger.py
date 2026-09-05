@@ -64,6 +64,11 @@ def _configured_spreadsheet_id() -> str:
 SPREADSHEET_ID = _configured_spreadsheet_id()
 SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 
+# The tab within that spreadsheet, by launchd-independent id. Was written out
+# separately in picks_tracker and sync_picks_to_sheet; if those two ever
+# disagreed the writers would target different tabs and neither would say so.
+TARGET_SHEET_GID = 1305096861
+
 # The sheet's column order, in one place.
 #
 # This used to be written down three times and three different ways.
@@ -208,7 +213,7 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
         return False
     
     try:
-        # Update export sheet (Sharp Picks tab, gid=1305096861)
+        # Update export sheet (the TARGET_SHEET_GID tab)
         export_sheet = "Sharp Picks"
         
         # Read the current sheet to find the matching row

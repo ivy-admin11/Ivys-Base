@@ -18,6 +18,7 @@ from ivy_core.sheets_logger import (  # noqa: E402
     COLUMNS,
     LAST_COLUMN_LETTER,
     SPREADSHEET_ID,
+    TARGET_SHEET_GID,
 )
 
 import sqlite3  # noqa: E402
@@ -28,7 +29,6 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Was a fifth hardcoded copy of the id. It comes from sheets_logger now,
 # which normalises whatever is configured (one of the env vars holds a
 # pasted browser URL, and the API answers a URL with a 404).
-TARGET_SHEET_GID = 1305096861  # From URL: gid=1305096861
 
 
 def get_sheets_service():

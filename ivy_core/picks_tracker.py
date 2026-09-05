@@ -447,17 +447,22 @@ def auto_sync_to_export_sheet():
     "Sharp Picks" sheet in the export tab for easy sharing and analysis.
     """
     try:
-        from ivy_core.sheets_logger import _get_sheets_service
+        # One import, at the point of use. sheets_logger owns every fact about
+        # the spreadsheet -- its id, its tab, and its column layout -- so none
+        # of them can drift apart across the modules that write to it.
+        from ivy_core.sheets_logger import (
+            COL,
+            COLUMNS,
+            LAST_COLUMN_LETTER,
+            SPREADSHEET_ID,
+            TARGET_SHEET_GID,
+            _get_sheets_service,
+        )
         
         service = _get_sheets_service()
         if not service:
             logger.debug("Skipping auto-sync to export sheet: no Google Sheets access")
             return False
-        
-        # Single source of truth; see sheets_logger for why this is not a
-        # literal any more.
-        from ivy_core.sheets_logger import SPREADSHEET_ID
-        TARGET_SHEET_GID = 1305096861
         
         # Find the target sheet
         spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
@@ -500,7 +505,6 @@ def auto_sync_to_export_sheet():
         
         # Format for sheet
         rows = []
-        from ivy_core.sheets_logger import COL, COLUMNS, LAST_COLUMN_LETTER
         header = list(COLUMNS)
         
         for pick in picks:
