@@ -363,3 +363,42 @@ class TestNCAAFCoverage:
         sports_bettor.attach_odds(picks, games)
         assert picks[0]["sport"] == "NCAAF"
         assert picks[0]["odds"] == "Texas +7 (-110)"
+
+
+class TestHandleVetting:
+    """scripts/vet_x_handles.py — the repeatable version of the check that
+    should have caught the dead 16-handle list. Never calls X in tests."""
+
+    @staticmethod
+    def _mod():
+        import importlib.util, pathlib
+        path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "vet_x_handles.py"
+        spec = importlib.util.spec_from_file_location("vet_x_handles", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_silent_zero_handles_are_reported_not_dropped(self):
+        vet = self._mod()
+        results = vet.vet(["live", "dead"], sweep=lambda batch, slate: [
+            {"handicapper": "live", "sport": "NCAAF", "matchup": "A @ B", "side": "B +7"}
+        ])
+        assert results["dead"] == [], "a handle returning nothing must still appear"
+        assert len(results["live"]) == 1
+
+    def test_handle_casing_from_grok_is_tolerated(self):
+        vet = self._mod()
+        results = vet.vet(["KyleHunterPicks"], sweep=lambda batch, slate: [
+            {"handicapper": "@kylehunterpicks", "sport": "NCAAF", "matchup": "A @ B", "side": "B"}
+        ])
+        assert len(results["KyleHunterPicks"]) == 1
+
+    def test_candidates_exclude_the_known_non_bettors(self):
+        vet = self._mod()
+        for bad in ("sharpfootball", "ToddFuhrman", "vegasbedwards", "stevejanus"):
+            assert bad not in vet.CANDIDATES, f"{bad} does not post free bettable picks"
+
+    def test_candidates_are_not_already_in_the_sweep(self):
+        vet = self._mod()
+        overlap = set(vet.CANDIDATES) & set(sports_bettor.TARGET_X_ACCOUNTS)
+        assert not overlap, f"already swept: {overlap}"
