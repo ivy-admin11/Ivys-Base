@@ -442,17 +442,17 @@ class TestCurrentHandleAudit:
         assert "ItsCappersPicks" in vet.TARGET_X_ACCOUNTS
 
 
-class TestPDFContextColumn:
-    """The Context column was blank in every PDF the job ever produced:
-    _to_row read enrichment["summary"], which nothing writes. The real schema
-    is take / line_movement / injury / sharp_public / confidence."""
+class TestCardAnalysis:
+    """The old Context column read enrichment["summary"], a key nothing writes,
+    so it was blank in every PDF ever produced. The card analysis line carries
+    the take and the market notes; grade and attribution sit on the card's meta
+    line and are deliberately not repeated."""
 
     PICK = {
         "sport": "NCAAF", "matchup": "Ohio State Buckeyes @ Texas Longhorns",
         "side": "Texas +7", "odds": "+7 (-110)",
         "is_consensus": True, "consensus_count": 3,
         "handicappers": ["ItsCappersPicks", "billhpicks"],
-        "start": "2026-09-05T23:30:00Z",
         "enrichment": {
             "confidence": "high",
             "take": "Line opened +9.5 and got bet to +7.",
@@ -462,58 +462,32 @@ class TestPDFContextColumn:
         },
     }
 
-    def test_context_carries_the_analysis_not_an_empty_string(self):
-        ctx = sports_bettor._pdf_context(self.PICK)
-        assert ctx.strip()
-        for fragment in ("HIGH", "@ItsCappersPicks", "Line opened +9.5",
-                         "Line: +9.5", "Inj: OSU LT questionable", "71% of money"):
-            assert fragment in ctx, fragment
+    def test_analysis_carries_the_take_and_the_market_notes(self):
+        out = sports_bettor._pick_analysis(self.PICK)
+        for fragment in ("Line opened +9.5", "Line: +9.5", "Inj: OSU LT questionable",
+                         "71% of money"):
+            assert fragment in out, fragment
 
-    def test_context_never_reads_the_nonexistent_summary_key(self):
-        """A pick whose enrichment has only 'summary' must still not be blank —
-        the grade and backers always render."""
+    def test_analysis_never_reads_the_nonexistent_summary_key(self):
         pick = dict(self.PICK, enrichment={"summary": "ignored legacy field"})
-        ctx = sports_bettor._pdf_context(pick)
-        assert "ignored legacy field" not in ctx
-        assert "HIGH" in ctx and "@billhpicks" in ctx
+        assert sports_bettor._pick_analysis(pick) == ""
+
+    def test_placeholder_takes_are_dropped(self):
+        pick = dict(self.PICK, enrichment={"take": "no data available"})
+        assert sports_bettor._pick_analysis(pick) == ""
 
     def test_markup_characters_are_escaped(self):
-        """Cells are reportlab Paragraphs; a raw & or < breaks the build."""
-        pick = dict(self.PICK, enrichment={
-            "confidence": "high", "take": "Top-10 SP+ & <best> in the country"})
-        ctx = sports_bettor._pdf_context(pick)
-        assert "&amp;" in ctx and "&lt;best&gt;" in ctx
-        assert " & " not in ctx.replace("&amp;", "")
+        pick = dict(self.PICK, enrichment={"take": "Top-10 SP+ & <best> in the country"})
+        out = sports_bettor._pick_analysis(pick)
+        assert "&amp;" in out and "&lt;best&gt;" in out
 
-    def test_row_escapes_matchup_and_side_too(self, tmp_path, monkeypatch):
+    def test_every_card_gets_its_analysis_and_a_signal_note(self, monkeypatch):
         captured = {}
-
-        class FakeFormatter:
-            def __init__(self, **kw): pass
-            def generate_pdf(self, filename, **kw):
-                captured.update(kw)
-                open(filename, "wb").write(b"%PDF-1.4 fake")
-
-        monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
-        sports_bettor.format_picks_pdf([dict(self.PICK, matchup="A & B @ C <D>")])
-        row = captured["consensus_picks"][0]
-        assert row["matchup"] == "A &amp; B @ C &lt;D&gt;"
-        assert row["reasoning"].strip()
-
-    def test_pdf_heading_has_no_emoji(self, tmp_path, monkeypatch):
-        """The PDF font renders emoji as filled squares."""
-        captured = {}
-
-        class FakeFormatter:
-            def __init__(self, **kw): pass
-            def generate_pdf(self, filename, **kw):
-                captured.update(kw)
-                open(filename, "wb").write(b"%PDF-1.4 fake")
-
-        monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
-        sports_bettor.format_picks_pdf([self.PICK])
-        assert "\U0001F525" not in captured["consensus_heading"]
-        assert "HIGH LIKELIHOOD" in captured["consensus_heading"]
+        monkeypatch.setattr(sports_bettor, "build_dashboard",
+                            lambda path, picks, **kw: captured.update(picks=picks, **kw) or path)
+        sports_bettor.format_picks_pdf([dict(self.PICK)])
+        assert "Line opened +9.5" in captured["picks"][0]["analysis"]
+        assert "consensus play" in captured["signal_note"]
 
 
 def test_team_totals_do_not_borrow_the_game_total():
@@ -677,41 +651,29 @@ def test_a_genuine_prop_price_from_grok_survives():
     assert picks[0]["odds"] == "+450"
 
 
-class TestPDFSummaryLine:
-    """"12 pick(s) sourced from X handicappers — 0 consensus play(s) with 2+
-    sharps agreeing." X is the platform, but beside "12 pick(s)" it reads as a
-    number nobody filled in."""
+class TestSignalNote:
+    """The old summary read "12 pick(s) sourced from X handicappers — 0
+    consensus play(s) with 2+ sharps agreeing": X is the platform but scanned
+    as a missing number, and a printed zero explained nothing. Counts now live
+    in the stat tiles, so the banner carries only the reason."""
 
-    def test_the_handicapper_count_is_stated(self):
-        board = [{"handicappers": ["a", "b"]}, {"handicappers": ["c"]}]
-        assert "from 3 handicappers on X" in sports_bettor._pdf_summary(board, [])
-
-    def test_a_single_source_is_named_in_the_singular(self):
-        board = [{"handicappers": ["cappersforfree"]} for _ in range(12)]
-        out = sports_bettor._pdf_summary(board, [])
-        assert "12 picks from 1 handicapper on X" in out
-        assert "handicappers" not in out.split("on X")[0]
-
-    def test_zero_consensus_explains_itself_instead_of_printing_a_zero(self):
-        out = sports_bettor._pdf_summary([{"handicappers": ["only"]}], [])
-        assert "0 consensus" not in out
-        assert "a single source cannot produce" in out
+    def test_single_source_is_named_as_the_cause(self):
+        note = sports_bettor._signal_note([{}], [], {"cappersforfree"})
+        assert "single source" in note
+        assert "0 consensus" not in note
 
     def test_multiple_sources_with_no_agreement_say_that_instead(self):
-        board = [{"handicappers": ["a"]}, {"handicappers": ["b"]}]
-        out = sports_bettor._pdf_summary(board, [])
-        assert "no two sharps landed on the same bet" in out
-        assert "single source" not in out
+        note = sports_bettor._signal_note([{}, {}], [], {"a", "b"})
+        assert "no two landed on the same one" in note
+        assert "single source" not in note
 
     def test_consensus_is_reported_with_real_plurals(self):
-        board = [{"handicappers": ["a", "b"]}, {"handicappers": ["c"]}]
-        assert "1 consensus play," in sports_bettor._pdf_summary(board, board[:1])
-        assert "2 consensus plays," in sports_bettor._pdf_summary(board, board)
+        assert "1 consensus play on the board" in sports_bettor._signal_note([{}], [{}], {"a", "b"})
+        assert "2 consensus plays on the board" in sports_bettor._signal_note([{}], [{}, {}], {"a", "b"})
 
     def test_no_parenthesised_plurals_anywhere(self):
-        for board, cons in (([{"handicappers": ["a"]}], []),
-                            ([{"handicappers": ["a", "b"]}] * 3, [{"handicappers": ["a", "b"]}])):
-            assert "(s)" not in sports_bettor._pdf_summary(board, cons)
+        for args in (([{}], [], {"a"}), ([{}], [{}], {"a", "b"}), ([{}], [], {"a", "b"})):
+            assert "(s)" not in sports_bettor._signal_note(*args)
 
     def test_count_helper_pluralises(self):
         assert sports_bettor._count(1, "pick") == "1 pick"
@@ -719,21 +681,53 @@ class TestPDFSummaryLine:
         assert sports_bettor._count(2, "consensus play") == "2 consensus plays"
 
 
-def test_footer_does_not_append_a_second_unit(tmp_path, monkeypatch):
-    """The formatter used to add " pick(s)" to a value callers already phrase
-    in full: "5 picks, 2 consensus pick(s)"."""
-    captured = {}
+class TestDashboard:
+    """The board Henry asked for: stat tiles, a signal banner, and cards
+    attributed to the handicapper rather than to "X Sharp Picks"."""
 
-    class FakeFormatter:
-        def __init__(self, **kw): pass
-        def generate_pdf(self, filename, **kw):
-            captured.update(kw)
-            open(filename, "wb").write(b"%PDF-1.4 fake")
+    def test_attribution_names_the_handicapper_not_the_platform(self):
+        from picks_dashboard import _attribution
+        assert _attribution({"handicappers": ["cappersforfree"]}) == "@cappersforfree"
+        assert _attribution({"handicappers": ["a", "b"]}) == "@a, @b"
+        assert _attribution({"handicappers": ["a", "b", "c"]}) == "@a +2 more"
+        assert _attribution({"handicappers": []}) == "unattributed"
 
-    monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
-    sports_bettor.format_picks_pdf([{
-        "sport": "NCAAF", "matchup": "A @ B", "side": "B -7", "odds": "-110",
-        "is_consensus": False, "consensus_count": 1, "handicappers": ["one"],
-    }])
-    assert captured["metadata"]["pick_count"] == "1 pick, 0 consensus"
-    assert "pick(s)" not in captured["metadata"]["pick_count"]
+    def test_market_badges_describe_the_bet(self):
+        from picks_dashboard import market_badge
+        assert market_badge("Auburn Tigers -7") == "SPREAD"
+        assert market_badge("Over 50.5") == "TOTAL"
+        assert market_badge("Auburn Tigers TT Over 34.5") == "TEAM TOTAL"
+        assert market_badge("LSU Tigers 1H -6.5") == "1H SPREAD"
+        assert market_badge("Indiana Hoosiers 1st Half -24.5") == "1H SPREAD"
+        assert market_badge("Baltimore Orioles ML") == "MONEYLINE"
+        assert market_badge("Coby Mayo HR") == "PROP"
+
+    def test_odds_label_drops_the_repeated_team_name(self):
+        from picks_dashboard import _odds_label
+        assert _odds_label({"side": "Tennessee -50",
+                            "odds": "Tennessee Volunteers -48.5 (-110)"}) == "-48.5 (-110)"
+        assert _odds_label({"side": "Baltimore Orioles ML",
+                            "odds": "Baltimore Orioles +108"}) == "+108"
+
+    def test_odds_label_keeps_over_under_which_is_the_bet_itself(self):
+        from picks_dashboard import _odds_label
+        assert _odds_label({"side": "Over 50.5", "odds": "Over 50.5 (-110)"}) == "Over 50.5 (-110)"
+
+    def test_a_missing_price_says_so(self):
+        from picks_dashboard import _odds_label
+        assert _odds_label({"side": "LSU Tigers 1H -6.5", "odds": ""}) == "No line"
+
+    def test_it_builds_a_real_pdf(self, tmp_path):
+        from picks_dashboard import build_dashboard
+        out = tmp_path / "d.pdf"
+        picks = [{"matchup": "A @ B", "side": "B -7", "handicappers": ["one"],
+                  "consensus_count": 1, "sport": "NCAAF", "odds": "-110"} for _ in range(12)]
+        build_dashboard(str(out), picks, signal_note="note", confidence_label="LOW")
+        assert out.exists() and out.read_bytes().startswith(b"%PDF")
+        assert out.stat().st_size > 1000
+
+    def test_an_empty_board_still_renders(self, tmp_path):
+        from picks_dashboard import build_dashboard
+        out = tmp_path / "empty.pdf"
+        build_dashboard(str(out), [])
+        assert out.exists() and out.read_bytes().startswith(b"%PDF")

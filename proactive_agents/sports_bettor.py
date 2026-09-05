@@ -52,7 +52,7 @@ from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
 from ivy_core.text_delivery import build_detail, deliver_report
-from picks_formatter import PicksReportFormatter
+from picks_dashboard import build_dashboard
 from ivy_core.pipeline_status import (
     PipelineStatus,
     PipelineResult,
@@ -1248,48 +1248,39 @@ def _count(n, noun, plural=None):
     return f"{n} {noun if n == 1 else (plural or noun + 's')}"
 
 
-def _pdf_summary(merged, consensus_picks) -> str:
-    """The line under the title.
+def _signal_note(picks, consensus, handles) -> str:
+    """The banner sentence under the stat tiles.
 
-    Two things were wrong with it. "sourced from X handicappers" reads as a
-    missing number — X is the platform, but next to "12 pick(s)" it scans as a
-    placeholder nobody filled in. And "0 consensus play(s) with 2+ sharps
-    agreeing" states a count of zero where the useful thing to say is why.
+    The old summary line read "12 pick(s) sourced from X handicappers — 0
+    consensus play(s) with 2+ sharps agreeing": X is the platform but scanned
+    as a missing number, and a printed zero says nothing about why. The counts
+    now live in the tiles, so this says only what a count cannot.
     """
-    handles = {h for e in merged for h in (e.get("handicappers") or [])}
-    lead = f"{_count(len(merged), 'pick')} from {_count(len(handles), 'handicapper')} on X"
-
-    if consensus_picks:
-        return f"{lead} — {_count(len(consensus_picks), 'consensus play')}, where 2+ sharps agree."
+    if consensus:
+        return (
+            f"{_count(len(consensus), 'consensus play')} on the board — "
+            "2+ independent sharps on the same bet."
+        )
     if len(handles) == 1:
         return (
-            f"{lead} — no consensus plays. Consensus needs 2+ sharps on the same "
-            "bet, which a single source cannot produce."
+            "No consensus plays detected. Consensus requires 2+ independent "
+            "sharps on the same bet; this report contains a single source."
         )
-    return f"{lead} — no consensus plays; no two sharps landed on the same bet."
-
-
-def _pdf_context(pick) -> str:
-    """The Context cell: everything the text report says about a pick.
-
-    This column was blank in every PDF the job ever produced. _to_row read
-    ``enrichment["summary"]``, a key nothing writes — the enrichment schema is
-    take / line_movement / injury / sharp_public / confidence — so the widest
-    column in the table always rendered as an empty string.
-    """
-    enr = pick.get("enrichment") or {}
-    grade, count = _confidence(pick)
-    handles = pick.get("handicappers") or []
-    credit = (
-        ", ".join(f"@{_xml_escape(str(h))}" for h in handles)
-        if handles else f"{count} sharp{'' if count == 1 else 's'}"
+    return (
+        "No consensus plays detected. Consensus requires 2+ independent sharps "
+        "on the same bet; no two landed on the same one."
     )
 
-    head = [f"<b>{grade}</b> \u00b7 {credit}"]
-    when = _pick_when(pick)
-    if when:
-        head.insert(0, _xml_escape(when))
-    lines = [" \u00b7 ".join(head)]
+
+def _pick_analysis(pick) -> str:
+    """The context line on a card: the take and the line/injury/market notes.
+
+    Grade and attribution are on the card's meta line already, so they are
+    deliberately not repeated here. Returns "" when the sweep brought back
+    nothing substantive, and the card simply omits the line.
+    """
+    enr = pick.get("enrichment") or {}
+    lines = []
 
     take = enr.get("take")
     if not _is_placeholder(take):
@@ -1309,66 +1300,36 @@ def _pdf_context(pick) -> str:
 
 
 def format_picks_pdf(merged) -> str:
-    """Generate a professional PDF report of sharp picks.
+    """Render the picks board as the dashboard PDF, and return its path.
 
-    Args:
-        merged: List of merged pick dicts from the sweep pipeline.
-
-    Returns:
-        str: Path to the generated PDF file.
+    Layout is in picks_dashboard: masthead, stat tiles, a signal-status banner
+    that explains the consensus result, and a two-column card board. Every card
+    is attributed to the handicapper who posted it — the old report printed
+    "X Sharp Picks" on every line, which named the platform, not the source.
     """
-    consensus_picks = [p for p in merged if p.get("is_consensus")]
-    other_picks = [p for p in merged if not p.get("is_consensus")]
+    picks = list(merged)
+    consensus = [p for p in picks if int(p.get("consensus_count") or 0) >= 2]
+    handles = {h for p in picks for h in (p.get("handicappers") or [])}
 
-    formatter = PicksReportFormatter(
-        title="Ivy's Sharp Picks",
-        subtitle=f"Sharp Picks Report | {datetime.now():%A, %B %d, %Y}",
-        color_scheme="picks",
-    )
+    # Give each card the same human start time the text report uses.
+    for p in picks:
+        p["start_label"] = _pick_when(p)
+        p["analysis"] = _pick_analysis(p)
 
-    def _esc(value):
-        """Table cells are reportlab Paragraphs, so raw &, < and > break the
-        build. Grok's prose routinely contains all three."""
-        return _xml_escape(str(value or ""))
-
-    def _to_row(pick):
-        return {
-            "sport": _esc(pick.get("sport")),
-            "matchup": _esc(pick.get("matchup")),
-            "side": _esc(pick.get("side")),
-            "odds": _esc(pick.get("odds")),
-            "reasoning": _pdf_context(pick),
-        }
-
-    summary = _pdf_summary(merged, consensus_picks)
-    metadata = {
-        "pick_count": f"{_count(len(merged), 'pick')}, {len(consensus_picks)} consensus",
-        "source": "X Sharp Picks",
-        "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
-    }
+    note = _signal_note(picks, consensus, handles)
+    grade = "HIGH" if consensus else ("MEDIUM" if len(handles) > 1 else "LOW")
 
     pdf_path = os.path.join(
         tempfile.gettempdir(),
         f"sharp_picks_{datetime.now():%Y%m%d_%H%M%S}.pdf",
     )
-    formatter.generate_pdf(
-        filename=pdf_path,
-        summary=summary,
-        consensus_picks=[_to_row(p) for p in consensus_picks],
-        other_picks=[_to_row(p) for p in other_picks],
-        metadata=metadata,
-        headers=["Sport", "Matchup", "Side", "Odds", "Context"],
-        col_widths=[0.6, 1.8, 1.0, 0.7, 3.4],
-        # No emoji here — the PDF font renders them as filled squares. The
-        # iMessage text keeps the flames; this is the same report, not the
-        # same medium.
-        consensus_heading="HIGH LIKELIHOOD (Consensus Plays)",
-        other_heading="Additional Picks",
+    return build_dashboard(
+        pdf_path, picks,
+        signal_note=note,
+        confidence_label=f"{grade} \u00b7 Source confidence label",
     )
-    return pdf_path
 
 
-# ===================== DUPLICATE-REPORT SUPPRESSION =====================
 def _report_signature(merged):
     """Stable content fingerprint of the picks, independent of run date/enrichment.
 
