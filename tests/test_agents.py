@@ -512,3 +512,28 @@ class TestPDFContextColumn:
         sports_bettor.format_picks_pdf([self.PICK])
         assert "\U0001F525" not in captured["consensus_heading"]
         assert "HIGH LIKELIHOOD" in captured["consensus_heading"]
+
+
+def test_team_totals_do_not_borrow_the_game_total():
+    """Real board 2026-09-05 09:49: "Auburn Tigers TT Over 34.5" was printed
+    with "(Over 58.5 (-115) / Under 58.5 (-105))" — the game total. A team
+    total and a game total are different numbers for different bets."""
+    games = [{
+        "away": "Baylor Bears", "home": "Auburn Tigers", "sport": "NCAAF",
+        "total": "Over 58.5 (-115) / Under 58.5 (-105)",
+        "spread": "Auburn -7.5 (-105)", "moneyline": "AUB -280",
+        "commence": "2026-09-05T19:30:00Z",
+    }]
+    picks = [
+        {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers TT Over 34.5"},
+        {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Over 58.5"},
+    ]
+    sports_bettor.attach_odds(picks, games)
+    assert not picks[0].get("odds"), "a team total must not inherit the game total"
+    assert picks[1]["odds"] == "Over 58.5 (-115) / Under 58.5 (-105)", "real game totals still fill"
+
+
+def test_prop_guard_leaves_ordinary_spreads_alone():
+    assert not sports_bettor._is_player_prop("Auburn Tigers -7")
+    assert not sports_bettor._is_player_prop("Oregon Ducks -24")
+    assert sports_bettor._is_player_prop("Auburn Tigers TT Over 34.5")

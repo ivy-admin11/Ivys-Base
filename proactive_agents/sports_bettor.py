@@ -515,6 +515,9 @@ _PROP_STAT_HINTS = (
     "yard", "reception", "completion", "touchdown", "carries", "attempt", "sack",
     "hit", "run scored", "total base", "home run", "walk",
     "shot", "save", "goal", "ace", "birdie",
+    # Team totals read like a game total ("TT Over 34.5") and route straight to
+    # the game's over/under, which is a different number for a different bet.
+    "team total", " tt ",
 )
 
 # The same thing written the way handicappers actually post it. These are
@@ -523,7 +526,7 @@ _PROP_STAT_HINTS = (
 # the Orioles/Red Sox moneyline stapled to it — "HR" was in none of the long
 # forms above, so the prop guard let it through.
 _PROP_STAT_ABBREVS = re.compile(
-    r"\b(hrs?|ks?|sos?|rbis?|tbs?|pra|pts|rebs?|asts?|blks?|stls?|tds?)\b",
+    r"\b(hrs?|ks?|sos?|rbis?|tbs?|tt|pra|pts|rebs?|asts?|blks?|stls?|tds?)\b",
     re.IGNORECASE,
 )
 
