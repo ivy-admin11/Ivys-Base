@@ -438,3 +438,77 @@ class TestCurrentHandleAudit:
     def test_current_flag_targets_the_live_sweep_list(self):
         vet = self._mod()
         assert "ItsCappersPicks" in vet.TARGET_X_ACCOUNTS
+
+
+class TestPDFContextColumn:
+    """The Context column was blank in every PDF the job ever produced:
+    _to_row read enrichment["summary"], which nothing writes. The real schema
+    is take / line_movement / injury / sharp_public / confidence."""
+
+    PICK = {
+        "sport": "NCAAF", "matchup": "Ohio State Buckeyes @ Texas Longhorns",
+        "side": "Texas +7", "odds": "+7 (-110)",
+        "is_consensus": True, "consensus_count": 3,
+        "handicappers": ["ItsCappersPicks", "billhpicks"],
+        "start": "2026-09-05T23:30:00Z",
+        "enrichment": {
+            "confidence": "high",
+            "take": "Line opened +9.5 and got bet to +7.",
+            "line_movement": "+9.5 -> +7",
+            "injury": "OSU LT questionable",
+            "sharp_public": "71% of money on TEX",
+        },
+    }
+
+    def test_context_carries_the_analysis_not_an_empty_string(self):
+        ctx = sports_bettor._pdf_context(self.PICK)
+        assert ctx.strip()
+        for fragment in ("HIGH", "@ItsCappersPicks", "Line opened +9.5",
+                         "Line: +9.5", "Inj: OSU LT questionable", "71% of money"):
+            assert fragment in ctx, fragment
+
+    def test_context_never_reads_the_nonexistent_summary_key(self):
+        """A pick whose enrichment has only 'summary' must still not be blank —
+        the grade and backers always render."""
+        pick = dict(self.PICK, enrichment={"summary": "ignored legacy field"})
+        ctx = sports_bettor._pdf_context(pick)
+        assert "ignored legacy field" not in ctx
+        assert "HIGH" in ctx and "@billhpicks" in ctx
+
+    def test_markup_characters_are_escaped(self):
+        """Cells are reportlab Paragraphs; a raw & or < breaks the build."""
+        pick = dict(self.PICK, enrichment={
+            "confidence": "high", "take": "Top-10 SP+ & <best> in the country"})
+        ctx = sports_bettor._pdf_context(pick)
+        assert "&amp;" in ctx and "&lt;best&gt;" in ctx
+        assert " & " not in ctx.replace("&amp;", "")
+
+    def test_row_escapes_matchup_and_side_too(self, tmp_path, monkeypatch):
+        captured = {}
+
+        class FakeFormatter:
+            def __init__(self, **kw): pass
+            def generate_pdf(self, filename, **kw):
+                captured.update(kw)
+                open(filename, "wb").write(b"%PDF-1.4 fake")
+
+        monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
+        sports_bettor.format_picks_pdf([dict(self.PICK, matchup="A & B @ C <D>")])
+        row = captured["consensus_picks"][0]
+        assert row["matchup"] == "A &amp; B @ C &lt;D&gt;"
+        assert row["reasoning"].strip()
+
+    def test_pdf_heading_has_no_emoji(self, tmp_path, monkeypatch):
+        """The PDF font renders emoji as filled squares."""
+        captured = {}
+
+        class FakeFormatter:
+            def __init__(self, **kw): pass
+            def generate_pdf(self, filename, **kw):
+                captured.update(kw)
+                open(filename, "wb").write(b"%PDF-1.4 fake")
+
+        monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
+        sports_bettor.format_picks_pdf([self.PICK])
+        assert "\U0001F525" not in captured["consensus_heading"]
+        assert "HIGH LIKELIHOOD" in captured["consensus_heading"]

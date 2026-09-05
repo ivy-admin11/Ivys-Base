@@ -39,6 +39,7 @@ import hashlib
 import json
 import re
 import tempfile
+from xml.sax.saxutils import escape as _xml_escape
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -1071,6 +1072,45 @@ def format_picks_digest(merged, top_n=DIGEST_TOP_N):
     return "\n\n".join(blocks), detail
 
 
+def _pdf_context(pick) -> str:
+    """The Context cell: everything the text report says about a pick.
+
+    This column was blank in every PDF the job ever produced. _to_row read
+    ``enrichment["summary"]``, a key nothing writes — the enrichment schema is
+    take / line_movement / injury / sharp_public / confidence — so the widest
+    column in the table always rendered as an empty string.
+    """
+    enr = pick.get("enrichment") or {}
+    grade, count = _confidence(pick)
+    handles = pick.get("handicappers") or []
+    credit = (
+        ", ".join(f"@{_xml_escape(str(h))}" for h in handles)
+        if handles else f"{count} sharp{'' if count == 1 else 's'}"
+    )
+
+    head = [f"<b>{grade}</b> \u00b7 {credit}"]
+    when = _pick_when(pick)
+    if when:
+        head.insert(0, _xml_escape(when))
+    lines = [" \u00b7 ".join(head)]
+
+    take = enr.get("take")
+    if not _is_placeholder(take):
+        lines.append(_xml_escape(str(take)))
+
+    extras = []
+    if enr.get("line_movement"):
+        extras.append(f"Line: {_xml_escape(str(enr['line_movement']))}")
+    if enr.get("injury"):
+        extras.append(f"Inj: {_xml_escape(str(enr['injury']))}")
+    if enr.get("sharp_public"):
+        extras.append(_xml_escape(str(enr["sharp_public"])))
+    if extras:
+        lines.append(" \u00b7 ".join(extras))
+
+    return "<br/>".join(lines)
+
+
 def format_picks_pdf(merged) -> str:
     """Generate a professional PDF report of sharp picks.
 
@@ -1089,13 +1129,18 @@ def format_picks_pdf(merged) -> str:
         color_scheme="picks",
     )
 
+    def _esc(value):
+        """Table cells are reportlab Paragraphs, so raw &, < and > break the
+        build. Grok's prose routinely contains all three."""
+        return _xml_escape(str(value or ""))
+
     def _to_row(pick):
         return {
-            "sport": pick.get("sport", ""),
-            "matchup": pick.get("matchup", ""),
-            "side": pick.get("side", ""),
-            "odds": pick.get("odds", ""),
-            "reasoning": (pick.get("enrichment") or {}).get("summary", ""),
+            "sport": _esc(pick.get("sport")),
+            "matchup": _esc(pick.get("matchup")),
+            "side": _esc(pick.get("side")),
+            "odds": _esc(pick.get("odds")),
+            "reasoning": _pdf_context(pick),
         }
 
     summary = (
@@ -1120,7 +1165,10 @@ def format_picks_pdf(merged) -> str:
         metadata=metadata,
         headers=["Sport", "Matchup", "Side", "Odds", "Context"],
         col_widths=[0.6, 1.8, 1.0, 0.7, 3.4],
-        consensus_heading="🔥 HIGH LIKELIHOOD 🔥 (Consensus Plays)",
+        # No emoji here — the PDF font renders them as filled squares. The
+        # iMessage text keeps the flames; this is the same report, not the
+        # same medium.
+        consensus_heading="HIGH LIKELIHOOD (Consensus Plays)",
         other_heading="Additional Picks",
     )
     return pdf_path
