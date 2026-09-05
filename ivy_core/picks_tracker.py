@@ -68,6 +68,7 @@ def save_picks(picks: List[Dict], report_date: str):
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
+    skipped = 0
     
     for pick in picks:
         # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
@@ -82,30 +83,46 @@ def save_picks(picks: List[Dict], report_date: str):
             sharp_count = 1 if handicappers else 0
             handicapper = handicappers
         
-        cursor.execute("""
-            INSERT INTO picks (
-                sport, matchup, side, odds, handicapper, confidence,
-                game_day, start_time, reasoning, report_date, sharp_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            pick.get("sport"),
-            pick.get("matchup"),
-            pick.get("side"),
-            pick.get("odds"),
-            handicapper,
-            pick.get("confidence"),
-            pick.get("game_day"),
-            start_time,
-            pick.get("reasoning"),
-            report_date,
-            sharp_count,
-        ))
+        # sport/matchup/side are NOT NULL. Picks are parsed out of free-form
+        # posts, so one of them arriving incomplete is routine -- and letting
+        # that IntegrityError escape used to discard the whole batch before
+        # the commit, losing every good pick alongside the bad one.
+        try:
+            cursor.execute("""
+                INSERT INTO picks (
+                    sport, matchup, side, odds, handicapper, confidence,
+                    game_day, start_time, reasoning, report_date, sharp_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pick.get("sport"),
+                pick.get("matchup"),
+                pick.get("side"),
+                pick.get("odds"),
+                handicapper,
+                pick.get("confidence"),
+                pick.get("game_day"),
+                start_time,
+                pick.get("reasoning"),
+                report_date,
+                sharp_count,
+            ))
+        except sqlite3.IntegrityError as exc:
+            skipped += 1
+            logger.warning(
+                "Skipping unsaveable pick (%s): %s | %s",
+                exc, pick.get("matchup") or "no matchup", pick.get("side") or "no side",
+            )
+            continue
         pick_id = cursor.lastrowid
         cursor.execute("INSERT INTO results (pick_id) VALUES (?)", (pick_id,))
     
     conn.commit()
     conn.close()
-    logger.info(f"Saved {len(picks)} picks to database")
+    saved = len(picks) - skipped
+    if skipped:
+        logger.warning("Saved %d of %d picks; %d could not be stored", saved, len(picks), skipped)
+    else:
+        logger.info("Saved %d picks to database", saved)
     
     # Also log to Google Sheets for shared visibility
     try:
@@ -151,6 +168,18 @@ def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = N
             logger.warning(f"Could not update result in Google Sheets: {e}")
 
 
+def _split_handicappers(stored: Optional[str]) -> List[str]:
+    """Unpack the comma-joined handicapper column into individual handles.
+
+    save_picks writes ", ".join(handicappers) for a consensus pick. Handles
+    never contain commas, so splitting on them is safe and reversible.
+    """
+    if not stored:
+        return ["unattributed"]
+    names = [part.strip() for part in stored.split(",")]
+    return [n for n in names if n] or ["unattributed"]
+
+
 def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
     """Get win/loss/push stats grouped by handicapper (last N days)."""
     _init_db()
@@ -172,24 +201,32 @@ def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
         ORDER BY wins DESC
     """, (days_back,))
     
-    stats = {}
+    # save_picks stores a consensus pick's backers as one comma-joined string,
+    # so grouping on that column alone invents a composite handicapper
+    # ("@a, @b") and credits neither real handle. Every pick a handicapper was
+    # part of counts toward that handicapper's record, which is the whole
+    # point of tracking them -- and consensus picks are the ones worth judging
+    # a roster on. Split the group key back apart and accumulate per handle.
+    stats: Dict[str, Dict] = {}
     for row in cursor.fetchall():
         handicapper, total, wins, losses, pushes, pending = row
-        wins = wins or 0
-        losses = losses or 0
-        pushes = pushes or 0
-        pending = pending or 0
-        
-        hit_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
-        
-        stats[handicapper] = {
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "pushes": pushes,
-            "pending": pending,
-            "hit_rate": hit_rate,
-        }
+        for name in _split_handicappers(handicapper):
+            bucket = stats.setdefault(
+                name,
+                {"total": 0, "wins": 0, "losses": 0, "pushes": 0, "pending": 0, "hit_rate": 0},
+            )
+            bucket["total"] += total or 0
+            bucket["wins"] += wins or 0
+            bucket["losses"] += losses or 0
+            bucket["pushes"] += pushes or 0
+            bucket["pending"] += pending or 0
+    
+    for bucket in stats.values():
+        decided = bucket["wins"] + bucket["losses"]
+        bucket["hit_rate"] = (bucket["wins"] / decided) * 100 if decided else 0
+    
+    # Restore the ORDER BY the SQL intended, now that rows have been merged.
+    stats = dict(sorted(stats.items(), key=lambda kv: kv[1]["wins"], reverse=True))
     
     conn.close()
     return stats
