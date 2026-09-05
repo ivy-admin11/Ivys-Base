@@ -137,7 +137,10 @@ def _match_teams_in_matchup(matchup: str, home: str, away: str) -> bool:
     Returns:
         True if both teams are found in matchup
     """
-    norm_matchup = matchup.lower()
+    # _normalize_team strips spaces, so the matchup must be stripped the same
+    # way or no multi-word team ever matches: "kansascitychiefs" is not a
+    # substring of "kansas city chiefs @ denver broncos".
+    norm_matchup = _normalize_team(matchup)
     home_norm = _normalize_team(home)
     away_norm = _normalize_team(away)
     
@@ -145,6 +148,30 @@ def _match_teams_in_matchup(matchup: str, home: str, away: str) -> bool:
     has_away = away_norm in norm_matchup if away_norm else False
     
     return has_home and has_away
+
+
+def _score_for(scores: list, team: str, fallback_index: int) -> Optional[Decimal]:
+    """Pull a team's score out of the API's scores list by name.
+
+    The Odds API returns scores as [{"name": ..., "score": ...}, ...] and does
+    not promise home-first ordering. Reading scores[0] as home and scores[1] as
+    away inverts every moneyline grade the moment the order flips, turning
+    every win into a loss in the tracker with nothing to show it happened.
+    Name matching is authoritative; position is a last resort so that a feed
+    with missing names still grades rather than silently returning None.
+    """
+    want = _normalize_team(team)
+    if want:
+        for entry in scores:
+            if not isinstance(entry, dict):
+                continue
+            if _normalize_team(entry.get("name", "")) == want:
+                return parse_score(entry.get("score"))
+    try:
+        entry = scores[fallback_index]
+    except (IndexError, TypeError):
+        return None
+    return parse_score(entry.get("score")) if isinstance(entry, dict) else None
 
 
 def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
@@ -156,8 +183,8 @@ def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
     if not scores or len(scores) < 2:
         return None
     
-    home_score = parse_score(scores[0].get("score"))
-    away_score = parse_score(scores[1].get("score"))
+    home_score = _score_for(scores, home_team, 0)
+    away_score = _score_for(scores, away_team, 1)
     
     if home_score is None or away_score is None:
         return None

@@ -477,10 +477,53 @@ def print_startup_banner() -> None:
 # LIFESPAN: Startup & Shutdown
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# Restart forensics
+#
+# com.ivy.gateway runs with KeepAlive=true, so launchd relaunches the process
+# on every exit — a crash, an OOM kill and a deliberate `kill` all produce the
+# same shape in the logs. An audit counted 27 restarts here and could not say
+# whether any of them was a crash loop.
+#
+# The marker makes the distinction durable: written on clean shutdown, removed
+# as soon as the next startup reads it. Present at startup means the previous
+# run ended through lifespan; absent means it did not.
+# ---------------------------------------------------------------------------
+CLEAN_SHUTDOWN_MARKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs", "gateway_clean_shutdown.marker"
+)
+
+
+def _record_clean_shutdown() -> None:
+    try:
+        os.makedirs(os.path.dirname(CLEAN_SHUTDOWN_MARKER), exist_ok=True)
+        with open(CLEAN_SHUTDOWN_MARKER, "w") as fh:
+            fh.write(datetime.now().isoformat())
+    except Exception as exc:
+        logger.warning("Could not write clean-shutdown marker: %s", exc)
+
+
+def _consume_shutdown_marker() -> str:
+    """Report how the previous run ended, then clear the marker."""
+    try:
+        if os.path.exists(CLEAN_SHUTDOWN_MARKER):
+            with open(CLEAN_SHUTDOWN_MARKER) as fh:
+                when = fh.read().strip() or "unknown time"
+            os.remove(CLEAN_SHUTDOWN_MARKER)
+            return f"previous run exited cleanly at {when}"
+        return (
+            "previous run did NOT exit through lifespan — crash, OOM or kill -9 "
+            "(launchd KeepAlive relaunched it)"
+        )
+    except Exception as exc:
+        return f"previous-run state unreadable: {exc}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Print banner, start iMessage poller, initialize voice assistant."""
     print_startup_banner()
+    logger.info("Gateway start — %s", _consume_shutdown_marker())
 
     # Initialize voice session manager if available
     if VOICE_ASSISTANT_AVAILABLE:
@@ -499,6 +542,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        _record_clean_shutdown()
         logger.info("Gateway shutdown complete.")
 
 

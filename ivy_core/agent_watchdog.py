@@ -45,10 +45,16 @@ STATE_PATH = PROJECT_ROOT / "data" / "watchdog_state.json"
 # the meal planner's template reads as a daily 08:00 start but has produced a
 # strictly weekly log for seven weeks, and the watchdog has to match reality
 # or it cries wolf every Monday.
+# Derived from deploy/launchd/*.plist.template, NOT from how often a job
+# happens to appear in the logs. Reading cadence off the logs is what made an
+# earlier audit call Happy Hour "stopped since Sep 1": it runs Weekday 0, so a
+# Monday-to-Saturday silence is the schedule working, not a failure. Each value
+# is the longest legitimate gap plus roughly one interval of slack.
+# test_watchdog_thresholds_match_plists holds these honest.
 EXPECTED_SILENCE_H: Dict[str, int] = {
-    "sharp_picks": 20,
-    "happy_hour": 50,
-    "familia_meal_planner": 240,
+    "sharp_picks": 20,           # daily at 09/15/21 -> 12h worst gap
+    "happy_hour": 192,           # Sundays 12:00 -> 168h between runs
+    "familia_meal_planner": 192, # Sundays 08:00 -> 168h between runs
 }
 
 FRIENDLY_NAMES = {

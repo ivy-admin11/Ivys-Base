@@ -4,6 +4,7 @@ Integrates with Google Sheets API to append pick records and update results
 in a shared spreadsheet for easy viewing and analysis.
 """
 
+import os
 import logging
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,17 @@ logger = logging.getLogger("ivy.sheets_logger")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Sheet IDs (from URL: /spreadsheets/d/{SPREADSHEET_ID}/edit)
-SPREADSHEET_ID = "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+#
+# .env.example has documented SPORTS_DASHBOARD_SPREADSHEET_ID and
+# GOOGLE_SHEET_ID since the pipeline was written, but both modules that
+# talk to Sheets hardcoded the ID instead, so setting either variable did
+# nothing. Env now wins; the literal stays as the default so an unset
+# environment behaves exactly as before.
+SPREADSHEET_ID = (
+    os.getenv("SPORTS_DASHBOARD_SPREADSHEET_ID")
+    or os.getenv("GOOGLE_SHEET_ID")
+    or "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+)
 SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 
 

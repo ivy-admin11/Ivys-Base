@@ -6,7 +6,10 @@
          proactive_agents/weekly_planner.py — a file that has never existed
          in any committed branch, so this schedule never actually ran
          anything. Points at the real, working Familia_meal_planner.py.
-         --scheduled preserves the 48-hour gate; --send actually delivers. -->
+         The scheduled flag preserves the 48-hour gate; the send flag
+         actually delivers. (Both are spelled out rather than written as
+         flags: a double hyphen is not legal inside an XML comment, and
+         plistlib/launchctl reject the whole file over it.) -->
     <key>Label</key>
     <string>com.ivy.familia_meal_planner</string>
     <key>ProgramArguments</key>

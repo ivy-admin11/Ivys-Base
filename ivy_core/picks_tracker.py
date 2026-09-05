@@ -318,7 +318,9 @@ def auto_sync_to_export_sheet():
             logger.debug("Skipping auto-sync to export sheet: no Google Sheets access")
             return
         
-        SPREADSHEET_ID = "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+        # Single source of truth; see sheets_logger for why this is not a
+        # literal any more.
+        from ivy_core.sheets_logger import SPREADSHEET_ID
         TARGET_SHEET_GID = 1305096861
         
         # Find the target sheet

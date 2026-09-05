@@ -8,6 +8,8 @@ familia_meal_planner, and other agents.
 Effort: ~200 lines of reportlab code. Dependencies already in requirements.txt.
 """
 
+import os
+import tempfile
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -314,8 +316,11 @@ if __name__ == "__main__":
         "timestamp": "2026-07-01 09:01",
     }
 
+    # tempfile, not a fixed /tmp name: a predictable path in a world-writable
+    # directory is the B108 finding, and this demo block is importable.
+    _demo_dir = tempfile.mkdtemp(prefix="ivy_picks_demo_")
     pdf_path = formatter.generate_pdf(
-        "/tmp/example_picks.pdf",
+        os.path.join(_demo_dir, "example_picks.pdf"),
         summary=(
             "Two sharps are locking in the Tampa Bay Rays ML (-132) against the Royals "
             "as our top consensus play for this 48-hour card. The full slate is packed with "

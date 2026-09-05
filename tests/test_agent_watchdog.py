@@ -9,6 +9,11 @@ message.
 
 from datetime import datetime, timedelta, timezone
 
+# Happy Hour runs Weekday 0 (Sundays), so six days of silence is the
+# schedule working normally -- that misreading is what produced a false
+# 'Happy Hour has stopped running' finding. Nine days is the first span
+# that means a run was genuinely missed.
+
 import pytest
 
 from ivy_core import agent_watchdog as wd
@@ -32,10 +37,10 @@ def _seen(monkeypatch, mapping):
 
 class TestStaleness:
     def test_a_job_silent_past_its_cadence_is_flagged(self, monkeypatch, clock):
-        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=6)})
+        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=9)})
         stale = wd.stale_agents(clock)
         assert [s["job"] for s in stale] == ["happy_hour"]
-        assert stale[0]["silent_hours"] == pytest.approx(144.0)
+        assert stale[0]["silent_hours"] == pytest.approx(216.0)
 
     def test_a_job_that_ran_recently_is_not_flagged(self, monkeypatch, clock):
         _seen(monkeypatch, {"sharp_picks": clock - timedelta(hours=6)})
@@ -61,7 +66,7 @@ class TestStaleness:
 
     def test_the_worst_offender_is_listed_first(self, monkeypatch, clock):
         _seen(monkeypatch, {
-            "happy_hour": clock - timedelta(days=6),
+            "happy_hour": clock - timedelta(days=9),
             "familia_meal_planner": clock - timedelta(days=20),
         })
         assert [s["job"] for s in wd.stale_agents(clock)][0] == "familia_meal_planner"
@@ -69,16 +74,16 @@ class TestStaleness:
 
 class TestAlerting:
     def test_the_alert_names_the_job_and_the_fix(self, monkeypatch, isolated, clock):
-        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=6)})
+        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=9)})
         sent = []
         wd.check_once(lambda body: sent.append(body) or True, clock)
         assert len(sent) == 1
         assert "Happy Hour Scout" in sent[0]
-        assert "6 days" in sent[0]
+        assert "9 days" in sent[0]
         assert "launchctl list | grep com.ivy" in sent[0]
 
     def test_it_does_not_nag_on_every_poll(self, monkeypatch, isolated, clock):
-        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=6)})
+        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=9)})
         sent = []
 
         def send(body):
@@ -91,7 +96,7 @@ class TestAlerting:
         assert len(sent) == 1, "a job that stays down must not alert hourly"
 
     def test_it_alerts_again_the_next_day(self, monkeypatch, isolated, clock):
-        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=6)})
+        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=9)})
         sent = []
 
         def send(body):
@@ -105,7 +110,7 @@ class TestAlerting:
     def test_a_failed_send_is_not_recorded_as_alerted(self, monkeypatch, isolated, clock):
         """Otherwise an undeliverable alert silences itself for a day — the
         exact failure mode this whole watchdog exists to prevent."""
-        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=6)})
+        _seen(monkeypatch, {"happy_hour": clock - timedelta(days=9)})
         assert wd.check_once(lambda body: False, clock) == []
         sent = []
         assert len(wd.check_once(lambda b: sent.append(b) or True, clock)) == 1
