@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Importing config is what loads .env -- it owns the load_dotenv call. Nothing
+# under ivy_core does it, so a script that skips this import runs with an
+# empty environment and reports "ODDS_API_KEY not set" while the key is
+# sitting in .env. That is exactly what happened on the first real run.
+import config  # noqa: E402,F401  (imported for its load_dotenv side effect)
 from ivy_core.pick_stats import UNVERIFIABLE  # noqa: E402
 from ivy_core.picks_tracker import PICKS_DB  # noqa: E402
 
@@ -133,6 +139,11 @@ def main() -> int:
         except Exception as exc:
             print(f"   could not re-grade: {exc}")
             print("   (needs network and ODDS_API_KEY; the rest of the repair still runs)")
+        else:
+            if args.apply and not os.getenv("ODDS_API_KEY"):
+                print("   NOTE: ODDS_API_KEY is not set even after loading .env —")
+                print("         nothing can be graded until it is. If the key was")
+                print("         rotated, put the new one in .env and re-run.")
 
     # ---- 2. write off what can never be graded ----------------------------
     conn = sqlite3.connect(PICKS_DB)

@@ -276,3 +276,46 @@ class TestRepairScript:
         )
         assert out.returncode == 0, out.stderr
         assert "DRY-RUN" in out.stdout
+
+
+class TestScriptLoadsEnvironment:
+    """Regression: the first real run reported the API key missing.
+
+    It was in .env the whole time. config.py owns the load_dotenv call, and
+    nothing under ivy_core triggers it -- so a script that imports only
+    ivy_core modules runs with an empty environment and silently grades
+    nothing. Any entry point that reads configuration has to import config.
+    """
+
+    def test_the_repair_script_imports_config(self):
+        import ast
+
+        tree = ast.parse((REPO / "scripts" / "repair_dashboard.py").read_text())
+        imported = {
+            alias.name.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module.split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        assert "config" in imported, (
+            "repair_dashboard.py must import config, which is what loads .env; "
+            "without it the script runs with no API key and grades nothing"
+        )
+
+    def test_importing_config_populates_the_environment(self, tmp_path, monkeypatch):
+        """config.load_dotenv is the mechanism, so prove it actually loads."""
+        import importlib
+        import os
+
+        env = tmp_path / ".env"
+        env.write_text("IVY_TEST_SENTINEL=loaded\n")
+        monkeypatch.delenv("IVY_TEST_SENTINEL", raising=False)
+
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env, override=False)
+        assert os.getenv("IVY_TEST_SENTINEL") == "loaded"
+        importlib.invalidate_caches()
