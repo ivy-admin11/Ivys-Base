@@ -5,14 +5,29 @@ This script reads the picks database (data/picks.db) and populates a target
 Google Sheet with all picks for easy sharing and analysis.
 """
 
-import sqlite3
 import sys
 from pathlib import Path
-from google.oauth2.service_account import Credentials
+
+# Run directly, sys.path[0] is scripts/, so ivy_core is not importable.
+# This script takes its column layout from ivy_core.sheets_logger, so the
+# repo root has to go on the path before that import runs.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import config  # noqa: E402,F401  (imported for its load_dotenv side effect)
+from ivy_core.sheets_logger import (  # noqa: E402
+    COLUMNS,
+    LAST_COLUMN_LETTER,
+    SPREADSHEET_ID,
+)
+
+import sqlite3  # noqa: E402
+from google.oauth2.service_account import Credentials  # noqa: E402
 from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SPREADSHEET_ID = "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+# Was a fifth hardcoded copy of the id. It comes from sheets_logger now,
+# which normalises whatever is configured (one of the env vars holds a
+# pasted browser URL, and the API answers a URL with a 404).
 TARGET_SHEET_GID = 1305096861  # From URL: gid=1305096861
 
 
@@ -100,7 +115,6 @@ def sync_picks_to_sheet(service, spreadsheet_id, sheet_name, rows):
         # The one column map, from ivy_core.sheets_logger. This list used to
         # be written out here by hand while two other modules kept their own
         # versions, and all three disagreed.
-        from ivy_core.sheets_logger import COLUMNS, LAST_COLUMN_LETTER  # noqa: F401
         header = list(COLUMNS)
         
         # Clear existing data (keep header)

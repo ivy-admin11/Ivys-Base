@@ -319,3 +319,51 @@ class TestScriptLoadsEnvironment:
         load_dotenv(dotenv_path=env, override=False)
         assert os.getenv("IVY_TEST_SENTINEL") == "loaded"
         importlib.invalidate_caches()
+
+
+class TestScriptsAreRunnableStandalone:
+    """Regression: sync_picks_to_sheet.py died with "No module named 'ivy_core'".
+
+    Run as `python scripts/x.py`, sys.path[0] is scripts/, so repo modules are
+    not importable. The script had grown an ivy_core import without the
+    matching path setup, and only failed at the point of use -- partway
+    through a rebuild, after reporting progress.
+    """
+
+    @pytest.mark.parametrize(
+        "script", sorted(p.name for p in (REPO / "scripts").glob("*.py"))
+    )
+    def test_a_script_importing_repo_modules_puts_the_root_on_the_path(self, script):
+        import ast
+
+        source = (REPO / "scripts" / script).read_text()
+        tree = ast.parse(source)
+
+        repo_modules = {"ivy_core", "config", "proactive_agents", "picks_formatter"}
+        imports_repo = any(
+            (isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] in repo_modules)
+            or (isinstance(n, ast.Import) and any(a.name.split(".")[0] in repo_modules for a in n.names))
+            for n in ast.walk(tree)
+        )
+        if not imports_repo:
+            pytest.skip(f"{script} imports no repo modules")
+
+        assert "sys.path.insert" in source or "sys.path.append" in source, (
+            f"{script} imports repo modules but never puts the repo root on "
+            f"sys.path; it will fail with ModuleNotFoundError when run directly"
+        )
+
+    def test_the_sync_script_compiles_and_resolves_its_imports(self):
+        """Catch an ImportError at test time rather than mid-rebuild."""
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util, sys, pathlib;"
+             "p = pathlib.Path('scripts/sync_picks_to_sheet.py');"
+             "spec = importlib.util.spec_from_file_location('sync_check', p);"
+             "m = importlib.util.module_from_spec(spec);"
+             "spec.loader.exec_module(m);"
+             "print('COLUMNS', len(m.COLUMNS))"],
+            cwd=REPO, capture_output=True, text=True, timeout=120,
+        )
+        assert out.returncode == 0, f"module-level import failed:\n{out.stderr}"
+        assert "COLUMNS 12" in out.stdout
