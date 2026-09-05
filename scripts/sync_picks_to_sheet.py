@@ -95,7 +95,11 @@ def find_target_sheet(service, spreadsheet_id, target_gid):
 def sync_picks_to_sheet(service, spreadsheet_id, sheet_name, rows):
     """Write picks to the Google Sheet."""
     try:
-        header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Result", "FinalScore"]
+        # The one column map, from ivy_core.sheets_logger. This list used to
+        # be written out here by hand while two other modules kept their own
+        # versions, and all three disagreed.
+        from ivy_core.sheets_logger import COLUMNS
+        header = list(COLUMNS)
         
         # Clear existing data (keep header)
         service.spreadsheets().values().clear(

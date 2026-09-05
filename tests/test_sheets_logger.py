@@ -233,12 +233,13 @@ class TestSummary:
         ])
         s = sl.get_sheet_summary()
         assert (s["wins"], s["losses"], s["pushes"], s["pending"]) == (3, 1, 1, 1)
-        assert s["hit_rate"] == pytest.approx(75.0)
+        assert s["decided"] == 4
         assert s["total"] == 6
+        assert s["hit_rate"] is None, "four decided picks is below the reporting threshold"
 
-    def test_pushes_are_excluded_from_hit_rate(self, service):
+    def test_pushes_are_excluded_from_the_decided_count(self, service):
         service([HEADER, sheet_row(result="W"), sheet_row(result="P")])
-        assert sl.get_sheet_summary()["hit_rate"] == pytest.approx(100.0)
+        assert sl.get_sheet_summary()["decided"] == 1
 
     def test_grades_written_by_update_are_the_ones_counted(self, service):
         """The end-to-end column agreement, in one assertion.
@@ -275,3 +276,17 @@ class TestSummary:
     def test_no_auth_returns_none(self, monkeypatch):
         monkeypatch.setattr(sl, "_get_sheets_service", lambda: None)
         assert sl.get_sheet_summary() is None
+
+
+class TestUnverifiableInSheet:
+    def test_a_U_row_is_not_counted_as_pending(self, service):
+        """The sheet summary must agree with the database summary."""
+        service([HEADER, sheet_row(result="U"), sheet_row(result="")])
+        s = sl.get_sheet_summary()
+        assert s["unverifiable"] == 1
+        assert s["pending"] == 1
+
+    def test_a_U_row_is_not_a_loss(self, service):
+        service([HEADER, sheet_row(result="U")])
+        s = sl.get_sheet_summary()
+        assert s["losses"] == 0 and s["decided"] == 0

@@ -13,6 +13,8 @@ from google.oauth2.service_account import Credentials
 from google.auth import default
 from googleapiclient.discovery import build
 
+from ivy_core.pick_stats import UNVERIFIABLE, summarize
+
 logger = logging.getLogger("ivy.sheets_logger")
 
 # Google Sheets API configuration
@@ -211,31 +213,15 @@ def get_sheet_summary():
         
         # Count results in the Result column
         result_idx = COL["Result"]
-        wins = losses = pushes = pending = 0
+        tally = {"wins": 0, "losses": 0, "pushes": 0, "pending": 0, "unverifiable": 0}
+        key = {"W": "wins", "L": "losses", "P": "pushes", UNVERIFIABLE: "unverifiable"}
         
         for row in values[1:]:  # Skip header
-            # Handle rows with fewer columns
+            # Rows arrive ragged: Sheets omits trailing empty cells.
             result = row[result_idx].upper().strip() if len(row) > result_idx else ""
-            
-            if result == "W":
-                wins += 1
-            elif result == "L":
-                losses += 1
-            elif result == "P":
-                pushes += 1
-            else:  # Empty or unrecognized
-                pending += 1
+            tally[key.get(result, "pending")] += 1
         
-        hit_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-        
-        return {
-            "wins": wins,
-            "losses": losses,
-            "pushes": pushes,
-            "pending": pending,
-            "hit_rate": hit_rate,
-            "total": wins + losses + pushes + pending,
-        }
+        return summarize(**tally)
     except Exception as e:
         logger.error(f"Failed to get sheet summary: {e}")
         return None

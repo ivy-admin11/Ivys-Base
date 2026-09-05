@@ -12,6 +12,12 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ivy_core.pick_stats import (  # noqa: F401  (re-exported for callers)
+    MIN_DECIDED_FOR_RATE,
+    UNVERIFIABLE,
+    format_hit_rate,
+    summarize,
+)
 from ivy_core.sheets_logger import log_picks_to_sheet, update_result_in_sheet
 
 logger = logging.getLogger("ivy.picks_tracker")
@@ -193,7 +199,8 @@ def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
             SUM(CASE WHEN r.result = 'W' THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN r.result = 'L' THEN 1 ELSE 0 END) as losses,
             SUM(CASE WHEN r.result = 'P' THEN 1 ELSE 0 END) as pushes,
-            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending
+            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN r.result = 'U' THEN 1 ELSE 0 END) as unverifiable
         FROM picks p
         LEFT JOIN results r ON p.id = r.pick_id
         WHERE datetime(p.created_at) >= datetime('now', '-' || ? || ' days')
@@ -207,24 +214,23 @@ def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
     # part of counts toward that handicapper's record, which is the whole
     # point of tracking them -- and consensus picks are the ones worth judging
     # a roster on. Split the group key back apart and accumulate per handle.
-    stats: Dict[str, Dict] = {}
+    tallies: Dict[str, Dict] = {}
     for row in cursor.fetchall():
-        handicapper, total, wins, losses, pushes, pending = row
+        handicapper, total, wins, losses, pushes, pending, unverifiable = row
         for name in _split_handicappers(handicapper):
-            bucket = stats.setdefault(
+            bucket = tallies.setdefault(
                 name,
-                {"total": 0, "wins": 0, "losses": 0, "pushes": 0, "pending": 0, "hit_rate": 0},
+                {"total": 0, "wins": 0, "losses": 0, "pushes": 0,
+                 "pending": 0, "unverifiable": 0},
             )
             bucket["total"] += total or 0
             bucket["wins"] += wins or 0
             bucket["losses"] += losses or 0
             bucket["pushes"] += pushes or 0
             bucket["pending"] += pending or 0
+            bucket["unverifiable"] += unverifiable or 0
     
-    for bucket in stats.values():
-        decided = bucket["wins"] + bucket["losses"]
-        bucket["hit_rate"] = (bucket["wins"] / decided) * 100 if decided else 0
-    
+    stats = {name: summarize(**t) for name, t in tallies.items()}
     # Restore the ORDER BY the SQL intended, now that rows have been merged.
     stats = dict(sorted(stats.items(), key=lambda kv: kv[1]["wins"], reverse=True))
     
@@ -244,33 +250,19 @@ def get_stats_overall(days_back: int = 30) -> Dict:
             SUM(CASE WHEN r.result = 'W' THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN r.result = 'L' THEN 1 ELSE 0 END) as losses,
             SUM(CASE WHEN r.result = 'P' THEN 1 ELSE 0 END) as pushes,
-            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending
+            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN r.result = 'U' THEN 1 ELSE 0 END) as unverifiable
         FROM picks p
         LEFT JOIN results r ON p.id = r.pick_id
         WHERE datetime(p.created_at) >= datetime('now', '-' || ? || ' days')
     """, (days_back,))
     
-    row = cursor.fetchone()
-    total, wins, losses, pushes, pending = row
-    wins = wins or 0
-    losses = losses or 0
-    pushes = pushes or 0
-    pending = pending or 0
-    
-    hit_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
-    roi = 0  # TODO: Calculate ROI based on odds if odds are tracked
-    
+    total, wins, losses, pushes, pending, unverifiable = cursor.fetchone()
     conn.close()
     
-    return {
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "pushes": pushes,
-        "pending": pending,
-        "hit_rate": hit_rate,
-        "roi": roi,
-    }
+    stats = summarize(wins, losses, pushes, pending, unverifiable, total=total)
+    stats["roi"] = 0  # TODO: Calculate ROI based on odds if odds are tracked
+    return stats
 
 
 def get_stats_by_sport(days_back: int = 30) -> Dict[str, Dict]:
@@ -286,7 +278,8 @@ def get_stats_by_sport(days_back: int = 30) -> Dict[str, Dict]:
             SUM(CASE WHEN r.result = 'W' THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN r.result = 'L' THEN 1 ELSE 0 END) as losses,
             SUM(CASE WHEN r.result = 'P' THEN 1 ELSE 0 END) as pushes,
-            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending
+            SUM(CASE WHEN r.result IS NULL THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN r.result = 'U' THEN 1 ELSE 0 END) as unverifiable
         FROM picks p
         LEFT JOIN results r ON p.id = r.pick_id
         WHERE datetime(p.created_at) >= datetime('now', '-' || ? || ' days')
@@ -296,22 +289,8 @@ def get_stats_by_sport(days_back: int = 30) -> Dict[str, Dict]:
     
     stats = {}
     for row in cursor.fetchall():
-        sport, total, wins, losses, pushes, pending = row
-        wins = wins or 0
-        losses = losses or 0
-        pushes = pushes or 0
-        pending = pending or 0
-        
-        hit_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
-        
-        stats[sport] = {
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "pushes": pushes,
-            "pending": pending,
-            "hit_rate": hit_rate,
-        }
+        sport, total, wins, losses, pushes, pending, unverifiable = row
+        stats[sport] = summarize(wins, losses, pushes, pending, unverifiable, total=total)
     
     conn.close()
     return stats
@@ -323,20 +302,36 @@ def format_stats_for_pdf(days_back: int = 30) -> str:
     by_sport = get_stats_by_sport(days_back)
     by_hand = get_stats_by_handicapper(days_back)
     
+    def record(stats: Dict) -> str:
+        return (
+            f"{stats['wins']}W-{stats['losses']}L-{stats['pushes']}P"
+            f" · {format_hit_rate(stats)}"
+        )
+    
     lines = [
         f"📊 Sharp Picks Record (Last {days_back} Days)",
-        f"Overall: {overall['wins']}W-{overall['losses']}L-{overall['pushes']}P ({overall['hit_rate']:.1f}% hit rate) — {overall['pending']} pending",
+        f"Overall: {record(overall)}",
     ]
+    
+    # Pending and unverifiable are different claims and are never merged: one
+    # is a result still coming, the other is a result that never will.
+    tail = []
+    if overall["pending"]:
+        tail.append(f"{overall['pending']} awaiting results")
+    if overall["unverifiable"]:
+        tail.append(f"{overall['unverifiable']} ungradeable (game outside the scores window)")
+    if tail:
+        lines.append("  " + " · ".join(tail))
     
     if by_sport:
         lines.append("\nBy Sport:")
         for sport, stats in sorted(by_sport.items(), key=lambda x: x[1]['wins'], reverse=True):
-            lines.append(f"  {sport}: {stats['wins']}W-{stats['losses']}L-{stats['pushes']}P ({stats['hit_rate']:.1f}%)")
+            lines.append(f"  {sport}: {record(stats)}")
     
     if by_hand:
         lines.append("\nTop Handicappers:")
         for hand, stats in list(sorted(by_hand.items(), key=lambda x: x[1]['wins'], reverse=True))[:5]:
-            lines.append(f"  {hand}: {stats['wins']}W-{stats['losses']}L-{stats['pushes']}P ({stats['hit_rate']:.1f}%)")
+            lines.append(f"  {hand}: {record(stats)}")
     
     return "\n".join(lines)
 

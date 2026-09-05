@@ -198,25 +198,30 @@ class TestOverallStats:
             pt.update_pick_result(pid, res)
         s = pt.get_stats_overall()
         assert (s["wins"], s["losses"], s["pushes"], s["pending"]) == (3, 1, 1, 0)
-        assert s["hit_rate"] == pytest.approx(75.0)
+        assert s["decided"] == 4
         assert s["total"] == 5
+        # Four decided picks is below the reporting threshold, so there is no
+        # rate to report -- see test_dashboard_trust for that rule.
+        assert s["hit_rate"] is None
 
     def test_pushes_are_excluded_from_hit_rate(self, isolated_db):
         pt.save_picks([pick(), pick()], "2026-09-05")
         ids = pick_ids(isolated_db)
         pt.update_pick_result(ids[0], "W")
         pt.update_pick_result(ids[1], "P")
-        assert pt.get_stats_overall()["hit_rate"] == pytest.approx(100.0)
+        # A push is not a decided pick, whatever the sample size.
+        assert pt.get_stats_overall()["decided"] == 1
 
     def test_ungraded_picks_are_pending_not_losses(self, isolated_db):
         pt.save_picks([pick(), pick()], "2026-09-05")
         s = pt.get_stats_overall()
         assert s["pending"] == 2 and s["losses"] == 0
-        assert s["hit_rate"] == 0
+        assert s["hit_rate"] is None, "no decided picks is not a 0% record"
 
     def test_empty_database_reports_zeroes(self, isolated_db):
         s = pt.get_stats_overall()
-        assert s["total"] == 0 and s["hit_rate"] == 0
+        assert s["total"] == 0
+        assert s["hit_rate"] is None, "an empty record must not read as 0%"
 
 
 class TestHandicapperStats:
@@ -253,9 +258,9 @@ class TestHandicapperStats:
         stats = pt.get_stats_by_handicapper()
         assert stats["@alice"]["total"] == 2
         assert stats["@alice"]["wins"] == 1 and stats["@alice"]["losses"] == 1
-        assert stats["@alice"]["hit_rate"] == pytest.approx(50.0)
+        assert stats["@alice"]["decided"] == 2
         assert stats["@bob"]["total"] == 1 and stats["@bob"]["losses"] == 1
-        assert stats["@bob"]["hit_rate"] == 0
+        assert stats["@bob"]["decided"] == 1
 
     def test_unattributed_picks_are_labelled_not_dropped(self, isolated_db):
         pt.save_picks([pick(handicapper=None)], "2026-09-05")
@@ -313,7 +318,9 @@ class TestPdfSummary:
         pt.update_pick_result(ids[1], "L")
         out = pt.format_stats_for_pdf()
         assert "1W-1L" in out
-        assert "50.0%" in out
+        # Two decided picks is not a 50% record, and must not be printed as one.
+        assert "50.0%" not in out
+        assert "no rate yet" in out
 
     def test_names_individual_handicappers(self, isolated_db):
         pt.save_picks(
