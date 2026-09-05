@@ -731,3 +731,55 @@ class TestDashboard:
         out = tmp_path / "empty.pdf"
         build_dashboard(str(out), [])
         assert out.exists() and out.read_bytes().startswith(b"%PDF")
+
+
+class TestSinglePageGuarantee:
+    """A board is a card you glance at; page 2 of a glance is a contradiction.
+    The builder measures each density rung and takes the densest that fits,
+    then truncates with a note rather than ever flowing to a second page."""
+
+    @staticmethod
+    def _board(n, long_names=True):
+        name = "Some Long University Team" if long_names else "A"
+        return [{
+            "matchup": f"{name} {i} @ Another Long Team {i}",
+            "side": f"Another Long Team {i} -{i % 20}.5", "odds": "-110",
+            "handicappers": ["cappersforfree"], "consensus_count": 1,
+            "sport": "NCAAF", "start_label": "Sat Sep 5, 2:30 PM CT",
+            "analysis": "Line opened +9.5 and got bet to +7.<br/>Line: +9.5 -&gt; +7",
+        } for i in range(1, n + 1)]
+
+    @pytest.mark.parametrize("n", [1, 6, 12, 18, 24, 32, 48, 80, 150])
+    def test_never_more_than_one_page(self, tmp_path, n):
+        from pypdf import PdfReader
+        from picks_dashboard import build_dashboard
+        out = tmp_path / f"b{n}.pdf"
+        build_dashboard(str(out), self._board(n),
+                        signal_note="No consensus plays detected.", confidence_label="LOW")
+        assert len(PdfReader(str(out)).pages) == 1, f"{n} picks spilled to a second page"
+
+    def test_a_small_board_keeps_the_roomy_layout(self):
+        """Density must not collapse just because it can — 12 picks is the
+        reference layout and should stay two columns."""
+        from picks_dashboard import DENSITIES
+        assert DENSITIES[0].cols == 2
+        assert DENSITIES[0].show_analysis is True
+        assert DENSITIES[-1].cols >= DENSITIES[0].cols, "the ladder must get denser, not looser"
+
+    def test_densities_are_ordered_loosest_to_densest(self):
+        from picks_dashboard import DENSITIES
+        sizes = [d.pick.fontSize for d in DENSITIES]
+        assert sizes == sorted(sizes, reverse=True)
+        cols = [d.cols for d in DENSITIES]
+        assert cols == sorted(cols)
+
+    def test_an_unfittable_board_says_what_it_left_off(self, tmp_path):
+        """Truncation has to be visible — a silently short board is the same
+        class of bug as a silently missing report."""
+        from pypdf import PdfReader
+        from picks_dashboard import build_dashboard
+        out = tmp_path / "huge.pdf"
+        build_dashboard(str(out), self._board(400), signal_note="x", confidence_label="LOW")
+        reader = PdfReader(str(out))
+        assert len(reader.pages) == 1
+        assert "not shown" in reader.pages[0].extract_text()

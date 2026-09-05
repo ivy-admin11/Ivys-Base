@@ -63,12 +63,42 @@ STAT_LABEL = _s("sl", fontSize=6.5, leading=8, textColor=MUTED)
 BANNER_TXT = _s("bn", fontSize=7.5, leading=10, textColor=colors.HexColor("#5B4A15"))
 BANNER_R = _s("bnr", fontSize=6.5, leading=9, textColor=colors.HexColor("#8A7431"), alignment=TA_RIGHT)
 SECTION = _s("sec", fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=NAVY)
-CARD_NUM = _s("cn", fontName="Helvetica-Bold", fontSize=6.5, leading=8, textColor=GOLD)
-CARD_BADGE = _s("cb", fontName="Helvetica-Bold", fontSize=6, leading=8, textColor=NAVY)
-CARD_MATCHUP = _s("cm", fontName="Helvetica-Bold", fontSize=7.5, leading=9, textColor=INK)
-CARD_PICK = _s("cp", fontName="Helvetica-Bold", fontSize=11, leading=13, textColor=BLUE)
-CARD_META = _s("cme", fontSize=6.5, leading=8.5, textColor=MUTED)
-CARD_ANALYSIS = _s("ca", fontSize=6.8, leading=9, textColor=colors.HexColor("#44506A"))
+class Density:
+    """One rung of the fit ladder.
+
+    The report must never run to a second page — a board is a single card you
+    glance at, and page 2 of a glance is a contradiction. Rather than letting
+    reportlab flow, the builder measures each rung and takes the densest layout
+    that still fits, dropping to more columns and smaller type as the board
+    grows.
+    """
+
+    def __init__(self, cols, pick_fs, matchup_fs, meta_fs, badge_fs, pad, gap,
+                 show_analysis=True):
+        self.cols, self.pad, self.gap = cols, pad, gap
+        self.show_analysis = show_analysis
+        self.num = _s("cn", fontName="Helvetica-Bold", fontSize=badge_fs + 0.5,
+                      leading=badge_fs + 2, textColor=GOLD)
+        self.badge = _s("cb", fontName="Helvetica-Bold", fontSize=badge_fs,
+                        leading=badge_fs + 2, textColor=NAVY)
+        self.matchup = _s("cm", fontName="Helvetica-Bold", fontSize=matchup_fs,
+                          leading=matchup_fs + 1.5, textColor=INK)
+        self.pick = _s("cp", fontName="Helvetica-Bold", fontSize=pick_fs,
+                       leading=pick_fs + 2, textColor=BLUE)
+        self.meta = _s("cme", fontSize=meta_fs, leading=meta_fs + 2, textColor=MUTED)
+        self.analysis = _s("ca", fontSize=meta_fs + 0.3, leading=meta_fs + 2.5,
+                           textColor=colors.HexColor("#44506A"))
+
+
+# Ordered loosest to densest. The last rung is the floor: past it the board is
+# truncated and the card says how many were left off.
+DENSITIES = [
+    Density(2, 11, 7.5, 6.5, 6, 5, 5),
+    Density(2, 9.5, 7, 6, 5.6, 3.5, 4),
+    Density(3, 9, 6.5, 5.8, 5.2, 3, 3),
+    Density(3, 8, 6, 5.4, 5, 2, 2.5, show_analysis=False),
+    Density(4, 7.5, 5.6, 5, 4.6, 2, 2, show_analysis=False),
+]
 FOOT_L = _s("fl", fontSize=6.5, leading=9, textColor=MUTED)
 FOOT_R = _s("fr", fontSize=6.5, leading=9, textColor=MUTED, alignment=TA_RIGHT)
 
@@ -132,12 +162,12 @@ def _attribution(pick: Dict[str, Any]) -> str:
     return f"@{handles[0]} +{len(handles) - 1} more"
 
 
-def _card(index: int, pick: Dict[str, Any]) -> Table:
+def _card(index: int, pick: Dict[str, Any], den: "Density") -> Table:
     badge_text = market_badge(pick.get("side", ""))
     # Width follows the text: a nested table with colWidths=[None] stretches to
     # fill the cell, which painted the badge across the whole card.
-    badge_w = stringWidth(badge_text, "Helvetica-Bold", CARD_BADGE.fontSize) + 12
-    badge = Table([[Paragraph(escape(badge_text), CARD_BADGE)]],
+    badge_w = stringWidth(badge_text, "Helvetica-Bold", den.badge.fontSize) + 12
+    badge = Table([[Paragraph(escape(badge_text), den.badge)]],
                   colWidths=[badge_w], style=TableStyle([
                       ("BACKGROUND", (0, 0), (-1, -1), BADGE_BG),
                       ("LEFTPADDING", (0, 0), (-1, -1), 5),
@@ -146,7 +176,7 @@ def _card(index: int, pick: Dict[str, Any]) -> Table:
                       ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
                   ]), hAlign="LEFT")
 
-    head = Table([[Paragraph(f"#{index:02d}", CARD_NUM), badge]],
+    head = Table([[Paragraph(f"#{index:02d}", den.num), badge]],
                  colWidths=[0.32 * inch, badge_w], style=TableStyle([
                      ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                      ("LEFTPADDING", (0, 0), (-1, -1), 0),
@@ -167,23 +197,23 @@ def _card(index: int, pick: Dict[str, Any]) -> Table:
 
     rows = [
         [head],
-        [Paragraph(escape(str(pick.get("matchup") or "TBD")), CARD_MATCHUP)],
-        [Paragraph(escape(str(pick.get("side") or "")), CARD_PICK)],
-        [Paragraph(" &#8226; ".join(meta_bits), CARD_META)],
+        [Paragraph(escape(str(pick.get("matchup") or "TBD")), den.matchup)],
+        [Paragraph(escape(str(pick.get("side") or "")), den.pick)],
+        [Paragraph(" &#8226; ".join(meta_bits), den.meta)],
     ]
     # Pre-escaped by the caller (it carries <br/> between the take and the
     # line/injury notes), so it is passed through as markup, not re-escaped.
     analysis = str(pick.get("analysis") or "").strip()
-    if analysis:
-        rows.append([Paragraph(analysis, CARD_ANALYSIS)])
+    if analysis and den.show_analysis:
+        rows.append([Paragraph(analysis, den.analysis)])
     style = [
         ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-        ("LEFTPADDING", (0, 0), (-1, -1), 9),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
         ("TOPPADDING", (0, 0), (-1, -1), 0.5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0.5),
-        ("TOPPADDING", (0, 0), (0, 0), 5),
-        ("BOTTOMPADDING", (0, -1), (0, -1), 5),
+        ("TOPPADDING", (0, 0), (0, 0), den.pad),
+        ("BOTTOMPADDING", (0, -1), (0, -1), den.pad),
         ("BOX", (0, 0), (-1, -1), 0.5, RULE),
     ]
     if count >= 2:
@@ -288,27 +318,61 @@ def build_dashboard(
     story.append(Paragraph("TODAY'S PICK BOARD", SECTION))
     story.append(Spacer(1, 4))
 
+    def _grid(cards, den):
+        col_w = (CONTENT_W - den.gap * (den.cols - 1)) / float(den.cols)
+        rows, i = [], 0
+        while i < len(cards):
+            row = cards[i:i + den.cols]
+            row += [""] * (den.cols - len(row))
+            rows.append(row)
+            i += den.cols
+        style = [
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), den.gap),
+        ]
+        for c in range(den.cols - 1):
+            style.append(("RIGHTPADDING", (c, 0), (c, -1), den.gap))
+        return Table(rows or [[""]], colWidths=[col_w] * den.cols, style=TableStyle(style))
+
+    # What is left for the board once the fixed furniture is laid out.
+    fixed = sum(f.wrap(CONTENT_W, PAGE[1])[1] for f in story)
+    available = PAGE[1] - MARGIN - (MARGIN + 22) - fixed - 4
+
+    note_style = _s("nt", fontSize=6.5, leading=9, textColor=MUTED)
+
     if not picks:
-        story.append(Paragraph("No picks on the board.", CARD_META))
+        story.append(Paragraph("No picks on the board.", note_style))
     else:
-        cards = [_card(i, p) for i, p in enumerate(picks, 1)]
-        half = (len(cards) + 1) // 2
-        left, right = cards[:half], cards[half:]
-        right += [""] * (len(left) - len(right))
-        col_w = (CONTENT_W - 10) / 2.0
-        grid = Table(
-            [[l, r] for l, r in zip(left, right)],
-            colWidths=[col_w, col_w],
-            style=TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (0, -1), 10),
-                ("RIGHTPADDING", (1, 0), (1, -1), 0),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ]),
-        )
+        grid, omitted = None, 0
+        for den in DENSITIES:
+            candidate = _grid([_card(i, p, den) for i, p in enumerate(picks, 1)], den)
+            if candidate.wrap(CONTENT_W, PAGE[1])[1] <= available:
+                grid = candidate
+                break
+
+        if grid is None:
+            # Even the densest rung overflows: drop cards from the end until the
+            # board fits, and say how many were left off rather than silently
+            # cutting or spilling onto a second page.
+            den = DENSITIES[-1]
+            keep = len(picks) - den.cols
+            while keep > 0:
+                candidate = _grid([_card(i, p, den) for i, p in enumerate(picks[:keep], 1)], den)
+                if candidate.wrap(CONTENT_W, PAGE[1])[1] <= available - 14:
+                    grid, omitted = candidate, len(picks) - keep
+                    break
+                keep -= den.cols
+            if grid is None:
+                grid, omitted = _grid([], den), len(picks)
+
         story.append(grid)
+        if omitted:
+            story.append(Paragraph(
+                f"+{omitted} more pick{'' if omitted == 1 else 's'} not shown \u2014 "
+                "the full board is in the text report.", note_style))
 
     source = ", ".join(f"@{h}" for h in sorted(handles)) if handles else "X"
     footer_left = (f"Generated {now:%Y-%m-%d %H:%M}  \u2022  Source: {source}  "
