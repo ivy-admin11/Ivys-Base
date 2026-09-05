@@ -324,3 +324,42 @@ def test_prop_guard_does_not_fire_on_team_names():
     assert not sports_bettor._is_player_prop("Los Angeles Dodgers -1.5")
     assert sports_bettor._is_player_prop("Coby Mayo HR")
     assert sports_bettor._is_player_prop("Luka 30+ PTS")
+
+
+class TestNCAAFCoverage:
+    """College football has to be added in three places at once. Missing any
+    one of them fails quietly: no games, or picks the sweep labels 'NFL'."""
+
+    def test_ncaaf_is_in_the_odds_feed(self):
+        assert sports_bettor.ODDS_SPORT_KEYS.get("NCAAF") == "americanfootball_ncaaf"
+
+    def test_ncaaf_is_in_the_x_sweep_query(self):
+        q = sports_bettor.SPORT_QUERY
+        # Sharps post "CFB" far more than "NCAAF", so both forms must be there.
+        for token in ("NCAAF", "#NCAAF", "CFB", "#CFB", "College Football"):
+            assert token in q, token
+
+    def test_sweep_prompt_names_ncaaf_as_a_league_value(self):
+        prompt = sports_bettor._build_sweep_prompt(["someHandle"], "", sports_bettor.SPORT_QUERY)
+        assert "NCAAF" in prompt
+        assert "never NFL" in prompt, "Grok mislabels college games as NFL without this"
+
+    def test_ncaaf_picks_render_with_a_football_emoji(self):
+        body, _ = sports_bettor.format_picks_digest([{
+            "sport": "NCAAF", "matchup": "Ohio State Buckeyes @ Texas Longhorns",
+            "side": "Texas +7", "odds": "-110",
+            "is_consensus": True, "consensus_count": 2, "handicappers": ["a", "b"],
+        }])
+        assert "\U0001F3C8" in body
+        assert "Texas +7" in body
+
+    def test_ncaaf_odds_attach_by_team_name(self):
+        games = [{
+            "away": "Ohio State Buckeyes", "home": "Texas Longhorns", "sport": "NCAAF",
+            "spread": "Texas +7 (-110)", "moneyline": "OSU -280 / TEX +230",
+            "total": "Over 54.5", "commence": "2026-09-05T23:30:00Z",
+        }]
+        picks = [{"matchup": "Ohio State Buckeyes @ Texas Longhorns", "side": "Texas +7"}]
+        sports_bettor.attach_odds(picks, games)
+        assert picks[0]["sport"] == "NCAAF"
+        assert picks[0]["odds"] == "Texas +7 (-110)"

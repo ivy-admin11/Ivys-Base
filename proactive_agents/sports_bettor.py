@@ -79,6 +79,7 @@ XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip().strip("*'\"")
 ODDS_SPORT_KEYS = {
     "NFL":        "americanfootball_nfl",
+    "NCAAF":      "americanfootball_ncaaf",
     "MLB":        "baseball_mlb",
     "NBA":        "basketball_nba",
     "NHL":        "icehockey_nhl",
@@ -104,7 +105,9 @@ WINDOW_HOURS = 48
 SPORT_QUERY = (
     "(MLB OR #MLB OR KBO OR #KBO OR NBA OR #NBA OR NHL OR #NHL "
     "OR Soccer OR #Soccer OR \"World Cup\" OR #WorldCup "
-    "OR NFL OR #NFL OR PGA OR #PGA OR Golf OR #Golf OR Tennis OR #Tennis)"
+    "OR NFL OR #NFL OR NCAAF OR #NCAAF OR CFB OR #CFB "
+    "OR \"College Football\" OR #CollegeFootball "
+    "OR PGA OR #PGA OR Golf OR #Golf OR Tennis OR #Tennis)"
 )
 
 # Curated handicappers verified (2026-06-29) to actually post bettable picks.
@@ -299,7 +302,8 @@ def _build_sweep_prompt(accounts, slate_clause, query):
         f"Target accounts: {', '.join(f'@{a}' for a in accounts)}\n\n"
         f"{slate_clause}"
         "Return a JSON array. Each element is one pick with fields: "
-        "sport (league, e.g. MLB/KBO/NBA/NHL/Soccer/World Cup/NFL/PGA Golf/Tennis), "
+        "sport (league, e.g. MLB/KBO/NBA/NHL/Soccer/World Cup/NFL/NCAAF/PGA Golf/"
+        "Tennis; use NCAAF for college football, never NFL), "
         "matchup (formatted 'Away @ Home'), "
         "side (the exact side/total/prop the handicapper is taking), "
         "odds (the American odds for that side copied verbatim from the slate "
