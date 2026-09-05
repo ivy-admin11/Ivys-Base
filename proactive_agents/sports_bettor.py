@@ -158,8 +158,8 @@ def _read_sports_cache():
             saved = saved.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) - saved < timedelta(hours=SPORTS_CACHE_TTL_H):
             return [(e["label"], e["key"]) for e in blob["sports"]]
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"\u26a0\ufe0f  Sport cache unreadable ({_redact(exc)}); re-discovering.")
     return None
 
 

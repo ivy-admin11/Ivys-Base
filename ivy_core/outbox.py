@@ -196,8 +196,8 @@ def find_newest_pending(job_name: str) -> Optional[str]:
                 and meta.get("status") in ("pending", "failed")
             ):
                 candidates.append((meta["generated_at"], meta["report_id"]))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Outbox: skipping unreadable %s: %s", meta_file.name, exc)
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -247,8 +247,8 @@ def find_newest(job_name: str, *, with_detail: bool = False) -> Optional[str]:
             if with_detail and not _detail_path(meta["report_id"]).exists():
                 continue
             candidates.append((meta["generated_at"], meta["report_id"]))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Outbox: skipping unreadable %s: %s", meta_file.name, exc)
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -269,7 +269,8 @@ def list_reports(job_name: Optional[str] = None) -> List[Dict[str, Any]]:
             continue
         try:
             meta = json.loads(meta_file.read_text())
-        except Exception:
+        except Exception as exc:
+            logger.warning("Outbox: skipping unreadable %s: %s", meta_file.name, exc)
             continue
         if not meta.get("report_id"):
             continue
@@ -313,7 +314,8 @@ def cleanup_old_reports() -> int:
         try:
             meta = json.loads(meta_file.read_text())
             job, when, rid = meta.get("job_name"), meta.get("generated_at", ""), meta["report_id"]
-        except Exception:
+        except Exception as exc:
+            logger.warning("Outbox: skipping unreadable %s: %s", meta_file.name, exc)
             continue
         if job and when > newest_per_job.get(job, ("", ""))[0]:
             newest_per_job[job] = (when, rid)

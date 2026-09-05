@@ -164,7 +164,9 @@ def _forge_wrapper(handle: _ServerHandle, tool: dict[str, Any]) -> Callable[...,
     if arg_doc_lines:
         docstring += "\n\n    Args:\n" + "\n".join(arg_doc_lines)
     # Escape triple-quotes defensively before splicing into source.
-    docstring_safe = docstring.replace('"""', '\\"\\"\\"')
+    docstring_safe = docstring.replace('"""', '\\"\\"\\"').rstrip("\\")
+    # rstrip: a description ending in a backslash would escape the closing
+    # delimiter and swallow the generated function body into the docstring.
 
     src = (
         f"def {name}({', '.join(param_decls)}) -> str:\n"

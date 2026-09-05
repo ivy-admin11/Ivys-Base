@@ -49,6 +49,7 @@ from pydantic import BaseModel
 # Import centralized configuration
 from config import (
     POLLING_INTERVAL,
+    WATCHDOG_INTERVAL_S,
     DB_TIMEOUT,
     DB_RETRY_ATTEMPTS,
     DB_RETRY_BACKOFF,
@@ -56,6 +57,7 @@ from config import (
     EXTERNAL_API_TIMEOUT,
     ENABLE_IMESSAGE_POLLER,
     ENABLE_CALENDAR_INTEGRATION,
+    HENRY_PHONE,
     ENABLE_REMINDERS_INTEGRATION,
     ENABLE_READWISE_INTEGRATION,
     PLAYWRIGHT_ENABLED,
@@ -78,6 +80,7 @@ from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 from ivy_core import receipts
 from ivy_core import outbox as _outbox
 from ivy_core import attachment_verify
+from ivy_core import agent_watchdog
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import split_imessage_content
 from utils.applescript import AppleScriptRunner
@@ -669,7 +672,9 @@ def check_apple_calendar(timeframe: str) -> str:
                     "date": event_dt,
                     "display": f"- {event_dt.strftime('%A, %b %d')}: {summary} ({ev_time})"
                 })
-            except Exception:
+            except Exception as exc:
+                # An unparseable line is an event the user never sees. Say so.
+                logger.warning("Calendar: unparseable line %r (%s)", line, exc)
                 continue
 
     parsed_events.sort(key=lambda x: x["date"])
@@ -1702,6 +1707,10 @@ def background_imessage_worker() -> None:
 
     consecutive_failures = 0
     first_failure_ts: Optional[float] = None
+    # The watchdog rides the poller rather than getting its own launchd unit:
+    # a scheduled watcher shares the failure it is meant to catch, and the
+    # gateway is alive precisely when the scheduler is not.
+    next_watchdog_check = 0.0
 
     def _mark_poll_success() -> None:
         """A completed cycle — including one that found no new message — proves
@@ -1716,6 +1725,16 @@ def background_imessage_worker() -> None:
     while True:
         try:
             time.sleep(POLLING_INTERVAL)
+
+            if time.monotonic() >= next_watchdog_check:
+                next_watchdog_check = time.monotonic() + WATCHDOG_INTERVAL_S
+                try:
+                    agent_watchdog.check_once(
+                        lambda body: run_local_applescript_send(HENRY_PHONE, body) == "SUCCESS"
+                    )
+                except Exception as watchdog_err:
+                    logger.error("Watchdog check failed: %s", watchdog_err)
+
             row = safe_fetch_last_message(last_id)
 
             if not row:

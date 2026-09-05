@@ -388,7 +388,8 @@ class TestHandleVetting:
 
     @staticmethod
     def _mod():
-        import importlib.util, pathlib
+        import importlib.util
+        import pathlib
         path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "vet_x_handles.py"
         spec = importlib.util.spec_from_file_location("vet_x_handles", path)
         mod = importlib.util.module_from_spec(spec)
@@ -427,7 +428,8 @@ class TestCurrentHandleAudit:
 
     @staticmethod
     def _mod():
-        import importlib.util, pathlib
+        import importlib.util
+        import pathlib
         path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "vet_x_handles.py"
         spec = importlib.util.spec_from_file_location("vet_x_handles_audit", path)
         mod = importlib.util.module_from_spec(spec)

@@ -22,6 +22,11 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False
 # ============================================================================
 
 POLLING_INTERVAL: int = int(os.environ.get("POLLING_INTERVAL", "1"))
+
+# How often the gateway checks whether a scheduled agent has gone quiet.
+# Hourly: the thresholds are measured in days, so this only needs to be far
+# more frequent than the silence it detects, not precise.
+WATCHDOG_INTERVAL_S: int = int(os.environ.get("WATCHDOG_INTERVAL_S", "3600"))
 """Seconds between iMessage database polls"""
 
 DB_TIMEOUT: float = float(os.environ.get("DB_TIMEOUT", "5"))
