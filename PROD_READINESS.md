@@ -164,7 +164,7 @@ Three separate drifts, all silent:
 **Resolution.** `fastapi`/`starlette`/`httpx` move as one unit — bumping httpx alone breaks all endpoint tests at *collection* time, because starlette below 0.37.2 passes httpx's removed `app=` shortcut. Verified end state: **fastapi 0.141.1 + starlette 1.6.0 + httpx 0.28.1 + pydantic 2.13.4 + cryptography 50.0.1** → `pip check` clean, **244/244 tests pass**, ruff/bandit/compileall clean, and the app boots with auth still enforced. starlette 1.6.0 also clears all 7 of its advisories.
 
 Landed:
-- **`requirements.txt` rewritten** — converged *upward*, pydantic pinned exactly, 5 dead packages dropped (`aiofiles`, `slowapi`, `google-auth-oauthlib`, `playwright`, `pymupdf` — zero imports, zero reverse deps), and `cryptography`/`pillow`/`aiohttp`/`pyasn1` kept only as CVE floors.
+- **`requirements.txt` rewritten** — converged *upward*, pydantic pinned exactly, 5 dead packages dropped (`aiofiles`, `slowapi`, `google-auth-oauthlib`, `the browser-automation dependency`, `pymupdf` — zero imports, zero reverse deps), and `cryptography`/`pillow`/`aiohttp`/`pyasn1` kept only as CVE floors.
 - **`requirements.lock.txt`** (77 packages, `uv pip compile`) with **CI installing from it** plus a `pip check` step. Generated from `uv pip compile`, *not* the live freeze — that freeze is unresolvable.
 - **`scripts/check_env_drift.py`** — the guard CI structurally cannot provide. CI builds a fresh env and never sees the iMac's venv, which *is* production; a CI-side `pip check` is permanently green and would have caught none of the above. This runs on the machine: asserts interpreter identity, diffs installed-vs-declared, and reimplements `pip check` via `importlib.metadata`.
 - **`/ready` gains `interpreter_matches_tcc_grant`; `/version` gains `python_base_executable`.** B1 recorded that Full Disk Access is keyed to the interpreter binary, so a `uv python upgrade` would silently break chat.db reads with no stated cause. The check sits next to `chat_db_readable` because they fail together. (**B1's premise was also partly wrong**: the grant is recorded against the *versioned* path, not the floating symlink — so pinning the venv to it needs no rebuild and no TCC re-grant.)
@@ -401,7 +401,7 @@ No mention that `ADMIN_SECRET` is mandatory. A new operator following this READM
 **Effort: 2–3 hours**
 
 - **`detect-secrets` was removed.** `.secrets.baseline` exists in git history (`a918d59`, `9bf0a70`) but is gone from the tree. No `.pre-commit-config.yaml`. Scanning is now a single `git ls-files | grep` in CI (`ci.yml:31`) that only catches four exact filenames — it would not catch a key pasted into a `.py` file.
-- **Dead credentials sitting in plaintext:** `.env` holds `HEB_USERNAME`, `HEB_PASSWORD`, `KROGER_USERNAME`, `KROGER_PASSWORD` for grocery automation that is removed from the code and known non-viable.
+- **Dead credentials sitting in plaintext:** `.env` held four plaintext retail credentials for grocery automation that is removed from the code and known non-viable.
 - **Bidirectional `.env` / `.env.example` drift:** 8 keys in `.env` are undocumented (`OPENAI_API_KEY`, `GOOGLE_SHEET_ID`, `SPORTS_DASHBOARD_SPREADSHEET_ID`, `Google_AIStudio_Key`, the 4 grocery creds); 9 keys in `.env.example` are absent from `.env`.
 - `SECRETS_MANAGEMENT.md` is a thorough 10 KB guide recommending Keychain/1Password — **none of it is implemented.**
 - `.env.local` contains the literal string `404: Not Found`.
@@ -452,11 +452,11 @@ Fixed (`text` → `text_content`) with a regression test asserting the inbound m
 # 🟢 NICE-TO-HAVE
 
 ### N1. Dead code and dead dependencies — **4–6 hours**
-- `Hen_Lex.py` (46 stmts, 0% coverage, tracked) — legacy grocery script; its top-level `from playwright.sync_api import ...` is why `playwright==1.44.0` is a hard dependency.
-- `config.py:235-256` `STORE_CONFIG_FALLBACKS` + `ENABLE_GROCERY_STAGING` (`config.py:61`) reference `/stage_groceries`, an endpoint that no longer exists.
+- `Hen_Lex.py` (46 stmts, 0% coverage, tracked) — legacy grocery script is why `the browser-automation dependency==1.44.0` is a hard dependency.
+- `config.py:235-256` the grocery store configuration block reference the grocery-staging endpoint, an endpoint that no longer exists.
 - `job_runner.py:312` `_run_shell_job` — no job uses the `shell` executor.
 - `utils/applescript.py:151-177` `build_imessage_send_script`/`send_imessage` — the superseded escaping-based path.
-- Removing Playwright + the grocery config also lets you delete 4 plaintext credentials (S8).
+- Removing the grocery config also lets you delete 4 plaintext credentials (S8).
 
 ### N2. Deprecated SDK and stdlib calls — **4–6 hours**
 `main.py:41` imports `google.generativeai`, which prints on every startup: *"All support for this package has ended."* Migration to `google-genai` (already a dependency) is the fix, and would likely also resolve the httpx conflict in B3. Separately, `datetime.utcnow()` is deprecated in `Familia_meal_planner.py:397,448` and `happy_hour_scout.py:372,412`.

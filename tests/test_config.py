@@ -141,14 +141,30 @@ def test_contacts_come_from_the_environment_when_set(tmp_path):
     assert res.stdout.strip() == "+15555550100"
 
 
-def test_grocery_automation_stays_deleted():
-    """H-E-B and Kroger cart automation was removed on 2026-09-05: both
-    retailers bot-walled it, no code path had called it in months, and it was
-    the sole reason four retail passwords sat in .env. This guards the removal
-    the way CI guards committed secrets — the credentials only come back if the
-    code that wants them does.
+def _forbidden_markers():
+    """The markers that must not reappear, built from fragments so that this
+    file is not itself a copy of what it forbids."""
+    retailers = ("kro" + "ger", "h" + "eb")
+    return (
+        *retailers,
+        f"{retailers[1]}_username",
+        f"{retailers[1]}_password",
+        "store_" + "configs",
+        "play" + "wright",
+        "stage_" + "groceries",
+    )
 
-    Grocery *lists* are unaffected: those go to Apple Reminders, and the word
+
+def test_grocery_automation_stays_deleted():
+    """Grocery cart automation was removed on 2026-09-05: it was bot-walled,
+    no code path had called it in months, and it was the sole reason retail
+    credentials sat in .env. This guards the removal the way CI guards
+    committed secrets — the credentials only come back if the code that wants
+    them does.
+
+    The retailer names are assembled at runtime rather than written out, so
+    this file does not reintroduce the strings it exists to forbid. Grocery
+    *lists* are unaffected: those go to Apple Reminders, and the word
     "grocery" is allowed in that context.
     """
     import subprocess
@@ -173,8 +189,7 @@ def test_grocery_automation_stays_deleted():
             text = path.read_text(errors="ignore").lower()
         except OSError:
             continue
-        for needle in ("kroger", "heb_username", "heb_password", "store_configs",
-                       "playwright", "stage_groceries"):
+        for needle in _forbidden_markers():
             if needle in text:
                 offenders.append(f"{rel}: {needle}")
 

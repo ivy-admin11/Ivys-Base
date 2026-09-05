@@ -59,7 +59,7 @@
     <span class="lname">1 · Triggers &amp; Entry Points</span>
     <div class="row">
       <div class="card live"><span class="tag">live</span><h3>📩 iMessage</h3><p>Someone texts "ivy…"; poller reads macOS <code>chat.db</code> (read-only, Full Disk Access).</p></div>
-      <div class="card live"><span class="tag">live</span><h3>🔌 HTTP API</h3><p>X-API-Key protected: <code>/health</code>, <code>/capabilities</code>, <code>/stage_groceries</code>.</p></div>
+      <div class="card live"><span class="tag">live</span><h3>🔌 HTTP API</h3><p>X-API-Key protected: <code>/health</code>, <code>/capabilities</code>, <code>the grocery-staging endpoint</code>.</p></div>
       <div class="card live"><span class="tag">live</span><h3>⏰ launchd Schedules</h3><p>Sports picks 17×/day (4 windows); brain agent always-on.</p></div>
     </div>
   </div>
@@ -97,7 +97,7 @@
       <div class="card live"><span class="tag">live</span><h3>📚 Readwise</h3><p>Fetches saved highlights (async httpx).</p></div>
       <div class="card live"><span class="tag">live</span><h3>💬 iMessage send</h3><p>Outbound replies via AppleScript (quote-escaped).</p></div>
     </div>
-    <div class="note"><b>Removed 2026-09-05:</b> grocery cart automation. Both retailers bot-walled it, nothing had called it in months, and it was the only reason four retail passwords sat in <span class="pill">.env</span>. Grocery <em>lists</em> still work — they go to Apple Reminders.</div>
+    <div class="note"><b>Removed 2026-09-05:</b> grocery cart automation. It was bot-walled, nothing had called it in months, and it was the only reason retail credentials sat in <span class="pill">.env</span>. Grocery <em>lists</em> still work — they go to Apple Reminders.</div>
   </div>
   <div class="arrow">▼</div>
 

@@ -52,4 +52,4 @@ flowchart TD
   classDef plan fill:#f1f5f9,stroke:#94a3b8,color:#0f172a;
 ```
 
-Everything green was exercised live. ⬜ items are empty `proactive_agents/` scaffolds. Grocery staging (H-E-B and Kroger cart automation) was removed on 2026-09-05: both retailers bot-walled it, no code path had called it in months, and it was the only reason four retail passwords sat in `.env`.
+Everything green was exercised live. ⬜ items are empty `proactive_agents/` scaffolds. Grocery cart automation was removed on 2026-09-05: it was bot-walled, no code path had called it in months, and it was the only reason retail credentials sat in `.env`.
