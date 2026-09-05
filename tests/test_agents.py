@@ -53,7 +53,10 @@ def test_sports_bettor_texts_the_picks_and_never_pushes_a_pdf(monkeypatch, tmp_p
     fake_pdf = tmp_path / "fake_picks.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake")
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
-    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
     monkeypatch.setattr(
         sports_bettor, "merge_picks",
@@ -94,7 +97,10 @@ def test_sports_bettor_texts_the_picks_and_never_pushes_a_pdf(monkeypatch, tmp_p
 def test_sports_bettor_does_not_stamp_fingerprint_when_text_fails(monkeypatch, tmp_path):
     """A failed send must leave the slate resendable on the next run."""
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
-    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real"}])
     monkeypatch.setattr(
         sports_bettor, "merge_picks",
@@ -207,7 +213,10 @@ def test_sports_bettor_speaks_up_when_picks_exist_but_none_qualify(monkeypatch, 
     """The most recent real run: 7 picks swept, 0 cleared the threshold, and the
     job returned in total silence — indistinguishable from not running."""
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
-    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real"}])
     monkeypatch.setattr(
         sports_bettor, "merge_picks",
@@ -241,7 +250,10 @@ def test_sports_bettor_speaks_up_when_picks_exist_but_none_qualify(monkeypatch, 
 
 def test_sports_bettor_stays_quiet_on_an_unchanged_below_bar_board(monkeypatch, tmp_path):
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
-    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["game1"])
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real"}])
     monkeypatch.setattr(
         sports_bettor, "merge_picks",
@@ -614,7 +626,10 @@ def test_below_threshold_board_names_a_single_source_as_the_cause(monkeypatch, t
     """14 picks from one handle can never reach a 2-sharp consensus. Saying
     'nothing qualified' without saying why reads as a quiet slate."""
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
-    monkeypatch.setattr(sports_bettor, "fetch_live_odds", lambda: ["g"])
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
     monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@x"}])
     monkeypatch.setattr(sports_bettor, "merge_picks", lambda picks: [
         {"is_consensus": False, "consensus_count": 1, "handicappers": ["cappersforfree"],
@@ -878,3 +893,79 @@ class TestAllSportsCoverage:
             "handicappers": ["someone"], "enrichment": {"confidence": "medium"},
         }])
         assert "India @ Australia" in body
+
+
+class TestMatchupRepair:
+    """Every case below is from a real board: "LAD @ ?", "Lille @ ?",
+    "Fernandez @ Opponent", "Doosan Bears — ml", and abbreviations like
+    "MIA @ KC" that never matched the slate and so never got a price."""
+
+    GAMES = [
+        {"away": "St. Louis Cardinals", "home": "Los Angeles Dodgers"},
+        {"away": "Miami Marlins", "home": "Kansas City Royals"},
+        {"away": "Chicago Cubs", "home": "Cincinnati Reds"},
+        {"away": "Lille", "home": "Paris Saint-Germain"},
+        {"away": "Doosan Bears", "home": "Kia Tigers"},
+    ]
+
+    def _one(self, matchup, side="Some Team -1.5"):
+        kept, dropped = sports_bettor.repair_matchups(
+            [{"matchup": matchup, "side": side}], self.GAMES)
+        return (kept[0] if kept else None), dropped
+
+    def test_a_missing_opponent_is_recovered_from_the_slate(self):
+        pick, _ = self._one("LAD @ ?", "Dodgers -1.5")
+        assert pick["matchup"] == "St. Louis Cardinals @ Los Angeles Dodgers"
+
+    def test_abbreviations_are_upgraded_to_the_slate_names(self):
+        pick, _ = self._one("MIA @ KC", "KC ROYALS")
+        assert pick["matchup"] == "Miami Marlins @ Kansas City Royals"
+
+    def test_a_placeholder_opponent_word_is_treated_as_missing(self):
+        pick, _ = self._one("Fernandez @ Opponent", "Fernandez +5.5 Games")
+        assert "Opponent" not in pick["matchup"]
+        assert "?" not in pick["matchup"]
+
+    def test_an_unrecoverable_opponent_leaves_the_team_alone_not_a_placeholder(self):
+        """Better to show one real team than to invent the other."""
+        pick, _ = self._one("Fernandez @ ?", "Fernandez +5.5 Games")
+        assert pick["matchup"] == "Fernandez"
+
+    def test_a_bare_market_side_takes_the_team_from_the_matchup(self):
+        pick, _ = self._one("Doosan Bears", "ml")
+        assert pick["side"] == "Doosan Bears ML"
+        assert pick["matchup"] == "Doosan Bears @ Kia Tigers"
+
+    def test_a_pick_with_no_identifiable_team_is_dropped(self):
+        pick, dropped = self._one("? @ ?", "whatever")
+        assert pick is None and len(dropped) == 1
+
+    def test_a_pick_with_no_side_is_dropped(self):
+        pick, dropped = self._one("Doosan Bears", "")
+        assert pick is None and len(dropped) == 1
+
+    def test_an_ambiguous_abbreviation_is_never_guessed(self):
+        """Two Los Angeles teams: matching "LA" must not pick one at random."""
+        games = [{"away": "X", "home": "Los Angeles Dodgers"},
+                 {"away": "Y", "home": "Los Angeles Angels"}]
+        kept, _ = sports_bettor.repair_matchups([{"matchup": "LA @ ?", "side": "LA -1.5"}], games)
+        assert kept[0]["matchup"] == "LA", "an ambiguous team must not be resolved"
+
+    def test_a_complete_matchup_off_the_slate_is_left_untouched(self):
+        pick, _ = self._one("Some Unlisted Team @ Another Team", "Another Team -3")
+        assert pick["matchup"] == "Some Unlisted Team @ Another Team"
+
+    def test_repair_runs_before_odds_so_repaired_games_get_priced(self):
+        games = [{"away": "Miami Marlins", "home": "Kansas City Royals",
+                  "moneyline": "Miami Marlins +120 / Kansas City Royals -140",
+                  "spread": "", "total": "", "sport": "MLB", "commence": "2026-09-05T23:40:00Z"}]
+        picks = [{"matchup": "MIA @ KC", "side": "Kansas City Royals ML"}]
+        picks, _ = sports_bettor.repair_matchups(picks, games)
+        sports_bettor.attach_odds(picks, games)
+        assert picks[0]["odds"] == "Kansas City Royals -140"
+        assert picks[0]["sport"] == "MLB"
+
+    def test_the_prompt_forbids_placeholder_opponents(self):
+        prompt = sports_bettor._build_sweep_prompt(["h"], "", sports_bettor.SPORT_HINTS)
+        assert "never a placeholder" in prompt
+        assert "'ML' or '-1.5' alone is not a side" in prompt

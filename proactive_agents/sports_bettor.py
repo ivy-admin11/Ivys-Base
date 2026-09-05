@@ -459,8 +459,12 @@ def _build_sweep_prompt(accounts, slate_clause, query):
         "NCAAF, NBA, WNBA, NCAAB, NHL, MLS, EPL, UFC, Boxing, Tennis, Golf, KBO, "
         "NPB, CFL and so on; use NCAAF for college football, never NFL, and never "
         "invent a league you did not see), "
-        "matchup (formatted 'Away @ Home'), "
-        "side (the exact side/total/prop the handicapper is taking), "
+        "matchup (formatted 'Away @ Home' using BOTH teams' real names as they "
+        "appear in the slate above, never an abbreviation and never a placeholder "
+        "such as '?', 'TBD' or 'Opponent'; if you cannot identify both teams, omit "
+        "the pick entirely), "
+        "side (the exact side/total/prop the handicapper is taking, naming the "
+        "team or player it is on \u2014 'ML' or '-1.5' alone is not a side), "
         "odds (the American odds for that side copied verbatim from the slate "
         "above, or null if not listed), "
         "handicapper (the X handle of the account that POSTED the pick — one of "
@@ -845,6 +849,122 @@ def _price_for_side(side, market, matchup=""):
         if len(matching) == 1:
             return matching[0]
     return ""
+
+
+# Placeholders Grok fills an unknown opponent with. Real boards carried
+# "LAD @ ?", "Lille @ ?" and "Fernandez @ Opponent" — a matchup that names one
+# side is not a matchup, and printing the placeholder makes the report look
+# broken even when the pick behind it is fine.
+_PLACEHOLDER_TEAMS = {"", "?", "??", "???", "tbd", "tba", "opponent", "opp",
+                      "unknown", "n/a", "na", "none", "-"}
+
+# A side that is only a market word ("ml") says nothing on its own; the team is
+# in the matchup, so it gets moved across rather than the pick being dropped.
+_BARE_MARKET_SIDES = {"ml", "moneyline", "money line", "spread", "line"}
+
+
+def _split_matchup(text):
+    """Split "Away @ Home" (or vs / v / at) into its two halves."""
+    parts = re.split(r"\s+(?:@|vs\.?|v\.?|at)\s+", str(text or "").strip(), maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return (parts[0].strip() if parts else ""), ""
+
+
+def _is_placeholder_team(name):
+    return _norm(name).strip(" .") in _PLACEHOLDER_TEAMS
+
+
+def _team_aliases(name):
+    """Ways a handicapper might write a team: full name, nickname, initials.
+
+    The slate says "Los Angeles Dodgers"; sharps post "LAD", "Dodgers" or
+    "LA Dodgers". Matching only on shared words left a fifth of the board with
+    no game and therefore no price.
+    """
+    tokens = [t for t in _norm(name).split() if t]
+    if not tokens:
+        return set()
+    aliases = set(tokens)
+    aliases.add(" ".join(tokens))
+    aliases.add(tokens[-1])                        # Dodgers
+    aliases.add(tokens[-1][:3])                    # dod
+    aliases.add(tokens[0][:3])                     # mia  (Miami Marlins)
+    aliases.add("".join(t[0] for t in tokens))     # lad  (Los Angeles Dodgers)
+    if len(tokens) >= 2:
+        # kc (Kansas City Royals) — the city initials without the nickname.
+        aliases.add("".join(t[0] for t in tokens[:-1]))
+        aliases.add("".join(t[0] for t in tokens[:2]))
+    return {a for a in aliases if len(a) >= 2}
+
+
+def _slate_index(games):
+    """[(game, away_aliases, home_aliases)] for matching picks to real games."""
+    return [(g, _team_aliases(g.get("away", "")), _team_aliases(g.get("home", "")))
+            for g in games or [] if isinstance(g, dict)]
+
+
+def _find_game(name, index):
+    """The single slate game featuring ``name``, or None when it is ambiguous.
+
+    Ambiguity is deliberately fatal here: guessing which of two games a pick
+    belongs to would attach a real price to the wrong bet, which is the class
+    of error this whole area keeps producing.
+    """
+    probes = _team_aliases(name)
+    if not probes:
+        return None
+    hits = [g for g, away, home in index if probes & away or probes & home]
+    return hits[0] if len(hits) == 1 else None
+
+
+def repair_matchups(merged, games):
+    """Complete, correct or discard every half-formed matchup from the sweep.
+
+    Returns ``(kept, dropped)``. A pick keeps its place if it names at least
+    one real team; it is only discarded when nothing identifiable survives,
+    because a card reading "Doosan Bears — ml" helps nobody.
+    """
+    index = _slate_index(games)
+    kept, dropped = [], []
+
+    for e in merged:
+        away, home = _split_matchup(e.get("matchup"))
+        known = [t for t in (away, home) if t and not _is_placeholder_team(t)]
+
+        if not known:
+            dropped.append(e)
+            continue
+
+        # A side that is only a market word borrows the team from the matchup.
+        side = str(e.get("side") or "").strip()
+        if _norm(side) in _BARE_MARKET_SIDES and len(known) == 1:
+            e["side"] = f"{known[0]} {side.upper() if len(side) <= 2 else side.title()}"
+        elif not side:
+            dropped.append(e)
+            continue
+
+        if len(known) == 2:
+            # Both halves present: upgrade abbreviations to the slate's own
+            # names when the game is unambiguous, so "MIA @ KC" reads as the
+            # teams and matches the feed on the next pass.
+            game = _find_game(known[0], index) or _find_game(known[1], index)
+            if game:
+                e["matchup"] = f"{game['away']} @ {game['home']}"
+            kept.append(e)
+            continue
+
+        # One half known: try to recover the opponent from the live slate.
+        game = _find_game(known[0], index)
+        if game:
+            e["matchup"] = f"{game['away']} @ {game['home']}"
+        else:
+            # Nothing to complete it with — show the team alone rather than
+            # inventing an opponent or printing "@ ?".
+            e["matchup"] = known[0]
+        kept.append(e)
+
+    return kept, dropped
 
 
 def attach_odds(merged, games):
@@ -1666,6 +1786,13 @@ def _run_pipeline(
         return result.to_dict()
 
     merged = merge_picks(picks)
+
+    # Complete the half-formed matchups before anything tries to match them
+    # against the slate — "LAD @ ?" finds no game, and so gets no price.
+    merged, unusable = repair_matchups(merged, games)
+    if unusable:
+        print(f"\U0001F9F9 Dropped {len(unusable)} pick(s) with no identifiable team.")
+
     attach_odds(merged, games)
 
     # A board carrying both sides of one game is a guaranteed loss after vig;
