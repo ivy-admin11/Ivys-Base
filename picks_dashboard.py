@@ -98,6 +98,8 @@ DENSITIES = [
     Density(3, 9, 6.5, 5.8, 5.2, 3, 3),
     Density(3, 8, 6, 5.4, 5, 2, 2.5, show_analysis=False),
     Density(4, 7.5, 5.6, 5, 4.6, 2, 2, show_analysis=False),
+    Density(5, 7, 5.2, 4.7, 4.4, 1.5, 1.5, show_analysis=False),
+    Density(6, 6.5, 4.9, 4.4, 4.2, 1.5, 1.5, show_analysis=False),
 ]
 FOOT_L = _s("fl", fontSize=6.5, leading=9, textColor=MUTED)
 FOOT_R = _s("fr", fontSize=6.5, leading=9, textColor=MUTED, alignment=TA_RIGHT)
@@ -339,7 +341,10 @@ def build_dashboard(
 
     # What is left for the board once the fixed furniture is laid out.
     fixed = sum(f.wrap(CONTENT_W, PAGE[1])[1] for f in story)
-    available = PAGE[1] - MARGIN - (MARGIN + 22) - fixed - 4
+    # The 10pt slack is deliberate: wrap() measures a shade under what the
+    # frame actually consumes, and a board that measured as fitting and then
+    # rendered onto a second page is the exact failure this is here to prevent.
+    available = PAGE[1] - MARGIN - (MARGIN + 22) - fixed - 14
 
     note_style = _s("nt", fontSize=6.5, leading=9, textColor=MUTED)
 
@@ -358,13 +363,13 @@ def build_dashboard(
             # board fits, and say how many were left off rather than silently
             # cutting or spilling onto a second page.
             den = DENSITIES[-1]
-            keep = len(picks) - den.cols
+            keep = len(picks) - 1
             while keep > 0:
                 candidate = _grid([_card(i, p, den) for i, p in enumerate(picks[:keep], 1)], den)
-                if candidate.wrap(CONTENT_W, PAGE[1])[1] <= available - 14:
+                if candidate.wrap(CONTENT_W, PAGE[1])[1] <= available - 12:
                     grid, omitted = candidate, len(picks) - keep
                     break
-                keep -= den.cols
+                keep -= 1
             if grid is None:
                 grid, omitted = _grid([], den), len(picks)
 

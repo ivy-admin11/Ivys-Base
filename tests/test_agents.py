@@ -752,7 +752,7 @@ class TestSinglePageGuarantee:
             "analysis": "Line opened +9.5 and got bet to +7.<br/>Line: +9.5 -&gt; +7",
         } for i in range(1, n + 1)]
 
-    @pytest.mark.parametrize("n", [1, 6, 12, 18, 24, 32, 48, 80, 150])
+    @pytest.mark.parametrize("n", [1, 6, 12, 18, 24, 28, 32, 40, 48, 56, 80, 150])
     def test_never_more_than_one_page(self, tmp_path, n):
         from pypdf import PdfReader
         from picks_dashboard import build_dashboard
@@ -760,6 +760,16 @@ class TestSinglePageGuarantee:
         build_dashboard(str(out), self._board(n),
                         signal_note="No consensus plays detected.", confidence_label="LOW")
         assert len(PdfReader(str(out)).pages) == 1, f"{n} picks spilled to a second page"
+
+    def test_a_full_saturday_slate_fits_without_truncation(self, tmp_path):
+        """48 picks across every sport is a realistic Saturday. It has to fit
+        whole — truncation is for absurd boards, not for a busy day."""
+        from pypdf import PdfReader
+        from picks_dashboard import build_dashboard
+        out = tmp_path / "slate.pdf"
+        build_dashboard(str(out), self._board(48), signal_note="x", confidence_label="LOW")
+        text = PdfReader(str(out)).pages[0].extract_text()
+        assert "not shown" not in text, "a 48-pick board should not need truncating"
 
     def test_a_small_board_keeps_the_roomy_layout(self):
         """Density must not collapse just because it can — 12 picks is the
