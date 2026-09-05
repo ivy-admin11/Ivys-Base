@@ -116,6 +116,11 @@ SPORT_QUERY = (
 # news reporters who never bet (JeffPassan, DanGrazianoESPN, TalkinBaseball_,
 # MySportsUpdate), and the rest were dormant. These 9 were each confirmed live
 # and posting picks via x_search before inclusion.
+# Coverage varies by handle and by season — ItsCappersPicks posts NCAAF as
+# well as the summer leagues (Henry, 2026-09-05). Before NCAAF was added to
+# SPORT_QUERY those posts were swept up and then dropped on the floor, because
+# the prompt told Grok to focus on the other leagues. To see what each handle
+# is actually posting right now: scripts/vet_x_handles.py --current
 TARGET_X_ACCOUNTS = [
     "MLBHR","KimsPicks", "parlay_bae", "FlamesPickz", "DanGambleAI", "ItsCappersPicks",
     "Picks4Dayzzz", "billhpicks", "MassMoneyline", "PropCaddie", "NBAModel", "Vegasinsider",

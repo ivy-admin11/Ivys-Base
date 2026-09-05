@@ -402,3 +402,39 @@ class TestHandleVetting:
         vet = self._mod()
         overlap = set(vet.CANDIDATES) & set(sports_bettor.TARGET_X_ACCOUNTS)
         assert not overlap, f"already swept: {overlap}"
+
+
+class TestCurrentHandleAudit:
+    """--current answers "does anyone I already follow post <sport>?" without
+    adding anyone. A zero there means quiet, not unusable."""
+
+    @staticmethod
+    def _mod():
+        import importlib.util, pathlib
+        path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "vet_x_handles.py"
+        spec = importlib.util.spec_from_file_location("vet_x_handles_audit", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_audit_wording_does_not_tell_you_to_drop_a_quiet_handle(self, capsys):
+        vet = self._mod()
+        vet.report({"quietOne": []}, auditing=True)
+        out = capsys.readouterr().out
+        assert "do not add" not in out
+        assert "nothing bettable" in out
+
+    def test_audit_summarises_the_leagues_actually_posted(self, capsys):
+        vet = self._mod()
+        vet.report({
+            "ItsCappersPicks": [
+                {"sport": "NCAAF", "matchup": "A @ B", "side": "B +7"},
+                {"sport": "MLB", "matchup": "C @ D", "side": "D ML"},
+            ],
+        }, auditing=True)
+        out = capsys.readouterr().out
+        assert "MLB, NCAAF" in out
+
+    def test_current_flag_targets_the_live_sweep_list(self):
+        vet = self._mod()
+        assert "ItsCappersPicks" in vet.TARGET_X_ACCOUNTS
