@@ -32,6 +32,46 @@ SPREADSHEET_ID = (
 )
 SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 
+# The sheet's column order, in one place.
+#
+# This used to be written down three times and three different ways.
+# scripts/sync_picks_to_sheet.py creates the header below; log_picks_to_sheet
+# appended rows shifted one column right (ReportDate first); and
+# update_result_in_sheet assumed a "Sharps" column that does not exist, so it
+# wrote each grade into FinalScore while get_sheet_summary read grades from
+# Result. The net effect was that a correctly graded pick never showed up as
+# graded -- the dashboard counted it pending forever.
+#
+# Anything that reads or writes this tab derives its indices from here.
+COLUMNS = (
+    "Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence",
+    "GameDay", "StartTime", "ReportDate", "Result", "FinalScore",
+)
+COL = {name: i for i, name in enumerate(COLUMNS)}
+LAST_COLUMN_LETTER = chr(ord("A") + len(COLUMNS) - 1)  # "K"
+
+
+def column_letter(name: str) -> str:
+    """Spreadsheet letter for a named column, e.g. "Result" -> "J"."""
+    return chr(ord("A") + COL[name])
+
+
+def row_for_pick(pick: dict, report_date: str) -> list:
+    """Build one sheet row in COLUMNS order."""
+    return [
+        pick.get("sport", ""),
+        pick.get("matchup", ""),
+        pick.get("side", ""),
+        str(pick.get("odds", "")),
+        pick.get("handicapper", ""),
+        pick.get("confidence", ""),
+        pick.get("game_day", ""),
+        pick.get("start_time", ""),
+        report_date,
+        "",  # Result -- filled in later by update_result_in_sheet
+        "",  # FinalScore
+    ]
+
 
 def _get_sheets_service():
     """Get authenticated Google Sheets API service."""
@@ -76,28 +116,13 @@ def log_picks_to_sheet(picks: list, report_date: str):
     
     try:
         # Prepare rows for the sheet
-        rows = []
-        for pick in picks:
-            row = [
-                report_date,
-                pick.get("sport", ""),
-                pick.get("matchup", ""),
-                pick.get("side", ""),
-                str(pick.get("odds", "")),
-                pick.get("handicapper", ""),
-                pick.get("confidence", ""),
-                pick.get("game_day", ""),
-                pick.get("start_time", ""),
-                "",  # Result (empty for new picks)
-                "",  # Notes
-            ]
-            rows.append(row)
+        rows = [row_for_pick(pick, report_date) for pick in picks]
         
         # Append rows to the sheet
         body = {"values": rows}
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A:K",  # A=Date, B=Sport, C=Matchup, D=Side, E=Odds, F=Handicapper, G=Confidence, H=GameDay, I=StartTime, J=Result, K=Notes
+            range=f"{SHEET_NAME}!A:{LAST_COLUMN_LETTER}",
             valueInputOption="USER_ENTERED",
             body=body,
         ).execute()
@@ -128,22 +153,19 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
         # Read the current sheet to find the matching row
         result_obj = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{export_sheet}'!A:L",
+            range=f"'{export_sheet}'!A:{LAST_COLUMN_LETTER}",
         ).execute()
         
         values = result_obj.get("values", [])
         
-        # Find the matching row
-        # Columns: A=Sport, B=Matchup, C=Side, D=Odds, E=Handicapper, F=Confidence, 
-        #          G=GameDay, H=StartTime, I=ReportDate, J=Sharps, K=Result, L=FinalScore
+        # Find the matching row (indices come from COLUMNS)
         for row_idx, row in enumerate(values[1:], start=2):  # Skip header
             if len(row) >= 3:
-                row_matchup = row[1].lower() if len(row) > 1 else ""
-                row_side = row[2].lower() if len(row) > 2 else ""
+                row_matchup = row[COL["Matchup"]].lower() if len(row) > COL["Matchup"] else ""
+                row_side = row[COL["Side"]].lower() if len(row) > COL["Side"] else ""
                 
                 if row_matchup == matchup.lower() and row_side == side.lower():
-                    # Found matching pick; update result (column K = index 10) and final_score (column L = index 11)
-                    update_range = f"'{export_sheet}'!K{row_idx}"
+                    update_range = f"'{export_sheet}'!{column_letter('Result')}{row_idx}"
                     update_body = {"values": [[result]]}
                     service.spreadsheets().values().update(
                         spreadsheetId=SPREADSHEET_ID,
@@ -153,7 +175,7 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
                     ).execute()
                     
                     if notes:
-                        notes_range = f"'{export_sheet}'!L{row_idx}"
+                        notes_range = f"'{export_sheet}'!{column_letter('FinalScore')}{row_idx}"
                         notes_body = {"values": [[notes]]}
                         service.spreadsheets().values().update(
                             spreadsheetId=SPREADSHEET_ID,
@@ -187,12 +209,13 @@ def get_sheet_summary():
         if not values or len(values) < 2:  # Header + at least one data row
             return None
         
-        # Count results in column J (index 9)
+        # Count results in the Result column
+        result_idx = COL["Result"]
         wins = losses = pushes = pending = 0
         
         for row in values[1:]:  # Skip header
             # Handle rows with fewer columns
-            result = row[9].upper().strip() if len(row) > 9 else ""
+            result = row[result_idx].upper().strip() if len(row) > result_idx else ""
             
             if result == "W":
                 wins += 1
