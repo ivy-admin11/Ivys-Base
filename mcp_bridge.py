@@ -138,6 +138,11 @@ def _forge_wrapper(handle: _ServerHandle, tool: dict[str, Any]) -> Callable[...,
     param_decls: list[str] = []
     arg_doc_lines: list[str] = []
     arg_dict_items: list[str] = []
+    # Schema-declared defaults are handed to exec() through the namespace rather
+    # than repr()'d into the source: repr() of a float NaN/Infinity (which
+    # json.loads happily produces from a JSON schema) is `nan`/`inf`, which is a
+    # NameError at def time and takes the whole server's toolbelt down with it.
+    default_ns: dict[str, Any] = {}
     # Required first so Python signature is legal.
     ordered = sorted(properties.items(), key=lambda kv: (kv[0] not in required, kv[0]))
     for pname, pspec in ordered:
@@ -146,16 +151,20 @@ def _forge_wrapper(handle: _ServerHandle, tool: dict[str, Any]) -> Callable[...,
         if pname in required:
             param_decls.append(f"{pname_safe}: {ptype}")
         else:
-            # An MCP-optional param with no schema-declared default must NOT be
-            # rendered as `name: str = None` — pydantic (used by google-genai to
-            # introspect callables into tool schemas) rejects None as a non-Optional
-            # default and the whole tool gets dropped from Gemini's toolbelt.
-            # Use Optional[T] = None and filter None on dispatch.
+            # An MCP-optional param must NOT be rendered as `name: str = None` —
+            # pydantic (used by google-genai to introspect callables into tool
+            # schemas) rejects None as a non-Optional default and the whole tool
+            # gets dropped from Gemini's toolbelt. Use Optional[T] = None and
+            # filter None on dispatch. A schema that spells the default out as
+            # an explicit JSON `null` means exactly the same thing as omitting
+            # it, so it has to take the same branch.
             default = (pspec or {}).get("default", _NO_DEFAULT)
-            if default is _NO_DEFAULT:
+            if default is _NO_DEFAULT or default is None:
                 param_decls.append(f"{pname_safe}: Optional[{ptype}] = None")
             else:
-                param_decls.append(f"{pname_safe}: {ptype} = {default!r}")
+                dref = f"_default_{pname_safe}"
+                default_ns[dref] = default
+                param_decls.append(f"{pname_safe}: {ptype} = {dref}")
         desc = (pspec or {}).get("description", "")
         arg_doc_lines.append(f"        {pname_safe}: {desc}".rstrip())
         arg_dict_items.append(f"{pname!r}: {pname_safe}")
@@ -163,21 +172,23 @@ def _forge_wrapper(handle: _ServerHandle, tool: dict[str, Any]) -> Callable[...,
     docstring = (tool.get("description") or f"MCP tool {name}.").strip()
     if arg_doc_lines:
         docstring += "\n\n    Args:\n" + "\n".join(arg_doc_lines)
-    # Escape triple-quotes defensively before splicing into source.
-    docstring_safe = docstring.replace('"""', '\\"\\"\\"').rstrip("\\")
-    # rstrip: a description ending in a backslash would escape the closing
-    # delimiter and swallow the generated function body into the docstring.
 
+    # The docstring is assigned after exec() instead of being spliced into the
+    # generated source. Descriptions are arbitrary text chosen by a third-party
+    # MCP server: one ending in `"`, or containing any backslash escape
+    # (`\x`, `\u`, a Windows path), makes the generated module a SyntaxError,
+    # and register_mcp_server would then lose *every* tool on that server, not
+    # just the one with the awkward description.
     src = (
         f"def {name}({', '.join(param_decls)}) -> str:\n"
-        f'    """{docstring_safe}"""\n'
         f"    _args = {{{', '.join(arg_dict_items)}}}\n"
         f"    _args = {{_k: _v for _k, _v in _args.items() if _v is not None}}\n"
         f"    return _handle.call({name!r}, _args)\n"
     )
-    ns: dict[str, Any] = {"_handle": handle, "Optional": Optional}
+    ns: dict[str, Any] = {"_handle": handle, "Optional": Optional, **default_ns}
     exec(src, ns)
     fn = ns[name]
+    fn.__doc__ = docstring
     fn.__module__ = "mcp_bridge"
     fn._mcp_raw = tool
     return fn

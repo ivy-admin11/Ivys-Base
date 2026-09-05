@@ -11,7 +11,8 @@ Effort: ~200 lines of reportlab code. Dependencies already in requirements.txt.
 import os
 import tempfile
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
+from xml.sax.saxutils import escape as _xml_escape
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -21,6 +22,26 @@ from reportlab.platypus import (
     SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 )
 from reportlab.lib.enums import TA_CENTER
+
+
+#: Left/right page margin used by every report (and the basis for the usable
+#: text width that column widths are fitted to).
+MARGIN = 0.75 * inch
+
+
+def _esc(value: Any) -> str:
+    """Make caller-supplied text safe for a reportlab ``Paragraph``.
+
+    ``Paragraph`` parses its text as mini-HTML, so raw ``&``/``<``/``>`` in a
+    venue name, team name or X handle either raises ``ValueError`` ("unclosed
+    tags") or silently swallows everything that looks like a tag — a real
+    "Bar & Grill <Wings>" lost its "<Wings>" before this existed. ``None`` is
+    also normalised to an empty string so a missing odds field does not print
+    the literal word "None".
+    """
+    if value is None:
+        return ""
+    return _xml_escape(str(value))
 
 
 class PicksReportFormatter:
@@ -90,8 +111,10 @@ class PicksReportFormatter:
             headers: Optional column header labels (defaults to the sports-report
                 labels); pass domain-appropriate labels for non-sports callers.
                 Must have the same length as `fields`.
-            col_widths: Optional column widths in inches (must sum to <= 6.5in
-                given the 0.75in margins); defaults to the sports-report widths.
+            col_widths: Optional column widths in inches. The usable text width
+                is 7.0in (letter minus the 0.75in margins); widths that sum to
+                more than that are scaled down proportionally to fit rather than
+                spilling past the right margin. Defaults to the sports-report widths.
             fields: Optional list of pick dict keys, in column order (defaults to
                 the 5 sports-report keys). Lets a caller add/reorder columns —
                 e.g. a "when" column for game date/time — as long as `headers`
@@ -108,6 +131,14 @@ class PicksReportFormatter:
         headers = headers or ["Sport", "Matchup", "Side", "Odds", "Reasoning"]
         col_widths = col_widths or [0.8, 2.0, 1.0, 0.9, 2.8]
         fields = fields or ["sport", "matchup", "side", "odds", "reasoning"]
+
+        # Usable text width between the margins set on the doc below. Column
+        # widths that sum to more than this used to be drawn anyway, spilling
+        # the last column into (and past) the right margin.
+        frame_width = letter[0] - 2 * MARGIN
+        scale = min(1.0, frame_width / (sum(col_widths) * inch)) if sum(col_widths) > 0 else 1.0
+        scaled_col_widths = [w * inch * scale for w in col_widths]
+
         cell_style = ParagraphStyle(
             "TableCell", parent=getSampleStyleSheet()["Normal"], fontSize=8, leading=10,
         )
@@ -116,13 +147,16 @@ class PicksReportFormatter:
             fontSize=9, leading=11, textColor=white, fontName="Helvetica-Bold",
         )
 
-        def _row(cells: List[str]) -> List[Paragraph]:
-            return [Paragraph(str(c), cell_style) for c in cells]
+        def _row(cells: List[Any]) -> List[Paragraph]:
+            return [Paragraph(_esc(c), cell_style) for c in cells]
+
+        def _header_row() -> List[Paragraph]:
+            return [Paragraph(_esc(h), header_style) for h in headers]
         doc = SimpleDocTemplate(
             filename,
             pagesize=letter,
-            rightMargin=0.75 * inch,
-            leftMargin=0.75 * inch,
+            rightMargin=MARGIN,
+            leftMargin=MARGIN,
             topMargin=0.5 * inch,
             bottomMargin=0.5 * inch,
         )
@@ -140,7 +174,7 @@ class PicksReportFormatter:
             alignment=TA_CENTER,
             fontName="Helvetica-Bold",
         )
-        story.append(Paragraph(self.title, title_style))
+        story.append(Paragraph(_esc(self.title), title_style))
 
         subtitle_style = ParagraphStyle(
             "CustomSubtitle",
@@ -151,10 +185,10 @@ class PicksReportFormatter:
             alignment=TA_CENTER,
             fontName="Helvetica",
         )
-        story.append(Paragraph(self.subtitle, subtitle_style))
+        story.append(Paragraph(_esc(self.subtitle), subtitle_style))
 
         # Divider line
-        divider_table = Table([["" * 80]], colWidths=[7.5 * inch])
+        divider_table = Table([[""]], colWidths=[frame_width])
         divider_table.setStyle(
             TableStyle([("LINEBELOW", (0, 0), (-1, -1), 2, self.theme["header"])])
         )
@@ -169,7 +203,7 @@ class PicksReportFormatter:
             leading=14,
             spaceAfter=0.15 * inch,
         )
-        story.append(Paragraph(summary, summary_style))
+        story.append(Paragraph(_esc(summary), summary_style))
         story.append(Spacer(1, 0.15 * inch))
 
         heading_style = ParagraphStyle(
@@ -183,17 +217,20 @@ class PicksReportFormatter:
 
         # ====== CONSENSUS PICKS TABLE ======
         if consensus_picks:
-            story.append(Paragraph(consensus_heading, heading_style))
+            story.append(Paragraph(_esc(consensus_heading), heading_style))
 
-            consensus_table_data = [_row(headers)]
+            # Header row keeps the bold/white header style regardless of _row's default.
+            consensus_table_data = [_header_row()]
             for pick in consensus_picks:
                 consensus_table_data.append(_row([pick.get(f, "") for f in fields]))
-            # Header row keeps the bold/white header style regardless of _row's default.
-            consensus_table_data[0] = [Paragraph(str(h), header_style) for h in headers]
 
             consensus_table = Table(
                 consensus_table_data,
-                colWidths=[w * inch for w in col_widths],
+                colWidths=scaled_col_widths,
+                # Repeat the header on every page the table spills onto, and let
+                # an over-tall single row split instead of raising LayoutError.
+                repeatRows=1,
+                splitInRow=1,
             )
             consensus_table.setStyle(
                 TableStyle(
@@ -215,15 +252,17 @@ class PicksReportFormatter:
 
         # ====== OTHER PICKS TABLE ======
         if other_picks:
-            story.append(Paragraph(other_heading, heading_style))
+            story.append(Paragraph(_esc(other_heading), heading_style))
 
-            other_table_data = [[Paragraph(str(h), header_style) for h in headers]]
+            other_table_data = [_header_row()]
             for pick in other_picks:
                 other_table_data.append(_row([pick.get(f, "") for f in fields]))
 
             other_table = Table(
                 other_table_data,
-                colWidths=[w * inch for w in col_widths],
+                colWidths=scaled_col_widths,
+                repeatRows=1,
+                splitInRow=1,
             )
             other_table.setStyle(
                 TableStyle(
@@ -244,13 +283,18 @@ class PicksReportFormatter:
 
         # ====== FOOTER ======
         if metadata:
+            def _meta(key: str, default: str) -> str:
+                # ``or default`` and not ``.get(key, default)``: an explicit
+                # None used to render the literal word "None" in the footer.
+                return _esc(metadata.get(key) or default)
+
             footer_text = (
-                f"Generated {metadata.get('timestamp', 'N/A')} • "
+                f"Generated {_meta('timestamp', 'N/A')} • "
                 # Rendered verbatim: every caller passes a full phrase
                 # ("12 picks from 3 handicappers"), so appending a unit here
                 # produced "... (2 consensus) pick(s)".
-                f"{metadata.get('pick_count', 'no picks')} • "
-                f"Source: {metadata.get('source', 'Ivy')} • "
+                f"{_meta('pick_count', 'no picks')} • "
+                f"Source: {_meta('source', 'Ivy')} • "
                 "For entertainment purposes only."
             )
         else:

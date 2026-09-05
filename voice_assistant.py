@@ -23,6 +23,14 @@ except ImportError:
 
 logger = logging.getLogger("ivy.voice")
 
+# Only the last few messages are ever read back (get_context slices to
+# MAX_CONTEXT_MESSAGES), but a session that keeps being used keeps refreshing
+# last_activity, so it never expires and never gets swept by the manager's
+# cleanup. Without a cap its history is a permanent, unbounded leak in a
+# long-lived server process.
+MAX_SESSION_MESSAGES = 50
+MAX_CONTEXT_MESSAGES = 5
+
 
 class SessionState(str, Enum):
     """Voice session lifecycle states."""
@@ -59,12 +67,18 @@ class VoiceSession:
         return (datetime.now() - self.last_activity).total_seconds() > self.ttl_seconds
 
     def add_message(self, role: str, content: str) -> None:
-        """Add message to conversation history."""
+        """Add message to conversation history.
+
+        History is trimmed to the newest MAX_SESSION_MESSAGES entries — see the
+        constant for why an unbounded list is a leak here.
+        """
         self.messages.append({
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat()
         })
+        if len(self.messages) > MAX_SESSION_MESSAGES:
+            del self.messages[:-MAX_SESSION_MESSAGES]
         self.last_activity = datetime.now()
 
     def get_context(self) -> str:
@@ -73,7 +87,7 @@ class VoiceSession:
             return ""
 
         formatted = []
-        for msg in self.messages[-5:]:  # Last 5 messages for context window
+        for msg in self.messages[-MAX_CONTEXT_MESSAGES:]:
             formatted.append(f"{msg['role'].upper()}: {msg['content']}")
         return "\n".join(formatted)
 
@@ -167,7 +181,14 @@ class VoiceSessionManager:
         self._cleanup_expired_sessions()
 
         total_sessions = len(self.sessions)
-        active_sessions = sum(1 for s in self.sessions.values() if s.state == SessionState.ACTIVE)
+        # Cleanup is rate-limited, so an expired session can still be sitting in
+        # self.sessions. get_session/get_user_session already refuse to hand one
+        # back, so counting it here would report sessions as active that no
+        # caller can actually use.
+        active_sessions = sum(
+            1 for s in self.sessions.values()
+            if s.state == SessionState.ACTIVE and not s.is_expired()
+        )
         total_queries = sum(s.total_queries for s in self.sessions.values())
         total_cache_hits = sum(s.cache_hits for s in self.sessions.values())
         cache_hit_rate = (total_cache_hits / total_queries * 100) if total_queries > 0 else 0

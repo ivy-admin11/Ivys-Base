@@ -4,6 +4,7 @@ Trigger script: Ivy capabilities summary to Henry via iMessage
 Fetches all available tools/skills and sends a formatted summary to Henry.
 """
 
+import argparse
 import os
 import sys
 import logging
@@ -36,6 +37,34 @@ logging.basicConfig(
 logger = logging.getLogger("ivy.capabilities_alert")
 
 
+# Statuses this alert knows how to bucket. Anything else still has to reach
+# Henry — a tool that vanishes from the message but stays in the denominator
+# reads as "8/9 ready" with no way to tell which one is missing or why.
+KNOWN_STATUSES = ("ready", "unavailable", "disabled")
+
+_REASON_LIMIT = 30
+
+
+def _tool_name(tool: dict) -> str:
+    return str(tool.get("tool_name") or "unknown")
+
+
+def _reason_text(tool: dict, limit: int = _REASON_LIMIT) -> str:
+    """Short, printable reason for a tool's status.
+
+    compute_tool_statuses() uses ``reason: None`` for tools that have nothing to
+    explain, so this must never assume a string. It also only marks the text as
+    truncated when it actually truncated it.
+    """
+    reason = tool.get("reason")
+    text = str(reason).strip() if reason is not None else ""
+    if not text:
+        text = "Unknown"
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
 def format_capabilities_alert() -> str:
     """
     Format tool capabilities into ultra-condensed SMS text.
@@ -48,9 +77,10 @@ def format_capabilities_alert() -> str:
     tool_statuses = compute_tool_statuses()
 
     # Separate by status
-    ready_tools = [t for t in tool_statuses if t["status"] == "ready"]
-    unavailable_tools = [t for t in tool_statuses if t["status"] == "unavailable"]
-    disabled_tools = [t for t in tool_statuses if t["status"] == "disabled"]
+    ready_tools = [t for t in tool_statuses if t.get("status") == "ready"]
+    unavailable_tools = [t for t in tool_statuses if t.get("status") == "unavailable"]
+    disabled_tools = [t for t in tool_statuses if t.get("status") == "disabled"]
+    other_tools = [t for t in tool_statuses if t.get("status") not in KNOWN_STATUSES]
 
     # Build SMS-friendly format
     lines = [
@@ -61,29 +91,34 @@ def format_capabilities_alert() -> str:
 
     # Add ready tools
     for tool in ready_tools:
-        name = tool["tool_name"]
-        lines.append(f"  • {name}")
+        lines.append(f"  • {_tool_name(tool)}")
 
     # Add unavailable if any
     if unavailable_tools:
         lines.append(f"\n❌ UNAVAILABLE ({len(unavailable_tools)}):")
         for tool in unavailable_tools:
-            name = tool["tool_name"]
-            reason = tool.get("reason", "Unknown")
-            lines.append(f"  • {name} ({reason[:30]}...)")
+            lines.append(f"  • {_tool_name(tool)} ({_reason_text(tool)})")
 
     # Add disabled if any
     if disabled_tools:
         lines.append(f"\n⊘ DISABLED ({len(disabled_tools)}):")
         for tool in disabled_tools:
-            name = tool["tool_name"]
-            lines.append(f"  • {name}")
+            lines.append(f"  • {_tool_name(tool)}")
+
+    # Anything with an unrecognised status still gets named, not dropped.
+    if other_tools:
+        lines.append(f"\n⚠️ OTHER ({len(other_tools)}):")
+        for tool in other_tools:
+            status = str(tool.get("status") or "unknown")
+            lines.append(f"  • {_tool_name(tool)} [{status}] ({_reason_text(tool)})")
 
     # Add summary
     total_ready = len(ready_tools)
     total_tools = len(tool_statuses)
     lines.append(f"\n📊 {total_ready}/{total_tools} tools ready")
-    lines.append(f"⏱️ Generated: {datetime.now().strftime('%I:%M %p CST')}")
+    # Label the timestamp with the timezone this machine is actually in; the
+    # old hardcoded "CST" was wrong for half the year and on any other host.
+    lines.append(f"⏱️ Generated: {datetime.now().astimezone().strftime('%I:%M %p %Z')}")
 
     alert_text = "\n".join(lines)
 
@@ -167,14 +202,11 @@ def main(dry_run: bool = False) -> int:
         return 1
 
 
-if __name__ == "__main__":
-    import argparse
-
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Trigger Ivy capabilities alert to Henry")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        default=True,
         help="Dry-run mode (print alert, don't send)"
     )
     parser.add_argument(
@@ -182,8 +214,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Actually send the alert via iMessage"
     )
+    return parser
 
-    args = parser.parse_args()
-    dry_run = not args.send
 
-    sys.exit(main(dry_run=dry_run))
+def resolve_dry_run(args: argparse.Namespace) -> bool:
+    """Dry-run unless --send was passed, and always dry-run if --dry-run was.
+
+    --dry-run used to be declared with default=True, which made args.dry_run
+    constant and the flag dead: `--dry-run --send` sent a real iMessage.
+    An explicit --dry-run now wins over --send.
+    """
+    if getattr(args, "dry_run", False):
+        return True
+    return not getattr(args, "send", False)
+
+
+if __name__ == "__main__":
+    cli_args = build_parser().parse_args()
+    sys.exit(main(dry_run=resolve_dry_run(cli_args)))
