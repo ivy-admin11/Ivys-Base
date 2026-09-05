@@ -96,9 +96,8 @@
       <div class="card live"><span class="tag">live</span><h3>✅ Reminders (read/write)</h3><p>Reads lists &amp; adds tasks/groceries with quantities.</p></div>
       <div class="card live"><span class="tag">live</span><h3>📚 Readwise</h3><p>Fetches saved highlights (async httpx).</p></div>
       <div class="card live"><span class="tag">live</span><h3>💬 iMessage send</h3><p>Outbound replies via AppleScript (quote-escaped).</p></div>
-      <div class="card blocked"><span class="tag">blocked</span><h3>🛒 Grocery staging</h3><p>Playwright cart-builder, hard checkout-block. Code done, but HEB &amp; Kroger bot-wall all automation.</p></div>
     </div>
-    <div class="note"><b>Grocery note:</b> the <span class="pill">/stage_groceries</span> flow is fully built and safe (never checks out), but HEB serves a bot block page and Kroger drops the connection at the TLS/HTTP-2 layer. Neither store is automatable from this machine — use the store app for the actual cart.</div>
+    <div class="note"><b>Removed 2026-09-05:</b> grocery cart automation. Both retailers bot-walled it, nothing had called it in months, and it was the only reason four retail passwords sat in <span class="pill">.env</span>. Grocery <em>lists</em> still work — they go to Apple Reminders.</div>
   </div>
   <div class="arrow">▼</div>
 
@@ -118,7 +117,6 @@
         <div class="card live"><span class="tag">llms</span><h3>🧠 LLMs</h3><p>Gemini 2.5 Flash (primary) · DeepSeek (failover) · Grok/xAI grok-4.3 (sports).</p></div>
         <div class="card live"><span class="tag">data</span><h3>🍎 Apple / macOS</h3><p>Calendar · Reminders · Messages &amp; chat.db (via AppleScript + SQLite).</p></div>
         <div class="card live"><span class="tag">apis</span><h3>🌐 Web APIs</h3><p>Readwise · The Odds API · X (via Grok) · Google Docs/Slides (config).</p></div>
-        <div class="card blocked"><span class="tag">blocked</span><h3>🛒 Grocery sites</h3><p>HEB · Kroger — Akamai bot walls block automation.</p></div>
       </div>
     </div>
   </div>

@@ -139,3 +139,43 @@ def test_contacts_come_from_the_environment_when_set(tmp_path):
     })
     assert res.returncode == 0, res.stderr
     assert res.stdout.strip() == "+15555550100"
+
+
+def test_grocery_automation_stays_deleted():
+    """H-E-B and Kroger cart automation was removed on 2026-09-05: both
+    retailers bot-walled it, no code path had called it in months, and it was
+    the sole reason four retail passwords sat in .env. This guards the removal
+    the way CI guards committed secrets — the credentials only come back if the
+    code that wants them does.
+
+    Grocery *lists* are unaffected: those go to Apple Reminders, and the word
+    "grocery" is allowed in that context.
+    """
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
+
+    # Code and configuration only. Documentation that *records* the removal is
+    # not a regression, and this file necessarily names what it forbids.
+    scanned = {".py", ".json", ".yml", ".yaml", ".sh", ".txt", ".template", ".example"}
+    offenders = []
+    for rel in tracked:
+        if not rel or rel == "tests/test_config.py":
+            continue
+        path = root / rel
+        if not path.is_file() or path.suffix not in scanned:
+            continue
+        try:
+            text = path.read_text(errors="ignore").lower()
+        except OSError:
+            continue
+        for needle in ("kroger", "heb_username", "heb_password", "store_configs",
+                       "playwright", "stage_groceries"):
+            if needle in text:
+                offenders.append(f"{rel}: {needle}")
+
+    assert not offenders, "grocery automation is back: " + "; ".join(offenders)

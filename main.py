@@ -60,15 +60,12 @@ from config import (
     HENRY_PHONE,
     ENABLE_REMINDERS_INTEGRATION,
     ENABLE_READWISE_INTEGRATION,
-    PLAYWRIGHT_ENABLED,
     ADMIN_SECRET,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
     READWISE_API_ENDPOINT,
     READWISE_HIGHLIGHTS_LIMIT,
     READWISE_TOKEN_OPTIMIZATION_MAX_CHARS,
-    STORE_CONFIG_PATH,
-    STORE_CONFIG_FALLBACKS,
     LOG_LEVEL,
     LOG_FORMAT,
     ENABLE_PROMPT_CACHING,
@@ -126,15 +123,6 @@ logging.basicConfig(
     format=LOG_FORMAT,
 )
 logger = logging.getLogger("ivy.gateway")
-
-# 🛡️ Guarded Playwright import (grocery staging removed)
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = PLAYWRIGHT_ENABLED
-except ImportError:
-    async_playwright = None
-    PLAYWRIGHT_AVAILABLE = False
-    logger.info("Playwright not available (optional — grocery staging removed)")
 
 # ============================================================================
 # GEMINI SDK CONFIGURATION
@@ -1176,28 +1164,6 @@ def get_last_message_id() -> Optional[int]:
 # ============================================================================
 
 
-def load_store_configs() -> Dict[str, Dict[str, str]]:
-    """Load store selectors from store_configs.json, with fallbacks."""
-    if os.path.exists(STORE_CONFIG_PATH):
-        try:
-            with open(STORE_CONFIG_PATH, "r") as f:
-                data = json.load(f)
-            merged = {}
-            for store, fallback in STORE_CONFIG_FALLBACKS.items():
-                cfg = dict(fallback)
-                cfg.update(data.get(store, {}))
-                merged[store] = cfg
-            # Allow stores defined only in the file
-            for store, cfg in data.items():
-                if store not in merged:
-                    merged[store] = cfg
-            return merged
-        except Exception as cfg_err:
-            logger.warning(
-                "Failed to parse store_configs.json (%s) — using hardcoded fallbacks.",
-                cfg_err,
-            )
-    return {k: dict(v) for k, v in STORE_CONFIG_FALLBACKS.items()}
 
 
 # ============================================================================

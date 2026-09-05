@@ -40,10 +40,6 @@ security add-generic-password -s "ivy-gemini-key" -a "admin" -w "your_actual_api
 
 # Store DeepSeek key
 security add-generic-password -s "ivy-deepseek-key" -a "admin" -w "your_actual_deepseek_key_here"
-
-# Store H-E-B credentials
-security add-generic-password -s "ivy-heb-username" -a "admin" -w "your_heb_email@example.com"
-security add-generic-password -s "ivy-heb-password" -a "admin" -w "your_heb_password"
 ```
 
 **Retrieve in Python:**
@@ -67,8 +63,6 @@ def get_keychain_secret(service: str, account: str = "admin") -> str:
 # In your .env or startup:
 os.environ["GEMINI_API_KEY"] = get_keychain_secret("ivy-gemini-key")
 os.environ["DEEPSEEK_API_KEY"] = get_keychain_secret("ivy-deepseek-key")
-os.environ["HEB_USERNAME"] = get_keychain_secret("ivy-heb-username")
-os.environ["HEB_PASSWORD"] = get_keychain_secret("ivy-heb-password")
 ```
 
 **File: `.gitignore` — already exclude `.env`:**
@@ -102,7 +96,6 @@ discord_backup_codes.txt
 3. **Add secrets as items:**
    - GEMINI_API_KEY
    - DEEPSEEK_API_KEY
-   - HEB_USERNAME / HEB_PASSWORD
    - READWISE_API_KEY
    - ADMIN_SECRET
 
@@ -228,8 +221,6 @@ Given your current setup (local Mac development), here's the **ideal workflow:**
    # .env.local — NOT committed to git
    # Retrieve these from Keychain on startup
    CHAT_DB_PATH=/Users/lexi/Library/Messages/chat.db
-   HEB_USERNAME=your_heb_email@example.com
-   HEB_PASSWORD=from_keychain
    READWISE_API_KEY=from_keychain
    ```
 

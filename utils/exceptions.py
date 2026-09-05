@@ -33,13 +33,6 @@ class AuthenticationError(IvyError):
     status_code = 401
 
 
-class GroceryServiceError(IvyError):
-    """Raised when the grocery staging pipeline fails."""
-
-    error_code = "grocery_service_error"
-    status_code = 502
-
-
 class ExternalServiceError(IvyError):
     """Raised when an upstream dependency (LLM, Readwise, etc.) fails."""
 

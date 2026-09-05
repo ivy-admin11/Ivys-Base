@@ -8,7 +8,6 @@ This file is environment-agnostic; environment-specific secrets should go in .en
 
 import os
 from pathlib import Path
-from typing import Dict
 
 from dotenv import load_dotenv
 
@@ -50,9 +49,6 @@ CHAT_DB_PATH: str = os.path.expanduser(
 EXTERNAL_API_TIMEOUT: int = int(os.environ.get("EXTERNAL_API_TIMEOUT", "20"))
 """Timeout for external API calls (requests, Readwise, etc.) in seconds"""
 
-PLAYWRIGHT_TIMEOUT_MS: int = 10000
-"""Playwright step timeout in milliseconds"""
-
 API_RATE_LIMIT: int = int(os.environ.get("API_RATE_LIMIT", "100"))
 """Maximum requests per minute (for future rate limiting)"""
 
@@ -63,9 +59,6 @@ API_RATE_LIMIT: int = int(os.environ.get("API_RATE_LIMIT", "100"))
 ENABLE_IMESSAGE_POLLER: bool = os.environ.get("ENABLE_IMESSAGE_POLLER", "true").lower() == "true"
 """Enable/disable background iMessage polling thread"""
 
-ENABLE_GROCERY_STAGING: bool = os.environ.get("ENABLE_GROCERY_STAGING", "true").lower() == "true"
-"""Enable/disable /stage_groceries endpoint"""
-
 ENABLE_CALENDAR_INTEGRATION: bool = os.environ.get("ENABLE_CALENDAR_INTEGRATION", "true").lower() == "true"
 """Enable/disable check_apple_calendar tool"""
 
@@ -74,12 +67,6 @@ ENABLE_REMINDERS_INTEGRATION: bool = os.environ.get("ENABLE_REMINDERS_INTEGRATIO
 
 ENABLE_READWISE_INTEGRATION: bool = os.environ.get("ENABLE_READWISE_INTEGRATION", "true").lower() == "true"
 """Enable/disable Readwise integration"""
-
-PLAYWRIGHT_ENABLED: bool = os.environ.get("PLAYWRIGHT_ENABLED", "true").lower() == "true"
-"""Enable/disable Playwright browser automation"""
-
-PLAYWRIGHT_HEADLESS: bool = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
-"""Run Playwright in headless mode (no window)"""
 
 ENABLE_SPORTS_PICKS: bool = os.environ.get("ENABLE_SPORTS_PICKS", "true").lower() == "true"
 """Enable/disable the Sharp Picks sports-betting job/tool"""
@@ -241,40 +228,6 @@ READWISE_HIGHLIGHTS_LIMIT: int = 15
 
 READWISE_TOKEN_OPTIMIZATION_MAX_CHARS: int = 3000
 """Maximum character length for optimized Readwise payload"""
-
-# ============================================================================
-# GROCERY STORE CONFIGURATIONS
-# ============================================================================
-
-STORE_CONFIG_PATH: str = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "store_configs.json"
-)
-"""Path to store_configs.json for Playwright selectors"""
-
-STORE_CONFIG_FALLBACKS: Dict[str, Dict[str, str]] = {
-    "HEB": {
-        "login_url": "https://www.heb.com/login",
-        "username_selector": "input[name='email']",
-        "password_selector": "input[name='password']",
-        "search_selector": "input[id='search-field']",
-        "search_button_selector": "button[aria-label='Search']",
-        "first_result_selector": "[data-qe-id='productCard']:first-of-type",
-        "add_to_cart_selector": "[data-qe-id='productCard']:first-of-type button[aria-label*='Add']",
-        "cart_confirmation_selector": "[data-qe-id='cartItemCount']",
-    },
-    "Kroger": {
-        "login_url": "https://www.kroger.com/signin",
-        "username_selector": "input[id='SignIn-emailInput']",
-        "password_selector": "input[id='SignIn-passwordInput']",
-        "search_selector": "input[id='SearchBar-input']",
-        "search_button_selector": "button[id='SearchBar-submit']",
-        "first_result_selector": "[data-testid='ProductCard']:first-of-type",
-        "add_to_cart_selector": "[data-testid='ProductCard']:first-of-type button[data-testid='AddToCart']",
-        "cart_confirmation_selector": "[data-testid='CartIcon-quantity']",
-    },
-}
-"""Fallback CSS selectors for grocery store automation (used if store_configs.json missing)"""
 
 # ============================================================================
 # LOGGING
