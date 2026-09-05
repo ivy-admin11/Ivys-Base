@@ -5,6 +5,7 @@ in a shared spreadsheet for easy viewing and analysis.
 """
 
 import os
+import re
 import logging
 from pathlib import Path
 from typing import Optional
@@ -25,13 +26,42 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # .env.example has documented SPORTS_DASHBOARD_SPREADSHEET_ID and
 # GOOGLE_SHEET_ID since the pipeline was written, but both modules that
 # talk to Sheets hardcoded the ID instead, so setting either variable did
-# nothing. Env now wins; the literal stays as the default so an unset
-# environment behaves exactly as before.
-SPREADSHEET_ID = (
-    os.getenv("SPORTS_DASHBOARD_SPREADSHEET_ID")
-    or os.getenv("GOOGLE_SHEET_ID")
-    or "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
-)
+# nothing. Env now wins -- but only after being normalised, because one of
+# those variables holds a pasted browser URL rather than an id, and feeding
+# that to the API returns a 404 that reads like a permissions failure.
+def _spreadsheet_id(raw: Optional[str]) -> str:
+    """Normalise whatever is configured into a bare spreadsheet id.
+
+    People paste the URL out of the browser, because that is what a
+    spreadsheet looks like when you are looking at one. The API wants only the
+    id from the middle of it, and handed a URL it returns 404 "Requested
+    entity was not found" -- which reads like a permissions problem and sent
+    this exact bug looking in the wrong place for a while.
+
+    Accepts a full edit URL, a bare id, or either with stray quotes.
+    """
+    if not raw:
+        return ""
+    value = raw.strip().strip("'\"").strip()
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    # A bare id, or something unusable -- return it and let the API complain
+    # about a value the operator will recognise.
+    return value
+
+
+def _configured_spreadsheet_id() -> str:
+    """First configured value that yields a usable id; else the known sheet."""
+    for name in ("SPORTS_DASHBOARD_SPREADSHEET_ID", "GOOGLE_SHEET_ID"):
+        candidate = _spreadsheet_id(os.getenv(name))
+        # A real id has no scheme and no path separators left in it.
+        if candidate and "/" not in candidate and not candidate.startswith("http"):
+            return candidate
+    return "1vxdAfvLyu3o3N-suV1qxX6KWbYZyCiQvNcYdOxePoHQ"
+
+
+SPREADSHEET_ID = _configured_spreadsheet_id()
 SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 
 # The sheet's column order, in one place.
@@ -45,9 +75,15 @@ SHEET_NAME = "Sharp Picks"  # Dedicated tab for picks tracking
 # graded -- the dashboard counted it pending forever.
 #
 # Anything that reads or writes this tab derives its indices from here.
+# Two layouts were genuinely in use: scripts/sync_picks_to_sheet.py wrote
+# eleven columns, and picks_tracker.auto_sync_to_export_sheet -- which runs
+# after every save_picks, so it touches the live sheet far more often -- wrote
+# twelve, the extra one being Sharps, the consensus count. That is the number
+# the whole "2+ sharps agreeing" threshold is about, so the twelve-column
+# layout is the one worth keeping and every writer now derives from it.
 COLUMNS = (
     "Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence",
-    "GameDay", "StartTime", "ReportDate", "Result", "FinalScore",
+    "GameDay", "StartTime", "ReportDate", "Sharps", "Result", "FinalScore",
 )
 COL = {name: i for i, name in enumerate(COLUMNS)}
 LAST_COLUMN_LETTER = chr(ord("A") + len(COLUMNS) - 1)  # "K"
@@ -58,18 +94,32 @@ def column_letter(name: str) -> str:
     return chr(ord("A") + COL[name])
 
 
+def sharp_count(pick: dict) -> int:
+    """How many handicappers back this pick.
+
+    Mirrors what picks_tracker.save_picks stores, so the sheet and the
+    database cannot disagree about a pick's consensus.
+    """
+    backers = pick.get("handicappers") or pick.get("handicapper")
+    if isinstance(backers, list):
+        return len(backers)
+    return 1 if backers else 0
+
+
 def row_for_pick(pick: dict, report_date: str) -> list:
     """Build one sheet row in COLUMNS order."""
+    backers = pick.get("handicappers") or pick.get("handicapper") or ""
     return [
         pick.get("sport", ""),
         pick.get("matchup", ""),
         pick.get("side", ""),
         str(pick.get("odds", "")),
-        pick.get("handicapper", ""),
+        ", ".join(backers) if isinstance(backers, list) else backers,
         pick.get("confidence", ""),
         pick.get("game_day", ""),
-        pick.get("start_time", ""),
+        pick.get("start_time") or pick.get("start") or "",
         report_date,
+        str(sharp_count(pick)),
         "",  # Result -- filled in later by update_result_in_sheet
         "",  # FinalScore
     ]

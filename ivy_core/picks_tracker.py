@@ -348,7 +348,7 @@ def auto_sync_to_export_sheet():
         service = _get_sheets_service()
         if not service:
             logger.debug("Skipping auto-sync to export sheet: no Google Sheets access")
-            return
+            return False
         
         # Single source of truth; see sheets_logger for why this is not a
         # literal any more.
@@ -365,7 +365,7 @@ def auto_sync_to_export_sheet():
         
         if not target_sheet_name:
             logger.debug(f"Target sheet (gid={TARGET_SHEET_GID}) not found for export")
-            return
+            return False
         
         # Get all picks from database
         conn = sqlite3.connect(PICKS_DB)
@@ -396,7 +396,8 @@ def auto_sync_to_export_sheet():
         
         # Format for sheet
         rows = []
-        header = ["Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence", "GameDay", "StartTime", "ReportDate", "Sharps", "Result", "FinalScore"]
+        from ivy_core.sheets_logger import COLUMNS, LAST_COLUMN_LETTER
+        header = list(COLUMNS)
         
         for pick in picks:
             row = [
@@ -421,13 +422,13 @@ def auto_sync_to_export_sheet():
         # Initialize header if empty
         current = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"{target_sheet_name}!A1:L1"
+            range=f"{target_sheet_name}!A1:{LAST_COLUMN_LETTER}1"
         ).execute()
         
         if not current.get('values'):
             service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{target_sheet_name}!A1:L1",
+                range=f"{target_sheet_name}!A1:{LAST_COLUMN_LETTER}1",
                 valueInputOption="USER_ENTERED",
                 body={"values": [header]}
             ).execute()
@@ -435,11 +436,16 @@ def auto_sync_to_export_sheet():
         if rows:
             service.spreadsheets().values().append(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"{target_sheet_name}!A2:L",
+                range=f"{target_sheet_name}!A2:{LAST_COLUMN_LETTER}",
                 valueInputOption="USER_ENTERED",
                 body={"values": rows}
             ).execute()
         
         logger.info(f"Auto-synced {len(picks)} picks to export sheet (append-only mode)")
+        return True
     except Exception as e:
+        # Returned, not just logged: a caller that reports "sheet updated"
+        # off a swallowed failure is how a 404 went unnoticed through two
+        # full repair runs.
         logger.warning(f"Failed to auto-sync picks to export sheet: {e}")
+        return False

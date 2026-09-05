@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -115,6 +116,7 @@ def main() -> int:
                     help="override today's date (testing)")
     args = ap.parse_args()
 
+    sheet_ok = True
     mode = "APPLY" if args.apply else "DRY-RUN (pass --apply to write)"
     print(f"Dashboard repair — {mode}")
     print(f"  database: {PICKS_DB}")
@@ -174,22 +176,36 @@ def main() -> int:
         print("\n4. Rebuild sheet: skipped (--no-sheet)")
     else:
         print("\n4. Rebuild sheet from the database")
-        try:
-            from ivy_core.picks_tracker import auto_sync_to_export_sheet
-            if args.apply:
-                auto_sync_to_export_sheet()
+        if not args.apply:
+            print("   would clear the tab and rewrite every row from the database")
+        else:
+            # scripts/sync_picks_to_sheet.py is the rebuild: it clears the tab
+            # and rewrites header and rows. picks_tracker.auto_sync_to_export_sheet
+            # only appends, and swallows its own failures -- calling that here
+            # is what let two runs report a rebuild that had 404'd.
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve().parent / "sync_picks_to_sheet.py")],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True, text=True,
+            )
+            for line in (proc.stdout or "").splitlines():
+                print(f"   {line}")
+            if proc.returncode == 0:
                 print("   sheet rewritten from the database")
             else:
-                print("   would clear the tab and rewrite every row from the database")
-        except Exception as exc:
-            print(f"   could not rebuild: {exc}")
-            print("   (needs network and Google credentials)")
+                sheet_ok = False
+                print(f"   REBUILD FAILED (exit {proc.returncode}) — the sheet was NOT updated")
+                for line in (proc.stderr or "").splitlines()[-6:]:
+                    print(f"   {line}")
 
     if not args.apply:
         print(f"\nDry run. {marked} pick(s) would be marked unverifiable. Re-run with --apply.")
     else:
         print(f"\nDone. {marked} pick(s) marked unverifiable; "
               f"{overall['wins']}W-{overall['losses']}L-{overall['pushes']}P stands as the real record.")
+        if not sheet_ok:
+            print("The database is correct but the SHEET IS STALE — fix the error above and re-run.")
+            return 1
     return 0
 
 

@@ -47,6 +47,7 @@ def get_picks_from_db(db_path="data/picks.db"):
             p.game_day,
             p.start_time,
             p.report_date,
+            p.sharp_count,
             COALESCE(r.result, '') as result,
             COALESCE(r.final_score, '') as final_score
         FROM picks p
@@ -73,8 +74,9 @@ def format_picks_for_sheet(picks):
             pick[7],  # game_day
             pick[8],  # start_time
             pick[9],  # report_date
-            pick[10],  # result
-            pick[11],  # final_score
+            str(pick[10] if pick[10] is not None else ""),  # sharps
+            pick[11],  # result
+            pick[12],  # final_score
         ]
         rows.append(row)
     return rows
@@ -98,19 +100,19 @@ def sync_picks_to_sheet(service, spreadsheet_id, sheet_name, rows):
         # The one column map, from ivy_core.sheets_logger. This list used to
         # be written out here by hand while two other modules kept their own
         # versions, and all three disagreed.
-        from ivy_core.sheets_logger import COLUMNS
+        from ivy_core.sheets_logger import COLUMNS, LAST_COLUMN_LETTER  # noqa: F401
         header = list(COLUMNS)
         
         # Clear existing data (keep header)
         service.spreadsheets().values().clear(
             spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A2:K"
+            range=f"{sheet_name}!A2:{LAST_COLUMN_LETTER}"
         ).execute()
         
         # Write header
         service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{sheet_name}!A1:K1",
+            range=f"{sheet_name}!A1:{LAST_COLUMN_LETTER}1",
             valueInputOption="USER_ENTERED",
             body={"values": [header]}
         ).execute()
@@ -119,7 +121,7 @@ def sync_picks_to_sheet(service, spreadsheet_id, sheet_name, rows):
         if rows:
             service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
-                range=f"{sheet_name}!A2:K",
+                range=f"{sheet_name}!A2:{LAST_COLUMN_LETTER}",
                 valueInputOption="USER_ENTERED",
                 body={"values": rows}
             ).execute()

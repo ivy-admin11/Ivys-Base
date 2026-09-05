@@ -68,29 +68,39 @@ HEADER = list(sl.COLUMNS)
 def sheet_row(sport="NFL", matchup="Chiefs @ Bills", side="Chiefs -2.5",
               odds="-110", handicapper="@someone", confidence="high",
               game_day="2026-09-06", start_time="16:25", report_date="2026-09-05",
-              result="", final_score=""):
+              sharps="1", result="", final_score=""):
     return [sport, matchup, side, odds, handicapper, confidence,
-            game_day, start_time, report_date, result, final_score]
+            game_day, start_time, report_date, sharps, result, final_score]
 
 
 # --------------------------------------------------------------------------
 # The column map itself.
 # --------------------------------------------------------------------------
 class TestColumnLayout:
-    def test_matches_the_header_sync_writes(self):
-        """scripts/sync_picks_to_sheet.py creates the sheet; it is the truth."""
+    def test_the_layout_is_the_twelve_column_one(self):
+        """Two layouts were in use; the one carrying Sharps is the keeper.
+
+        auto_sync_to_export_sheet wrote twelve columns and runs after every
+        save, so it touched the live sheet most; sync_picks_to_sheet wrote
+        eleven and dropped Sharps -- the consensus count the whole 2+ sharps
+        threshold is built on. All four writers now derive from COLUMNS.
+        """
         assert HEADER == [
             "Sport", "Matchup", "Side", "Odds", "Handicapper", "Confidence",
-            "GameDay", "StartTime", "ReportDate", "Result", "FinalScore",
+            "GameDay", "StartTime", "ReportDate", "Sharps", "Result", "FinalScore",
         ]
 
-    def test_result_is_column_J_not_K(self):
-        """Regression: the grade was written to K while the summary read J."""
-        assert sl.column_letter("Result") == "J"
-        assert sl.column_letter("FinalScore") == "K"
+    def test_the_grade_columns_are_where_every_writer_expects(self):
+        """The original defect was a grade written one column off from where
+        the summary read it. The letters matter less than that one map
+        produces them; test_grades_written_by_update_are_the_ones_counted
+        checks the agreement without hardcoding anything."""
+        assert sl.column_letter("Sharps") == "J"
+        assert sl.column_letter("Result") == "K"
+        assert sl.column_letter("FinalScore") == "L"
 
     def test_last_column_letter_tracks_the_layout(self):
-        assert sl.LAST_COLUMN_LETTER == "K"
+        assert sl.LAST_COLUMN_LETTER == "L"
 
 
 # --------------------------------------------------------------------------
@@ -116,6 +126,7 @@ class TestLogPicks:
         assert row[sl.COL["Matchup"]] == "Chiefs @ Bills"
         assert row[sl.COL["Side"]] == "Chiefs -2.5"
         assert row[sl.COL["ReportDate"]] == "2026-09-05"
+        assert row[sl.COL["Sharps"]] == "1"
 
     def test_row_length_matches_the_header(self, service):
         svc = service()
@@ -168,13 +179,13 @@ class TestUpdateResult:
 
         assert svc.store["updates"], "no write was attempted"
         rng = svc.store["updates"][0]["range"]
-        assert "!J2" in rng, f"grade written to {rng}, expected column J"
+        assert "!K2" in rng, f"grade written to {rng}, expected the Result column"
         assert svc.store["updates"][0]["values"] == [["W"]]
 
     def test_notes_land_in_final_score(self, service):
         svc = service([HEADER, sheet_row()])
         sl.update_result_in_sheet("Chiefs @ Bills", "Chiefs -2.5", "W", notes="31-17")
-        assert "!K2" in svc.store["updates"][1]["range"]
+        assert "!L2" in svc.store["updates"][1]["range"]
         assert svc.store["updates"][1]["values"] == [["31-17"]]
 
     def test_matches_the_right_row_among_many(self, service):
@@ -185,7 +196,7 @@ class TestUpdateResult:
             sheet_row(matchup="C @ D", side="C -3"),
         ])
         sl.update_result_in_sheet("Chiefs @ Bills", "Chiefs -2.5", "L")
-        assert "!J3" in svc.store["updates"][0]["range"]
+        assert "!K3" in svc.store["updates"][0]["range"]
 
     def test_matching_is_case_insensitive(self, service):
         svc = service([HEADER, sheet_row()])
@@ -207,7 +218,7 @@ class TestUpdateResult:
         """Sheets omits trailing empties, so rows arrive ragged."""
         svc = service([HEADER, ["NFL"], ["NFL", "Chiefs @ Bills"], sheet_row()])
         sl.update_result_in_sheet("Chiefs @ Bills", "Chiefs -2.5", "P")
-        assert "!J4" in svc.store["updates"][0]["range"]
+        assert "!K4" in svc.store["updates"][0]["range"]
 
     def test_header_row_is_never_graded(self, service):
         svc = service([HEADER])
@@ -290,3 +301,42 @@ class TestUnverifiableInSheet:
         service([HEADER, sheet_row(result="U")])
         s = sl.get_sheet_summary()
         assert s["losses"] == 0 and s["decided"] == 0
+
+
+class TestSpreadsheetIdNormalisation:
+    """Regression: a pasted browser URL was handed to the API as an id.
+
+    The env var holding it took precedence over a correct bare id, and the
+    API answered 404 "Requested entity was not found" -- which reads like a
+    permissions problem, not a malformed id.
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("https://docs.google.com/spreadsheets/d/ABC_id-1/edit?pli=1&gid=17#gid=17", "ABC_id-1"),
+        ("https://docs.google.com/spreadsheets/d/ABC_id-1/edit", "ABC_id-1"),
+        ("https://docs.google.com/spreadsheets/d/ABC_id-1", "ABC_id-1"),
+        ("ABC_id-1", "ABC_id-1"),
+        ('"ABC_id-1"', "ABC_id-1"),
+        ("  ABC_id-1  ", "ABC_id-1"),
+        (None, ""),
+        ("", ""),
+    ])
+    def test_normalises(self, raw, expected):
+        assert sl._spreadsheet_id(raw) == expected
+
+    def test_a_url_valued_variable_does_not_win_over_a_real_id(self, monkeypatch):
+        monkeypatch.setenv("SPORTS_DASHBOARD_SPREADSHEET_ID",
+                           "https://docs.google.com/spreadsheets/d/FROM_URL/edit?gid=1")
+        monkeypatch.setenv("GOOGLE_SHEET_ID", "FROM_BARE_ID")
+        assert sl._configured_spreadsheet_id() == "FROM_URL"
+
+    def test_an_unusable_value_falls_through_to_the_next(self, monkeypatch):
+        monkeypatch.setenv("SPORTS_DASHBOARD_SPREADSHEET_ID", "https://example.com/nope")
+        monkeypatch.setenv("GOOGLE_SHEET_ID", "FROM_BARE_ID")
+        assert sl._configured_spreadsheet_id() == "FROM_BARE_ID"
+
+    def test_nothing_configured_uses_the_known_sheet(self, monkeypatch):
+        monkeypatch.delenv("SPORTS_DASHBOARD_SPREADSHEET_ID", raising=False)
+        monkeypatch.delenv("GOOGLE_SHEET_ID", raising=False)
+        got = sl._configured_spreadsheet_id()
+        assert got and not got.startswith("http") and "/" not in got
