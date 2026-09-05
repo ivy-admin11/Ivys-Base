@@ -340,7 +340,7 @@ def format_meal_plan_pdf(meal_data: Dict[str, Any]) -> str:
     )
 
     metadata = {
-        "pick_count": f"{len(recipes)} recipe(s) for the week",
+        "pick_count": f"{len(recipes)} recipe{'' if len(recipes) == 1 else 's'} for the week",
         "source": "Familia Meal Planner",
         "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
     }

@@ -1242,6 +1242,33 @@ def format_picks_digest(merged, top_n=DIGEST_TOP_N):
     return "\n\n".join(blocks), detail
 
 
+def _count(n, noun, plural=None):
+    """"1 pick" / "12 picks" — the report is read on a phone, and "pick(s)"
+    is the kind of thing that makes software look unfinished."""
+    return f"{n} {noun if n == 1 else (plural or noun + 's')}"
+
+
+def _pdf_summary(merged, consensus_picks) -> str:
+    """The line under the title.
+
+    Two things were wrong with it. "sourced from X handicappers" reads as a
+    missing number — X is the platform, but next to "12 pick(s)" it scans as a
+    placeholder nobody filled in. And "0 consensus play(s) with 2+ sharps
+    agreeing" states a count of zero where the useful thing to say is why.
+    """
+    handles = {h for e in merged for h in (e.get("handicappers") or [])}
+    lead = f"{_count(len(merged), 'pick')} from {_count(len(handles), 'handicapper')} on X"
+
+    if consensus_picks:
+        return f"{lead} — {_count(len(consensus_picks), 'consensus play')}, where 2+ sharps agree."
+    if len(handles) == 1:
+        return (
+            f"{lead} — no consensus plays. Consensus needs 2+ sharps on the same "
+            "bet, which a single source cannot produce."
+        )
+    return f"{lead} — no consensus plays; no two sharps landed on the same bet."
+
+
 def _pdf_context(pick) -> str:
     """The Context cell: everything the text report says about a pick.
 
@@ -1313,12 +1340,9 @@ def format_picks_pdf(merged) -> str:
             "reasoning": _pdf_context(pick),
         }
 
-    summary = (
-        f"{len(merged)} pick(s) sourced from X handicappers — "
-        f"{len(consensus_picks)} consensus play(s) with 2+ sharps agreeing."
-    )
+    summary = _pdf_summary(merged, consensus_picks)
     metadata = {
-        "pick_count": f"{len(merged)} pick(s) ({len(consensus_picks)} consensus)",
+        "pick_count": f"{_count(len(merged), 'pick')}, {len(consensus_picks)} consensus",
         "source": "X Sharp Picks",
         "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
     }

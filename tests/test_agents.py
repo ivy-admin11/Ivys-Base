@@ -675,3 +675,65 @@ def test_a_genuine_prop_price_from_grok_survives():
     picks = [{"matchup": "A @ B", "side": "Coby Mayo HR", "odds": "+450"}]
     sports_bettor.attach_odds(picks, [])
     assert picks[0]["odds"] == "+450"
+
+
+class TestPDFSummaryLine:
+    """"12 pick(s) sourced from X handicappers — 0 consensus play(s) with 2+
+    sharps agreeing." X is the platform, but beside "12 pick(s)" it reads as a
+    number nobody filled in."""
+
+    def test_the_handicapper_count_is_stated(self):
+        board = [{"handicappers": ["a", "b"]}, {"handicappers": ["c"]}]
+        assert "from 3 handicappers on X" in sports_bettor._pdf_summary(board, [])
+
+    def test_a_single_source_is_named_in_the_singular(self):
+        board = [{"handicappers": ["cappersforfree"]} for _ in range(12)]
+        out = sports_bettor._pdf_summary(board, [])
+        assert "12 picks from 1 handicapper on X" in out
+        assert "handicappers" not in out.split("on X")[0]
+
+    def test_zero_consensus_explains_itself_instead_of_printing_a_zero(self):
+        out = sports_bettor._pdf_summary([{"handicappers": ["only"]}], [])
+        assert "0 consensus" not in out
+        assert "a single source cannot produce" in out
+
+    def test_multiple_sources_with_no_agreement_say_that_instead(self):
+        board = [{"handicappers": ["a"]}, {"handicappers": ["b"]}]
+        out = sports_bettor._pdf_summary(board, [])
+        assert "no two sharps landed on the same bet" in out
+        assert "single source" not in out
+
+    def test_consensus_is_reported_with_real_plurals(self):
+        board = [{"handicappers": ["a", "b"]}, {"handicappers": ["c"]}]
+        assert "1 consensus play," in sports_bettor._pdf_summary(board, board[:1])
+        assert "2 consensus plays," in sports_bettor._pdf_summary(board, board)
+
+    def test_no_parenthesised_plurals_anywhere(self):
+        for board, cons in (([{"handicappers": ["a"]}], []),
+                            ([{"handicappers": ["a", "b"]}] * 3, [{"handicappers": ["a", "b"]}])):
+            assert "(s)" not in sports_bettor._pdf_summary(board, cons)
+
+    def test_count_helper_pluralises(self):
+        assert sports_bettor._count(1, "pick") == "1 pick"
+        assert sports_bettor._count(0, "pick") == "0 picks"
+        assert sports_bettor._count(2, "consensus play") == "2 consensus plays"
+
+
+def test_footer_does_not_append_a_second_unit(tmp_path, monkeypatch):
+    """The formatter used to add " pick(s)" to a value callers already phrase
+    in full: "5 picks, 2 consensus pick(s)"."""
+    captured = {}
+
+    class FakeFormatter:
+        def __init__(self, **kw): pass
+        def generate_pdf(self, filename, **kw):
+            captured.update(kw)
+            open(filename, "wb").write(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(sports_bettor, "PicksReportFormatter", FakeFormatter)
+    sports_bettor.format_picks_pdf([{
+        "sport": "NCAAF", "matchup": "A @ B", "side": "B -7", "odds": "-110",
+        "is_consensus": False, "consensus_count": 1, "handicappers": ["one"],
+    }])
+    assert captured["metadata"]["pick_count"] == "1 pick, 0 consensus"
+    assert "pick(s)" not in captured["metadata"]["pick_count"]

@@ -266,7 +266,10 @@ def format_happy_hour_pdf(discovery_data: Dict[str, Any]) -> str:
     )
 
     metadata = {
-        "pick_count": f"{len(specials)} special(s) across {len(venues)} venue(s)",
+        "pick_count": (
+            f"{len(specials)} special{'' if len(specials) == 1 else 's'} across "
+            f"{len(venues)} venue{'' if len(venues) == 1 else 's'}"
+        ),
         "source": "Happy Hour Scout",
         "timestamp": f"{datetime.now():%Y-%m-%d %H:%M}",
     }

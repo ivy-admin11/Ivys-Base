@@ -83,7 +83,8 @@ class PicksReportFormatter:
             consensus_picks: List of dicts with keys: sport, matchup, side, odds, reasoning
                 (or whatever keys `fields` names)
             other_picks: List of dicts with same structure
-            metadata: Optional dict with pick_count, source, timestamp
+            metadata: Optional dict with pick_count (a complete phrase,
+                rendered as-is), source, timestamp
             headers: Optional column header labels (defaults to the sports-report
                 labels); pass domain-appropriate labels for non-sports callers.
                 Must have the same length as `fields`.
@@ -243,7 +244,10 @@ class PicksReportFormatter:
         if metadata:
             footer_text = (
                 f"Generated {metadata.get('timestamp', 'N/A')} • "
-                f"{metadata.get('pick_count', '0')} pick(s) • "
+                # Rendered verbatim: every caller passes a full phrase
+                # ("12 picks from 3 handicappers"), so appending a unit here
+                # produced "... (2 consensus) pick(s)".
+                f"{metadata.get('pick_count', 'no picks')} • "
                 f"Source: {metadata.get('source', 'Ivy')} • "
                 "For entertainment purposes only."
             )
@@ -305,7 +309,7 @@ if __name__ == "__main__":
     ]
 
     metadata = {
-        "pick_count": "8 pick(s) swept from 9 curated X handicappers",
+        "pick_count": "8 picks from 9 handicappers on X",
         "source": "Sharp X Picks",
         "timestamp": "2026-07-01 09:01",
     }
