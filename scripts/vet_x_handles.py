@@ -10,7 +10,8 @@ and the rest were dormant. The fix was to confirm each handle actually returns
 bettable picks through the real sweep before trusting it — this script is that
 check, made repeatable.
 
-It runs the SAME code path as the job (`_sweep_chunk` + `SPORT_QUERY`), so a
+It runs the SAME code path as the job (`_sweep_chunk`, which now sweeps every
+sport rather than a league list), so a
 handle that produces picks here will produce them in production. It sends
 nothing: no iMessage, no outbox entry, no state written.
 

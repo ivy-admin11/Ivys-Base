@@ -78,19 +78,146 @@ XAI_API_KEY = require_env("XAI_API_KEY").strip("'\" ")
 
 # The Odds API (https://the-odds-api.com) — live Vegas lines + scheduled games.
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip().strip("*'\"")
+# Seed list, used only when sport discovery is unavailable. Enumerating leagues
+# by hand is what kept college football out of the sweep for a full season:
+# every new sport needed a human to remember it. Discovery below replaces this
+# in normal operation — see discover_sport_keys().
 ODDS_SPORT_KEYS = {
     "NFL":        "americanfootball_nfl",
     "NCAAF":      "americanfootball_ncaaf",
     "MLB":        "baseball_mlb",
     "NBA":        "basketball_nba",
+    "WNBA":       "basketball_wnba",
+    "NCAAB":      "basketball_ncaab",
     "NHL":        "icehockey_nhl",
+    "MMA":        "mma_mixed_martial_arts",
     "EPL":        "soccer_epl",
     "La Liga":    "soccer_spain_la_liga",
     "Bundesliga": "soccer_germany_bundesliga",
     "Serie A":    "soccer_italy_serie_a",
+    "Ligue 1":    "soccer_france_ligue_one",
+    "UCL":        "soccer_uefa_champs_league",
+    "MLS":        "soccer_usa_mls",
     "KBO":        "baseball_kbo",
+    "NPB":        "baseball_npb",
     "World Cup":  "soccer_fifa_world_cup",
 }
+
+# Short labels for the keys the feed returns, so the report says "NCAAF" rather
+# than "NCAA Football". Anything not listed falls back to the API's own title.
+_SPORT_LABELS = {
+    "americanfootball_nfl": "NFL", "americanfootball_ncaaf": "NCAAF",
+    "americanfootball_cfl": "CFL", "americanfootball_ufl": "UFL",
+    "baseball_mlb": "MLB", "baseball_ncaa": "NCAA BSB",
+    "baseball_kbo": "KBO", "baseball_npb": "NPB",
+    "basketball_nba": "NBA", "basketball_wnba": "WNBA",
+    "basketball_ncaab": "NCAAB", "basketball_euroleague": "EuroLeague",
+    "icehockey_nhl": "NHL", "mma_mixed_martial_arts": "MMA",
+    "boxing_boxing": "Boxing", "tennis_atp_singles": "Tennis",
+    "tennis_wta_singles": "Tennis", "golf_pga_championship": "Golf",
+    "soccer_epl": "EPL", "soccer_spain_la_liga": "La Liga",
+    "soccer_germany_bundesliga": "Bundesliga", "soccer_italy_serie_a": "Serie A",
+    "soccer_france_ligue_one": "Ligue 1", "soccer_uefa_champs_league": "UCL",
+    "soccer_usa_mls": "MLS", "soccer_fifa_world_cup": "World Cup",
+    "aussierules_afl": "AFL", "rugbyleague_nrl": "NRL", "cricket_test_match": "Cricket",
+}
+
+# Discovery is cached: the in-season set changes over weeks, not over runs, and
+# re-listing it three times a day is wasted latency.
+SPORTS_CACHE_PATH = os.path.join(PROJECT_ROOT, "data", "odds_sports_cache.json")
+SPORTS_CACHE_TTL_H = 12
+
+# Ceiling on leagues pulled per run. Each league is one request against the
+# Odds API quota; at three runs a day, 40 leagues is ~3,600/month.
+ODDS_MAX_LEAGUES = int(os.environ.get("ODDS_MAX_LEAGUES", "40") or 40)
+
+
+def _redact(text):
+    """Strip API keys out of anything bound for a log or a message.
+
+    requests puts the full query string in its exception text, so a proxy or
+    DNS failure printed "?apiKey=<the real key>" straight into ivy_error.log —
+    212 lines of it before this was noticed. Provider errors also captured
+    r.url, which carries the same query string.
+    """
+    return re.sub(r"(apiKey|api_key|key)=[^&\s\)\'\"]+", r"\1=***", str(text))
+
+
+def _label_for(key, title=""):
+    if key in _SPORT_LABELS:
+        return _SPORT_LABELS[key]
+    return (title or key.split("_", 1)[-1].replace("_", " ").title())
+
+
+def _read_sports_cache():
+    try:
+        with open(SPORTS_CACHE_PATH) as f:
+            blob = json.load(f)
+        saved = datetime.fromisoformat(blob["saved_at"])
+        if saved.tzinfo is None:
+            saved = saved.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - saved < timedelta(hours=SPORTS_CACHE_TTL_H):
+            return [(e["label"], e["key"]) for e in blob["sports"]]
+    except Exception:
+        pass
+    return None
+
+
+def _write_sports_cache(pairs):
+    try:
+        os.makedirs(os.path.dirname(SPORTS_CACHE_PATH), exist_ok=True)
+        with open(SPORTS_CACHE_PATH, "w") as f:
+            json.dump({
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "sports": [{"label": lbl, "key": k} for lbl, k in pairs],
+            }, f, indent=2)
+    except Exception as exc:
+        print(f"\u26a0\ufe0f  Could not cache sport list: {exc}")
+
+
+def discover_sport_keys(force=False):
+    """Every sport currently in season, from the Odds API's own catalogue.
+
+    Returns a list of ``(label, sport_key)``. The /v4/sports endpoint does not
+    count against the odds quota, and the result is cached for
+    SPORTS_CACHE_TTL_H hours.
+
+    Outright/futures markets are excluded — they have no head-to-head line to
+    match a pick against. On any failure this falls back to ODDS_SPORT_KEYS, so
+    a discovery outage degrades to the old fixed list rather than to nothing.
+    """
+    if not force:
+        cached = _read_sports_cache()
+        if cached:
+            return cached
+
+    if not ODDS_API_KEY:
+        return list(ODDS_SPORT_KEYS.items())
+
+    try:
+        r = requests.get(
+            "https://api.the-odds-api.com/v4/sports",
+            params={"apiKey": ODDS_API_KEY}, timeout=12,
+        )
+        r.raise_for_status()
+        catalogue = r.json() or []
+    except Exception as exc:
+        print(f"\u26a0\ufe0f  Sport discovery failed ({_redact(exc)}); using the seed list.")
+        return list(ODDS_SPORT_KEYS.items())
+
+    pairs = [
+        (_label_for(entry.get("key", ""), entry.get("title", "")), entry["key"])
+        for entry in catalogue
+        if entry.get("active") and not entry.get("has_outrights") and entry.get("key")
+    ]
+    if not pairs:
+        return list(ODDS_SPORT_KEYS.items())
+
+    pairs = pairs[:ODDS_MAX_LEAGUES]
+    _write_sports_cache(pairs)
+    print(f"\U0001F310 Sport discovery: {len(pairs)} league(s) in season.")
+    return pairs
+
 
 # How far ahead to scout — both the odds feed and the X sweep use this window.
 WINDOW_HOURS = 48
@@ -103,13 +230,26 @@ WINDOW_HOURS = 48
 # almost nothing and the sweep returned 0 picks. This surfaces ANY pick touching
 # these leagues/sports — NOT just games present in the live odds slate (which
 # omits leagues like KBO and tennis).
-SPORT_QUERY = (
-    "(MLB OR #MLB OR KBO OR #KBO OR NBA OR #NBA OR NHL OR #NHL "
-    "OR Soccer OR #Soccer OR \"World Cup\" OR #WorldCup "
-    "OR NFL OR #NFL OR NCAAF OR #NCAAF OR CFB OR #CFB "
-    "OR \"College Football\" OR #CollegeFootball "
-    "OR PGA OR #PGA OR Golf OR #Golf OR Tennis OR #Tennis)"
+# The sweep is no longer restricted to a league list.
+#
+# It used to be: a parenthesised OR-group of league names, and Grok was told to
+# "focus on these leagues/sports". Anything outside the list was retrieved and
+# then thrown away — which is exactly how college football went missing for a
+# season, and it would have happened again for every sport nobody remembered to
+# add. A handicapper posting a WNBA total or a UFC moneyline is posting a
+# bettable pick; the sweep's job is to surface it, not to audit its league.
+#
+# The named leagues survive only as HINTS, in hashtag form, because sharps post
+# "#CFB" far more than they post the words. They bias the search; they no longer
+# bound it.
+SPORT_HINTS = (
+    "#MLB #NFL #NCAAF #CFB #NBA #WNBA #NCAAB #NHL #MLS #EPL #UCL "
+    "#UFC #MMA #Boxing #PGA #Golf #Tennis #KBO #NPB #CFL #AFL #NRL"
 )
+
+# Kept for callers that still expect a query string (vet_x_handles reports what
+# the sweep covers). Reads as "anything", which is now the truth.
+SPORT_QUERY = "any sport or league"
 
 # Curated handicappers verified (2026-06-29) to actually post bettable picks.
 # A prior 16-handle list quietly returned 0 picks every run: 2 handles no longer
@@ -181,7 +321,7 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
     print(f"📊 Pulling live odds for the next {window_hours}h ({frm} → {to})...")
 
     games = []
-    for league, sport_key in ODDS_SPORT_KEYS.items():
+    for league, sport_key in discover_sport_keys():
         try:
             r = requests.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
@@ -203,7 +343,7 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
                     provider="odds_api",
                     status_code=r.status_code,
                     message=f"Odds API credentials were rejected (HTTP {r.status_code})",
-                    endpoint=r.url,
+                    endpoint=_redact(r.url),
                 )
             
             # Handle rate limiting and server errors (retryable)
@@ -249,7 +389,7 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
             )
         
         except Exception as e:
-            print(f"⚠️  Odds fetch failed for {league}: {e}")
+            print(f"⚠️  Odds fetch failed for {league}: {_redact(e)}")
             continue
 
         for g in data:
@@ -304,12 +444,21 @@ def _build_sweep_prompt(accounts, slate_clause, query):
     return (
         "Review the most recent posts from the listed X accounts and surface every "
         "concrete sports betting pick they have made for games SCHEDULED WITHIN THE "
-        f"NEXT 48 HOURS. Focus on these leagues/sports: {query}.\n\n"
+        "NEXT 48 HOURS.\n\n"
+        "COVER EVERY SPORT AND LEAGUE. Do not restrict yourself to any list: "
+        "American and college football, basketball at every level including the "
+        "WNBA, baseball including KBO and NPB, hockey, soccer in any competition, "
+        "MMA and boxing, tennis, golf, motorsport, cricket, rugby — if a "
+        "handicapper posted a bettable pick on it, include it. These tags are "
+        f"common in such posts and may help you search, but they are NOT a "
+        f"filter: {query}\n\n"
         f"Target accounts: {', '.join(f'@{a}' for a in accounts)}\n\n"
         f"{slate_clause}"
         "Return a JSON array. Each element is one pick with fields: "
-        "sport (league, e.g. MLB/KBO/NBA/NHL/Soccer/World Cup/NFL/NCAAF/PGA Golf/"
-        "Tennis; use NCAAF for college football, never NFL), "
+        "sport (the league or competition as it is actually known \u2014 MLB, NFL, "
+        "NCAAF, NBA, WNBA, NCAAB, NHL, MLS, EPL, UFC, Boxing, Tennis, Golf, KBO, "
+        "NPB, CFL and so on; use NCAAF for college football, never NFL, and never "
+        "invent a league you did not see), "
         "matchup (formatted 'Away @ Home'), "
         "side (the exact side/total/prop the handicapper is taking), "
         "odds (the American odds for that side copied verbatim from the slate "
@@ -331,7 +480,7 @@ def _build_sweep_prompt(accounts, slate_clause, query):
 
 def _sweep_chunk(accounts, slate_clause):
     """Run a single Grok x_search sweep over one batch of handles → list of pick dicts."""
-    prompt = _build_sweep_prompt(accounts, slate_clause, SPORT_QUERY)
+    prompt = _build_sweep_prompt(accounts, slate_clause, SPORT_HINTS)
 
     try:
         if USE_XAI_SDK:
@@ -356,7 +505,7 @@ def _sweep_chunk(accounts, slate_clause):
             )
             raw_text = response.output_text
     except Exception as e:
-        print(f"⚠️ Grok X Search failed for batch {accounts}: {e}.")
+        print(f"⚠️ Grok X Search failed for batch {accounts}: {_redact(e)}.")
         return []
 
     try:
@@ -798,7 +947,7 @@ def enrich_picks(merged, games):
             )
             raw = resp.output_text
     except Exception as e:
-        print(f"⚠️ Grok enrichment failed: {e}. Texting picks without enrichment.")
+        print(f"⚠️ Grok enrichment failed: {_redact(e)}. Texting picks without enrichment.")
         return merged
 
     try:
@@ -839,7 +988,7 @@ def _sweep_unrestricted(games):
     prompt = (
         "Search X for concrete sports betting picks posted by reputable handicappers "
         "in the last 24 hours, for games SCHEDULED WITHIN THE NEXT 48 HOURS. Focus on "
-        f"these leagues/sports: {SPORT_QUERY}.\n\n{slate}"
+        f"any sport or league. Tags often seen on such posts: {SPORT_HINTS}\n\n{slate}"
         "Return a JSON array; each element: sport, matchup ('Away @ Home'), side "
         "(exact side/total/prop), odds (verbatim from the slate above or null), "
         "handicapper (the X handle that posted it, no @), confidence (low/medium/high "
@@ -866,7 +1015,7 @@ def _sweep_unrestricted(games):
             )
             raw_text = resp.output_text
     except Exception as e:
-        print(f"⚠️ Unrestricted fallback sweep failed: {e}.")
+        print(f"⚠️ Unrestricted fallback sweep failed: {_redact(e)}.")
         return []
     try:
         picks = json.loads(raw_text)
@@ -1123,10 +1272,21 @@ DIGEST_TOP_N = 5
 # Below-the-bar boards get a shorter list — it's context, not a play.
 NEAR_MISS_TOP_N = 3
 
+# The sweep covers every sport now, so this maps whatever comes back. Unknown
+# leagues fall through to a neutral marker rather than being dropped.
 _SPORT_EMOJI = {
-    "MLB": "\u26be", "NBA": "\U0001F3C0", "NFL": "\U0001F3C8", "NHL": "\U0001F3D2",
-    "NCAAF": "\U0001F3C8", "NCAAB": "\U0001F3C0", "MLS": "\u26bd", "Soccer": "\u26bd",
-    "World Cup": "\u26bd", "Tennis": "\U0001F3BE", "Golf": "\u26f3", "UFC": "\U0001F94A",
+    "MLB": "\u26be", "KBO": "\u26be", "NPB": "\u26be", "NCAA BSB": "\u26be",
+    "NBA": "\U0001F3C0", "WNBA": "\U0001F3C0", "NCAAB": "\U0001F3C0",
+    "EuroLeague": "\U0001F3C0",
+    "NFL": "\U0001F3C8", "NCAAF": "\U0001F3C8", "CFL": "\U0001F3C8", "UFL": "\U0001F3C8",
+    "NHL": "\U0001F3D2",
+    "MLS": "\u26bd", "Soccer": "\u26bd", "EPL": "\u26bd", "La Liga": "\u26bd",
+    "Bundesliga": "\u26bd", "Serie A": "\u26bd", "Ligue 1": "\u26bd", "UCL": "\u26bd",
+    "World Cup": "\u26bd",
+    "Tennis": "\U0001F3BE", "Golf": "\u26f3",
+    "UFC": "\U0001F94A", "MMA": "\U0001F94A", "Boxing": "\U0001F94A",
+    "Cricket": "\U0001F3CF", "AFL": "\U0001F3C9", "NRL": "\U0001F3C9", "Rugby": "\U0001F3C9",
+    "NASCAR": "\U0001F3CE", "F1": "\U0001F3CE",
 }
 
 
@@ -1474,7 +1634,7 @@ def _run_pipeline(
         result.status = PipelineStatus.DEGRADED
         games = []
     except Exception as e:
-        print(f"🔴 Unexpected error fetching odds: {e}")
+        print(f"🔴 Unexpected error fetching odds: {_redact(e)}")
         odds_source.mark_failure(e)
         result.status = PipelineStatus.INTERNAL_ERROR
         return result.to_dict()

@@ -335,11 +335,14 @@ class TestNCAAFCoverage:
     def test_ncaaf_is_in_the_odds_feed(self):
         assert sports_bettor.ODDS_SPORT_KEYS.get("NCAAF") == "americanfootball_ncaaf"
 
-    def test_ncaaf_is_in_the_x_sweep_query(self):
-        q = sports_bettor.SPORT_QUERY
-        # Sharps post "CFB" far more than "NCAAF", so both forms must be there.
-        for token in ("NCAAF", "#NCAAF", "CFB", "#CFB", "College Football"):
-            assert token in q, token
+    def test_ncaaf_is_reachable_by_the_sweep(self):
+        """The sweep is unrestricted now, so college football is covered by
+        default. The hashtag hints still name it, because sharps post "#CFB"
+        far more than they post the words and that biases the search."""
+        assert "#NCAAF" in sports_bettor.SPORT_HINTS
+        assert "#CFB" in sports_bettor.SPORT_HINTS
+        prompt = sports_bettor._build_sweep_prompt(["h"], "", sports_bettor.SPORT_HINTS)
+        assert "college football" in prompt.lower()
 
     def test_sweep_prompt_names_ncaaf_as_a_league_value(self):
         prompt = sports_bettor._build_sweep_prompt(["someHandle"], "", sports_bettor.SPORT_QUERY)
@@ -783,3 +786,85 @@ class TestSinglePageGuarantee:
         reader = PdfReader(str(out))
         assert len(reader.pages) == 1
         assert "not shown" in reader.pages[0].extract_text()
+
+
+class TestAllSportsCoverage:
+    """The sweep used to be bounded by a hand-maintained league list, which is
+    how college football stayed invisible for a season. It is now unbounded,
+    and the odds feed discovers what is in season instead of being told."""
+
+    def test_the_prompt_does_not_restrict_to_a_league_list(self):
+        prompt = sports_bettor._build_sweep_prompt(["h"], "", sports_bettor.SPORT_HINTS)
+        assert "COVER EVERY SPORT AND LEAGUE" in prompt
+        assert "NOT a filter" in prompt
+        assert "Focus on these leagues" not in prompt
+
+    def test_hints_bias_the_search_without_bounding_it(self):
+        for tag in ("#NCAAF", "#WNBA", "#UFC", "#NHL", "#MLS"):
+            assert tag in sports_bettor.SPORT_HINTS, tag
+
+    def test_discovery_falls_back_to_the_seed_list_when_the_api_is_down(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sports_bettor, "SPORTS_CACHE_PATH", str(tmp_path / "c.json"))
+        monkeypatch.setattr(sports_bettor.requests, "get",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+        pairs = sports_bettor.discover_sport_keys(force=True)
+        assert ("NCAAF", "americanfootball_ncaaf") in pairs
+        assert len(pairs) == len(sports_bettor.ODDS_SPORT_KEYS)
+
+    def test_discovery_keeps_in_season_head_to_head_sports_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sports_bettor, "SPORTS_CACHE_PATH", str(tmp_path / "c.json"))
+        monkeypatch.setattr(sports_bettor, "ODDS_API_KEY", "test-key")
+        catalogue = [
+            {"key": "basketball_wnba", "title": "WNBA", "active": True, "has_outrights": False},
+            {"key": "mma_mixed_martial_arts", "title": "MMA", "active": True, "has_outrights": False},
+            {"key": "americanfootball_nfl_super_bowl_winner", "title": "Super Bowl Winner",
+             "active": True, "has_outrights": True},
+            {"key": "baseball_kbo", "title": "KBO", "active": False, "has_outrights": False},
+        ]
+
+        class R:
+            def raise_for_status(self): pass
+            def json(self): return catalogue
+
+        monkeypatch.setattr(sports_bettor.requests, "get", lambda *a, **k: R())
+        pairs = sports_bettor.discover_sport_keys(force=True)
+        keys = [k for _, k in pairs]
+        assert "basketball_wnba" in keys and "mma_mixed_martial_arts" in keys
+        assert "americanfootball_nfl_super_bowl_winner" not in keys, "outrights have no h2h line"
+        assert "baseball_kbo" not in keys, "out of season"
+
+    def test_discovery_is_capped_and_cached(self, monkeypatch, tmp_path):
+        cache = tmp_path / "c.json"
+        monkeypatch.setattr(sports_bettor, "SPORTS_CACHE_PATH", str(cache))
+        monkeypatch.setattr(sports_bettor, "ODDS_API_KEY", "test-key")
+        monkeypatch.setattr(sports_bettor, "ODDS_MAX_LEAGUES", 2)
+        catalogue = [{"key": f"sport_{i}", "title": f"S{i}", "active": True,
+                      "has_outrights": False} for i in range(10)]
+
+        calls = []
+
+        class R:
+            def raise_for_status(self): pass
+            def json(self): return catalogue
+
+        monkeypatch.setattr(sports_bettor.requests, "get",
+                            lambda *a, **k: calls.append(1) or R())
+        assert len(sports_bettor.discover_sport_keys(force=True)) == 2
+        assert cache.exists()
+        sports_bettor.discover_sport_keys()  # cached: no second call
+        assert len(calls) == 1
+
+    def test_api_keys_never_reach_a_log_line(self):
+        leaky = ("HTTPSConnectionPool(host='api.the-odds-api.com') url: "
+                 "/v4/sports?apiKey=99f379dfSECRETVALUE (Caused by ProxyError)")
+        out = sports_bettor._redact(leaky)
+        assert "SECRETVALUE" not in out
+        assert "apiKey=***" in out
+
+    def test_unknown_leagues_still_render(self):
+        body, _ = sports_bettor.format_picks_digest([{
+            "sport": "Cricket", "matchup": "India @ Australia", "side": "India ML",
+            "odds": "-120", "is_consensus": False, "consensus_count": 1,
+            "handicappers": ["someone"], "enrichment": {"confidence": "medium"},
+        }])
+        assert "India @ Australia" in body
