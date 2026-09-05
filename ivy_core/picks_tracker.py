@@ -396,7 +396,7 @@ def auto_sync_to_export_sheet():
         
         # Format for sheet
         rows = []
-        from ivy_core.sheets_logger import COLUMNS, LAST_COLUMN_LETTER
+        from ivy_core.sheets_logger import COL, COLUMNS, LAST_COLUMN_LETTER
         header = list(COLUMNS)
         
         for pick in picks:
@@ -416,16 +416,33 @@ def auto_sync_to_export_sheet():
             ]
             rows.append(row)
         
-        # Append-only: do not clear existing data, only add new picks
-        # This prevents losing picks from old job runs that aren't in the current database
+        # Append-only: do not clear existing data, only add new picks.
+        # This preserves rows from old job runs that are no longer in the
+        # database -- but "new" has to mean new. The query above selects every
+        # pick, and this used to append all of them on every run, so each
+        # save_picks re-appended the entire history. A sheet rebuilt to 88 rows
+        # would have gone to 176 on the next picks job, then 264, with every
+        # row duplicated. Read what is already there and append only the rest.
+        existing = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{target_sheet_name}!A:{LAST_COLUMN_LETTER}"
+        ).execute().get("values", [])
+        
+        def key(row):
+            """Identity of a pick: same game, same side, same report."""
+            def cell(i):
+                return (row[i] or "").strip().lower() if len(row) > i else ""
+            return (cell(COL["Matchup"]), cell(COL["Side"]), cell(COL["ReportDate"]))
+        
+        already = {key(r) for r in existing[1:]} if len(existing) > 1 else set()
+        before = len(rows)
+        rows = [r for r in rows if key(r) not in already]
+        skipped = before - len(rows)
         
         # Initialize header if empty
-        current = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{target_sheet_name}!A1:{LAST_COLUMN_LETTER}1"
-        ).execute()
+        current = existing[:1]
         
-        if not current.get('values'):
+        if not current:
             service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"{target_sheet_name}!A1:{LAST_COLUMN_LETTER}1",
@@ -441,7 +458,10 @@ def auto_sync_to_export_sheet():
                 body={"values": rows}
             ).execute()
         
-        logger.info(f"Auto-synced {len(picks)} picks to export sheet (append-only mode)")
+        logger.info(
+            "Auto-synced %d new pick(s) to export sheet; %d already present",
+            len(rows), skipped,
+        )
         return True
     except Exception as e:
         # Returned, not just logged: a caller that reports "sheet updated"

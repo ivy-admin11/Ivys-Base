@@ -26,6 +26,10 @@ from ivy_core.pick_stats import MIN_DECIDED_FOR_RATE, UNVERIFIABLE, format_hit_r
 
 REPO = Path(__file__).resolve().parents[1]
 
+# isolated_db stubs auto_sync_to_export_sheet so save_picks stays offline.
+# Hold the real one from before that patch, or these tests exercise the stub.
+REAL_AUTO_SYNC = pt.auto_sync_to_export_sheet
+
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path, monkeypatch):
@@ -367,3 +371,112 @@ class TestScriptsAreRunnableStandalone:
         )
         assert out.returncode == 0, f"module-level import failed:\n{out.stderr}"
         assert "COLUMNS 12" in out.stdout
+
+
+class _Exec:
+    """Every Sheets call ends in .execute(); this carries its payload."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self):
+        return self.payload
+
+
+class FakeSheetsAPI:
+    """The chained Sheets client, recording what gets appended."""
+
+    def __init__(self, rows, tab="Sharp Picks", gid=1305096861):
+        self.rows = [list(r) for r in rows]
+        self.appended = []
+        self.tab, self.gid = tab, gid
+
+    # service.spreadsheets()
+    def spreadsheets(self):
+        return self
+
+    # .get(spreadsheetId=...) -> metadata
+    def get(self, *, spreadsheetId, range=None, **kw):
+        if range is None:
+            return _Exec({"sheets": [{"properties": {"sheetId": self.gid,
+                                                     "title": self.tab}}]})
+        return _Exec({"values": self.rows})
+
+    # .values()
+    def values(self):
+        return self
+
+    def append(self, *, spreadsheetId, range, valueInputOption, body):
+        self.appended.append(body["values"])
+        self.rows.extend(body["values"])
+        return _Exec({})
+
+    def update(self, *, spreadsheetId, range, valueInputOption, body):
+        return _Exec({})
+
+
+class TestAutoSyncDoesNotDuplicate:
+    """Regression: every save re-appended the entire pick history.
+
+    auto_sync_to_export_sheet selects all picks and appends them, and runs
+    after every save_picks. Its comment claimed it added only new picks; there
+    was no filter. A sheet freshly rebuilt to 88 rows would reach 176 on the
+    next picks job and 264 on the one after, every row duplicated. It runs
+    unattended, so nothing would have reported it.
+    """
+
+    @pytest.fixture
+    def api(self, monkeypatch):
+        from ivy_core.sheets_logger import COLUMNS
+        fake = FakeSheetsAPI([list(COLUMNS)])
+        monkeypatch.setattr("ivy_core.sheets_logger._get_sheets_service", lambda: fake)
+        return fake
+
+    def _sync(self):
+        return REAL_AUTO_SYNC()
+
+    def test_first_sync_writes_every_pick(self, isolated_db, api):
+        pt.save_picks([pick(side="A -1"), pick(side="B +1")], "2026-09-05")
+        assert self._sync() is True
+        assert sum(len(b) for b in api.appended) == 2
+
+    def test_a_second_sync_appends_nothing(self, isolated_db, api):
+        pt.save_picks([pick(side="A -1"), pick(side="B +1")], "2026-09-05")
+        self._sync()
+        api.appended.clear()
+        assert self._sync() is True
+        appended = sum(len(b) for b in api.appended)
+        assert appended == 0, (
+            f"second sync re-appended {appended} row(s) already on the sheet — "
+            "this is the duplication bug"
+        )
+
+    def test_only_the_new_pick_is_appended(self, isolated_db, api):
+        from ivy_core.sheets_logger import COL
+        pt.save_picks([pick(side="A -1")], "2026-09-05")
+        self._sync()
+        pt.save_picks([pick(side="B +1")], "2026-09-05")
+        api.appended.clear()
+        self._sync()
+
+        appended = [r for batch in api.appended for r in batch]
+        assert len(appended) == 1, f"expected only the new pick, got {appended}"
+        assert appended[0][COL["Side"]] == "B +1"
+
+    def test_the_sheet_does_not_grow_when_nothing_is_added(self, isolated_db, api):
+        pt.save_picks([pick(side=f"S{i}") for i in range(5)], "2026-09-05")
+        self._sync()
+        size = len(api.rows)
+        for _ in range(3):
+            self._sync()
+        assert len(api.rows) == size, "repeated syncs must not grow the sheet"
+
+    def test_matching_ignores_case_and_padding(self, isolated_db, api):
+        """A row already on the sheet must not be re-added over whitespace."""
+        from ivy_core.sheets_logger import COL
+        pt.save_picks([pick(side="A -1")], "2026-09-05")
+        self._sync()
+        api.rows[1][COL["Side"]] = "  a -1  "
+        api.appended.clear()
+        self._sync()
+        assert sum(len(b) for b in api.appended) == 0
