@@ -59,7 +59,17 @@ def check_interpreter(expected: str) -> list[str]:
 
 
 def check_declared_vs_installed(req_file: Path) -> list[str]:
-    """Every pinned requirement must be installed at the pinned version."""
+    """Every declared requirement must be installed and satisfy its specifier.
+
+    Parsed with packaging rather than a regex. A hand-rolled pattern silently
+    skipped any line it could not match -- `uvicorn[standard]==0.28.0` was not
+    checked at all -- and string-compared versions, so a `>=` floor was never
+    enforced and `==1.0` vs an installed `1.0.0` was reported as drift even
+    though PEP 440 calls them the same version.
+    """
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.version import InvalidVersion
+
     problems: list[str] = []
     if not req_file.exists():
         return [f"{req_file.name} not found"]
@@ -69,15 +79,28 @@ def check_declared_vs_installed(req_file: Path) -> list[str]:
         line = raw.split("#")[0].strip()
         if not line or line.startswith("-"):
             continue
-        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*(==|>=)\s*([^\s,;]+)", line)
-        if not m:
+        try:
+            req = Requirement(line)
+        except InvalidRequirement:
             continue
-        name, op, want = m.group(1), m.group(2), m.group(3)
-        have = installed.get(_norm(name))
+        # A requirement gated to another platform or Python is not expected
+        # to be installed here; demanding it would be a false alarm.
+        if req.marker and not req.marker.evaluate():
+            continue
+        have = installed.get(_norm(req.name))
         if have is None:
-            problems.append(f"{name} is declared but NOT installed")
-        elif op == "==" and have != want:
-            problems.append(f"{name} declared =={want} but installed {have}")
+            problems.append(f"{req.name} is declared but NOT installed")
+            continue
+        if not req.specifier:
+            continue
+        try:
+            satisfied = req.specifier.contains(have, prereleases=True)
+        except InvalidVersion:
+            # An installed version that cannot be parsed cannot be shown to
+            # satisfy the pin -- report it rather than pass it silently.
+            satisfied = False
+        if not satisfied:
+            problems.append(f"{req.name} declared {req.specifier} but installed {have}")
     return problems
 
 

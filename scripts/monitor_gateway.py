@@ -134,11 +134,17 @@ def check_gateway_up() -> bool:
 
 
 def load_state() -> dict:
+    """Always returns a dict. A state file that is valid JSON but not an
+    object (a half-written file, a hand-edit, an older format) used to be
+    handed back as-is and blew up main() with an AttributeError — the one
+    failure mode a monitor must not have, since a crashed monitor is a silent
+    monitor."""
     try:
         with open(STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def save_state(state: dict) -> None:
@@ -193,19 +199,28 @@ def main() -> int:
             f"⚠️ Ivy gateway is STILL {new_status.upper()} — {reason}. Has not recovered."
         )
 
+    # An alert that failed to send was never delivered, so nothing about it
+    # may be recorded as done: neither the re-alert clock below nor the status
+    # transition further down. Advancing the status used to swallow the alert
+    # entirely — a dropped "back UP" text was never retried at all, and a
+    # dropped "DOWN" text stayed silent until an hour after some *earlier*
+    # alert. Holding the old status makes the next run see the same transition
+    # and try again.
+    alert_delivered = True
     if alert_text:
         print(f"[{timestamp}] {alert_text}")
-        if send_imessage(HENRY_PHONE, alert_text):
+        alert_delivered = bool(send_imessage(HENRY_PHONE, alert_text))
+        if alert_delivered:
             state["last_alert_ts"] = now
         else:
-            print(f"[{timestamp}] WARNING: alert send failed")
+            print(f"[{timestamp}] WARNING: alert send failed — will retry on the next run")
     else:
         if prev_status is not None:
             print(f"[{timestamp}] gateway status={new_status} ({reason}), no alert needed")
 
     # Keep reporting "up" until a degraded reading is confirmed, so the
     # eventual confirmed alert still reads as an up->degraded transition.
-    state["status"] = prev_status if suppress_transition else new_status
+    state["status"] = prev_status if (suppress_transition or not alert_delivered) else new_status
     state["reason"] = reason
     save_state(state)
     return 0

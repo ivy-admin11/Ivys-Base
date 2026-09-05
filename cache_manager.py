@@ -24,6 +24,44 @@ except ImportError:
 
 logger = logging.getLogger("ivy.cache")
 
+# Gemini Flash input pricing, expressed per TOKEN. The published rates are per
+# MILLION tokens ($0.075 fresh input, $0.0075 for cached input), so every rate
+# here is divided by 1_000_000 exactly once. Multiplying a token count by the
+# per-million figure directly overstates cost by 1000x, which is how a few
+# cents of spend gets reported as tens of dollars.
+GEMINI_INPUT_COST_PER_MILLION = 0.075
+GEMINI_CACHED_INPUT_COST_PER_MILLION = 0.0075
+GEMINI_INPUT_COST_PER_TOKEN = GEMINI_INPUT_COST_PER_MILLION / 1_000_000
+GEMINI_CACHE_SAVINGS_PER_TOKEN = (
+    GEMINI_INPUT_COST_PER_MILLION - GEMINI_CACHED_INPUT_COST_PER_MILLION
+) / 1_000_000
+
+# Used only by the very rough "what would this have cost uncached" figure.
+AVG_INPUT_TOKENS_PER_REQUEST = 500
+
+_MISSING = object()
+
+
+def _usage_field(usage: Any, *names: str) -> Any:
+    """Return the first attribute of *usage* that actually exists.
+
+    The Gemini SDK spells these prompt_token_count / cached_content_token_count /
+    candidates_token_count. Other providers (and hand-rolled stubs) use
+    input_tokens / output_tokens. Returning a sentinel rather than 0 for "absent"
+    is what lets the caller tell an honest zero apart from a field that was never
+    there -- guessing wrong here silently reports every request as a cache miss.
+    """
+    for name in names:
+        value = getattr(usage, name, _MISSING)
+        if value is not _MISSING:
+            return value
+    return _MISSING
+
+
+def _usage_int(usage: Any, *names: str) -> int:
+    value = _usage_field(usage, *names)
+    return int(value) if value is not _MISSING else 0
+
 
 class PromptCacheManager:
     """Manages cached prompt content for Gemini API calls with cost tracking."""
@@ -119,7 +157,12 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
         Create Gemini content list optimized for caching.
         
         Returns: [cached_system_block, user_message]
-        where cached_system_block has cache_control set to ephemeral.
+
+        The system+tools block is kept byte-identical across requests and sent
+        as the FIRST part, because a stable prefix is the only thing Gemini's
+        caching keys off. There is deliberately no "cache_control" marker: that
+        is Anthropic's API, and the Gemini SDK rejects any Part dict carrying
+        keys it does not know.
         """
         if genai is None:
             logger.warning("google.generativeai not installed, caching disabled")
@@ -134,15 +177,12 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
 
         messages = []
 
-        # ✅ PART 1: Cached system + tools (reused across requests)
+        # PART 1: Cached system + tools (byte-identical across requests)
         cached_system = self.build_cached_system_prompt(system_instruction, tool_declarations)
         messages.append(
             genai.types.ContentDict(
                 role="user",
-                parts=[{
-                    "text": cached_system,
-                    "cache_control": {"type": "ephemeral"}  # ✅ KEY: Mark for caching
-                }]
+                parts=[genai.types.PartDict(text=cached_system)]
             )
         )
 
@@ -174,16 +214,25 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
             return 0, 0
 
         usage = response.usage_metadata
-        cached_tokens = getattr(usage, 'cached_content_input_tokens', 0)
-        input_tokens = getattr(usage, 'input_tokens', 0)
-        output_tokens = getattr(usage, 'output_tokens', 0)
+        cached_tokens = _usage_int(usage, "cached_content_token_count", "cached_content_input_tokens")
 
-        total_input = cached_tokens + input_tokens
+        prompt_tokens = _usage_field(usage, "prompt_token_count")
+        if prompt_tokens is not _MISSING:
+            # Gemini documents prompt_token_count as the TOTAL effective prompt --
+            # cached content included. Adding cached_tokens on top would double
+            # count it and report efficiencies above 100%.
+            total_input = int(prompt_tokens)
+            input_tokens = max(total_input - cached_tokens, 0)
+        else:
+            input_tokens = _usage_int(usage, "input_tokens")
+            total_input = cached_tokens + input_tokens
+
+        output_tokens = _usage_int(usage, "candidates_token_count", "output_tokens")
 
         if cached_tokens > 0:
             self.cache_stats["cache_hits"] += 1
-            # Gemini cache tokens cost 90% less: $0.075 → $0.0075 per 1M
-            cache_savings = cached_tokens * 0.00009  # Rough estimate: 90% cheaper
+            # Cached input is 90% cheaper; savings are per token, see constants above.
+            cache_savings = cached_tokens * GEMINI_CACHE_SAVINGS_PER_TOKEN
             self.cache_stats["tokens_cached"] += cached_tokens
             self.cache_stats["tokens_saved"] += int(cached_tokens * 0.9)
             
@@ -220,9 +269,11 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
             else 0
         )
         
-        # Rough cost estimation (Gemini pricing: $0.075 input, $0.003 output)
-        estimated_cost_without_cache = total_req * 500 * 0.000075  # Avg 500 input tokens
-        estimated_savings = self.cache_stats["tokens_saved"] * 0.000075
+        # Rough cost estimation at the published per-million input rate.
+        estimated_cost_without_cache = (
+            total_req * AVG_INPUT_TOKENS_PER_REQUEST * GEMINI_INPUT_COST_PER_TOKEN
+        )
+        estimated_savings = self.cache_stats["tokens_saved"] * GEMINI_INPUT_COST_PER_TOKEN
         
         return {
             "uptime_seconds": uptime.total_seconds(),
@@ -232,8 +283,8 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
             "hit_rate_percent": hit_rate,
             "total_cached_tokens": self.cache_stats["tokens_cached"],
             "estimated_tokens_saved": self.cache_stats["tokens_saved"],
-            "estimated_cost_without_cache": f"${estimated_cost_without_cache:.2f}",
-            "estimated_savings": f"${estimated_savings:.2f}",
+            "estimated_cost_without_cache": f"${estimated_cost_without_cache:.4f}",
+            "estimated_savings": f"${estimated_savings:.4f}",
             "recommendation": (
                 "✅ Caching working well!" if hit_rate > 70
                 else "⚠️  Low cache hit rate - check system prompt consistency"
