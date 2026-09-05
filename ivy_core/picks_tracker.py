@@ -65,6 +65,15 @@ def _init_db():
         )
     """)
     
+    # Whether this grade also reached the spreadsheet. A grade can land in the
+    # database and fail to reach the sheet -- that happened live on 5 Sep when
+    # four picks graded while every Sheets call returned 404 -- and until this
+    # column existed the only trace was a log line. 0 means the two stores
+    # disagree and nothing has reconciled them yet.
+    cursor.execute("PRAGMA table_info(results)")
+    if "sheet_synced" not in {row[1] for row in cursor.fetchall()}:
+        cursor.execute("ALTER TABLE results ADD COLUMN sheet_synced INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
@@ -165,13 +174,29 @@ def update_pick_result(pick_id: int, result: str, final_score: Optional[str] = N
     conn.commit()
     conn.close()
     
-    # Also update in Google Sheets
+    # Also update in Google Sheets, and record whether it actually landed.
     if pick_data:
         matchup, side = pick_data
         try:
-            update_result_in_sheet(matchup, side, result, notes=final_score)
+            synced = bool(update_result_in_sheet(matchup, side, result, notes=final_score))
         except Exception as e:
+            synced = False
             logger.warning(f"Could not update result in Google Sheets: {e}")
+        if not synced:
+            logger.warning(
+                "Grade recorded in the database but NOT on the sheet: %s %s -> %s. "
+                "Run scripts/repair_dashboard.py to reconcile.",
+                matchup, side, result,
+            )
+        conn = sqlite3.connect(PICKS_DB)
+        try:
+            conn.execute(
+                "UPDATE results SET sheet_synced = ? WHERE pick_id = ?",
+                (1 if synced else 0, pick_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _split_handicappers(stored: Optional[str]) -> List[str]:
@@ -184,6 +209,78 @@ def _split_handicappers(stored: Optional[str]) -> List[str]:
         return ["unattributed"]
     names = [part.strip() for part in stored.split(",")]
     return [n for n in names if n] or ["unattributed"]
+
+
+def mark_all_synced() -> int:
+    """Record that every grade is now on the sheet.
+
+    Only correct after a full rebuild, which rewrites every row from this
+    database -- scripts/sync_picks_to_sheet.py. Called there rather than
+    assumed, so the flag reflects a write that actually happened.
+    """
+    _init_db()
+    conn = sqlite3.connect(PICKS_DB)
+    try:
+        cur = conn.execute(
+            "UPDATE results SET sheet_synced = 1 WHERE result IS NOT NULL")
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def unsynced_grades() -> List[Dict]:
+    """Grades in the database that are not known to be on the sheet.
+
+    This is the divergence that used to be invisible. A non-empty result means
+    the dashboard is understating the record -- the grade exists, the sheet
+    does not show it.
+    """
+    _init_db()
+    conn = sqlite3.connect(PICKS_DB)
+    try:
+        rows = conn.execute("""
+            SELECT p.id, p.matchup, p.side, r.result, r.final_score
+            FROM picks p
+            JOIN results r ON r.pick_id = p.id
+            WHERE r.result IS NOT NULL
+              AND r.result != ?
+              AND COALESCE(r.sheet_synced, 0) = 0
+            ORDER BY p.id
+        """, (UNVERIFIABLE,)).fetchall()
+    finally:
+        conn.close()
+    return [
+        {"pick_id": r[0], "matchup": r[1], "side": r[2],
+         "result": r[3], "final_score": r[4]}
+        for r in rows
+    ]
+
+
+def resync_grades() -> Dict[str, int]:
+    """Retry every grade the sheet is missing. Safe to run repeatedly."""
+    pending = unsynced_grades()
+    fixed = failed = 0
+    for row in pending:
+        try:
+            ok = bool(update_result_in_sheet(
+                row["matchup"], row["side"], row["result"], notes=row["final_score"]
+            ))
+        except Exception as exc:
+            ok = False
+            logger.warning("Resync failed for pick %s: %s", row["pick_id"], exc)
+        if ok:
+            fixed += 1
+            conn = sqlite3.connect(PICKS_DB)
+            try:
+                conn.execute("UPDATE results SET sheet_synced = 1 WHERE pick_id = ?",
+                             (row["pick_id"],))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            failed += 1
+    return {"attempted": len(pending), "fixed": fixed, "still_missing": failed}
 
 
 def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
@@ -322,6 +419,13 @@ def format_stats_for_pdf(days_back: int = 30) -> str:
         tail.append(f"{overall['unverifiable']} ungradeable (game outside the scores window)")
     if tail:
         lines.append("  " + " · ".join(tail))
+    
+    behind = len(unsynced_grades())
+    if behind:
+        lines.append(
+            f"  ⚠️  {behind} grade(s) recorded but missing from the sheet — "
+            f"the dashboard is understating the record"
+        )
     
     if by_sport:
         lines.append("\nBy Sport:")

@@ -156,6 +156,9 @@ def _get_sheets_service():
 
 def log_picks_to_sheet(picks: list, report_date: str):
     """Append picks to the Google Sheet for record tracking.
+
+    Returns True if the rows were written. A False here used to be invisible:
+    the database kept the picks and nothing recorded that the sheet had not.
     
     Args:
         picks: List of pick dicts with sport, matchup, side, odds, handicapper, etc.
@@ -164,7 +167,7 @@ def log_picks_to_sheet(picks: list, report_date: str):
     service = _get_sheets_service()
     if not service:
         logger.warning("Skipping Google Sheets logging: no authentication available")
-        return
+        return False
     
     try:
         # Prepare rows for the sheet
@@ -180,12 +183,18 @@ def log_picks_to_sheet(picks: list, report_date: str):
         ).execute()
         
         logger.info(f"Logged {len(picks)} picks to Google Sheet")
+        return True
     except Exception as e:
         logger.error(f"Failed to log picks to Google Sheet: {e}")
+        return False
 
 
 def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional[str] = None):
     """Update the result column for a specific pick in the export sheet.
+
+    Returns True only if a row was actually found and written. Both failure
+    modes -- the API refusing, and the pick simply not being on the sheet --
+    return False, because both leave the sheet disagreeing with the database.
     
     Args:
         matchup: The matchup identifier (e.g., "Kansas City Chiefs @ Buffalo Bills")
@@ -196,7 +205,7 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
     service = _get_sheets_service()
     if not service:
         logger.warning("Skipping Google Sheets update: no authentication available")
-        return
+        return False
     
     try:
         # Update export sheet (Sharp Picks tab, gid=1305096861)
@@ -237,11 +246,15 @@ def update_result_in_sheet(matchup: str, side: str, result: str, notes: Optional
                         ).execute()
                     
                     logger.info(f"Updated export sheet: {matchup} {side} to {result}")
-                    return
+                    return True
         
+        # Not an exception, but the grade did not land. The caller has to know
+        # the difference between "written" and "the row wasn't there".
         logger.warning(f"Pick not found in export sheet: {matchup} {side}")
+        return False
     except Exception as e:
         logger.error(f"Failed to update result in Google Sheet: {e}")
+        return False
 
 
 def get_sheet_summary():

@@ -171,6 +171,27 @@ def main() -> int:
     finally:
         conn.close()
 
+    # ---- 2b. reconcile grades the sheet never received --------------------
+    from ivy_core.picks_tracker import resync_grades, unsynced_grades
+
+    missing = unsynced_grades()
+    print(f"\n3b. Grades recorded but missing from the sheet: {len(missing)}")
+    for row in missing[:5]:
+        print(f"      #{row['pick_id']} {row['matchup']} — {row['side']} = {row['result']}")
+    if len(missing) > 5:
+        print(f"      ... and {len(missing) - 5} more")
+    if missing and not args.no_sheet:
+        # The rebuild below rewrites every row from this database, so it
+        # resolves all of these at once; a targeted retry would be wasted work.
+        print("   the rebuild in step 4 rewrites every row, which covers these")
+    elif missing and args.apply:
+        outcome = resync_grades()
+        print(f"   reconciled {outcome['fixed']}; {outcome['still_missing']} still missing")
+        if outcome["still_missing"]:
+            sheet_ok = False
+    elif missing:
+        print("   would retry each against the sheet")
+
     # ---- 3. rebuild the sheet from the database ---------------------------
     if args.no_sheet:
         print("\n4. Rebuild sheet: skipped (--no-sheet)")
@@ -191,7 +212,10 @@ def main() -> int:
             for line in (proc.stdout or "").splitlines():
                 print(f"   {line}")
             if proc.returncode == 0:
-                print("   sheet rewritten from the database")
+                from ivy_core.picks_tracker import mark_all_synced
+                marked = mark_all_synced()
+                print(f"   sheet rewritten from the database "
+                      f"({marked} grade(s) confirmed present)")
             else:
                 sheet_ok = False
                 print(f"   REBUILD FAILED (exit {proc.returncode}) — the sheet was NOT updated")
