@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger("ivy.applescript")
 
 # Default subprocess timeout (seconds) for a single osascript invocation.
 DEFAULT_TIMEOUT_S = 30
+
+# Reminders writes get longer than the default. Even without the `exists`
+# enumeration, the first write after the Mac wakes has to launch Reminders and
+# let it settle, which can outrun 30s. This runs on the poller thread, so the
+# ceiling is a deliberate compromise: long enough that a slow write completes,
+# short enough that a wedged one does not stall inbound messages for minutes.
+REMINDERS_WRITE_TIMEOUT_S = 75
 
 # `on run argv` scripts for iMessage send — untrusted content (recipient,
 # message body, attachment path) is passed as process argv, never
@@ -125,19 +132,24 @@ on run argv
 end run
 """
 
+# `exists list X` is the slow path in Reminders scripting: it makes the app
+# enumerate and sync every list before answering, which regularly outran the
+# 30s subprocess timeout and surfaced to Henry as "AppleScript execution timed
+# out" on every add, while reads — which reference the list directly — kept
+# working. Referencing the list and catching the failure is the same logic
+# without the enumeration.
 REMINDERS_ADD_ARGV_SCRIPT = """
 on run argv
     set listNameValue to item 1 of argv
     set titleValue to item 2 of argv
     tell application "Reminders"
         try
-            if not (exists list listNameValue) then
-                make new list with properties {name:listNameValue}
-            end if
-            set targetList to list listNameValue
-            tell targetList
-                make new reminder with properties {name:titleValue}
-            end tell
+            try
+                set targetList to list listNameValue
+            on error
+                set targetList to make new list with properties {name:listNameValue}
+            end try
+            make new reminder at end of targetList with properties {name:titleValue}
             return "SUCCESS"
         on error err
             return "ERROR: " & err
@@ -224,7 +236,8 @@ class AppleScriptRunner:
         """Convenience: build and run an outbound iMessage send."""
         return self.run(self.build_imessage_send_script(recipient, body))
 
-    def run_argv(self, script_source: str, args: List[str]) -> str:
+    def run_argv(self, script_source: str, args: List[str],
+                 timeout: Optional[int] = None) -> str:
         """Execute an ``on run argv`` AppleScript with ``args`` passed as process argv.
 
         Unlike :meth:`run`, the caller's content is never embedded in the
@@ -247,11 +260,15 @@ class AppleScriptRunner:
                 ["osascript", "-e", script_source, "--", *args],
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=timeout or self.timeout,
             )
         except subprocess.TimeoutExpired:
-            logger.error("AppleScript (argv) timed out after %ss", self.timeout)
-            return "ERROR: AppleScript execution timed out."
+            effective = timeout or self.timeout
+            logger.error("AppleScript (argv) timed out after %ss", effective)
+            return (
+                f"ERROR: AppleScript execution timed out after {effective}s. "
+                "Reminders may be slow to launch — open it once and retry."
+            )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("AppleScript (argv) subprocess failed: %s", exc)
             return "ERROR: AppleScript execution failed."
@@ -288,7 +305,10 @@ class AppleScriptRunner:
 
         Returns exactly "SUCCESS", or "ERROR: ...".
         """
-        return self.run_argv(REMINDERS_ADD_ARGV_SCRIPT, [list_name, title])
+        return self.run_argv(
+            REMINDERS_ADD_ARGV_SCRIPT, [list_name, title],
+            timeout=REMINDERS_WRITE_TIMEOUT_S,
+        )
 
     def send_imessage_file_argv(self, recipient: str, file_path: str) -> str:
         """Send a file attachment by emulating a human paste into the Messages

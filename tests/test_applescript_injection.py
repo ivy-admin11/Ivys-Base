@@ -137,7 +137,10 @@ def test_applescript_calls_carry_a_timeout(captured_argv):
     hung Apple app wedges all inbound iMessage handling."""
     main.add_apple_reminder("Milk")
     _, kwargs = _only_call(captured_argv)
-    assert kwargs["timeout"] == applescript.DEFAULT_TIMEOUT_S
+    # A Reminders write takes the longer, explicit ceiling rather than the
+    # default — but it must still have one, and it must still be bounded.
+    assert kwargs["timeout"] == applescript.REMINDERS_WRITE_TIMEOUT_S
+    assert 0 < kwargs["timeout"] <= 120
 
 
 @pytest.mark.parametrize(
@@ -256,3 +259,86 @@ def test_deepseek_tool_dispatch_passes_the_inbound_message(monkeypatch):
     assert out == "Milk, Eggs"
     # The inbound message must reach the re-run guard, not an undefined name.
     assert seen["inbound_text"] == "what's on my list?"
+
+
+class TestRemindersAddPerformance:
+    """The add script timed out on every attempt; the read script never did.
+
+    The difference was one line. `exists list X` makes Reminders enumerate and
+    sync every list before answering, which regularly outran the 30s
+    subprocess timeout — so Henry got "AppleScript execution timed out" twice
+    in a row while reads worked fine. Referencing the list directly and
+    catching the failure is the same logic without the enumeration.
+    """
+
+    def test_the_add_script_does_not_enumerate_lists(self):
+        from utils.applescript import REMINDERS_ADD_ARGV_SCRIPT
+        assert "exists list" not in REMINDERS_ADD_ARGV_SCRIPT, (
+            "`exists list` is the slow path that caused the timeouts"
+        )
+
+    def test_it_still_creates_a_missing_list(self):
+        """Dropping `exists` must not drop the create-if-absent behaviour."""
+        from utils.applescript import REMINDERS_ADD_ARGV_SCRIPT
+        assert "make new list" in REMINDERS_ADD_ARGV_SCRIPT
+        assert "on error" in REMINDERS_ADD_ARGV_SCRIPT
+
+    def test_it_still_creates_the_reminder(self):
+        from utils.applescript import REMINDERS_ADD_ARGV_SCRIPT
+        assert "make new reminder" in REMINDERS_ADD_ARGV_SCRIPT
+
+    def test_the_read_script_was_already_using_the_fast_path(self):
+        """Which is why reads worked throughout — the control case."""
+        from utils.applescript import REMINDERS_FETCH_ARGV_SCRIPT
+        assert "exists list" not in REMINDERS_FETCH_ARGV_SCRIPT
+        assert "set targetList to list" in REMINDERS_FETCH_ARGV_SCRIPT
+
+    def test_a_write_gets_longer_than_the_default(self, monkeypatch):
+        import utils.applescript as a
+
+        captured = {}
+
+        class Done:
+            returncode, stdout, stderr = 0, "SUCCESS", ""
+
+        def fake_run(cmd, **kw):
+            captured["timeout"] = kw.get("timeout")
+            return Done()
+        monkeypatch.setattr(a.subprocess, "run", fake_run)
+
+        a.AppleScriptRunner().add_reminder_argv("Household", "chicken teriyaki")
+        assert captured["timeout"] == a.REMINDERS_WRITE_TIMEOUT_S
+        assert captured["timeout"] > a.DEFAULT_TIMEOUT_S
+
+    def test_the_write_timeout_is_bounded(self):
+        """It runs on the poller thread — a wedged write must not stall
+        inbound messages for minutes."""
+        import utils.applescript as a
+        assert a.REMINDERS_WRITE_TIMEOUT_S <= 120
+
+    def test_other_calls_keep_the_default_timeout(self, monkeypatch):
+        import utils.applescript as a
+
+        captured = {}
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        monkeypatch.setattr(a.subprocess, "run",
+                            lambda cmd, **kw: (captured.update(kw), Done())[1])
+        a.AppleScriptRunner().fetch_reminders_argv("Household")
+        assert captured["timeout"] == a.DEFAULT_TIMEOUT_S
+
+    def test_a_timeout_message_tells_the_user_what_to_do(self, monkeypatch):
+        import subprocess as sp
+
+        import utils.applescript as a
+
+        def boom(cmd, **kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout", 30))
+        monkeypatch.setattr(a.subprocess, "run", boom)
+
+        out = a.AppleScriptRunner().add_reminder_argv("Household", "x")
+        assert out.startswith("ERROR:")
+        assert "Reminders may be slow to launch" in out
+        assert str(a.REMINDERS_WRITE_TIMEOUT_S) in out
