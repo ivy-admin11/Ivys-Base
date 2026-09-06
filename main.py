@@ -77,7 +77,7 @@ from registry import GEMINI_TOOL_DECLARATIONS, DEEPSEEK_TOOL_SCHEMA
 from ivy_core import receipts
 from ivy_core import outbox as _outbox
 from ivy_core import attachment_verify
-from ivy_core import agent_watchdog
+from ivy_core import agent_watchdog, proactive
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import split_imessage_content
 from utils.applescript import AppleScriptRunner
@@ -1744,6 +1744,17 @@ def background_imessage_worker() -> None:
                     )
                 except Exception as watchdog_err:
                     logger.error("Watchdog check failed: %s", watchdog_err)
+                try:
+                    # Proactive findings ride the same interval. Deterministic
+                    # checks only, capped at one ordinary text a day; see
+                    # ivy_core/proactive.py for why it is not a model deciding.
+                    def _notify(body: str) -> bool:
+                        return run_local_applescript_send(HENRY_PHONE, body) == "SUCCESS"
+
+                    proactive.run_once(_notify)
+                    proactive.maybe_send_digest(_notify)
+                except Exception as proactive_err:
+                    logger.error("Proactive check failed: %s", proactive_err)
 
             row = safe_fetch_last_message(last_id)
 
