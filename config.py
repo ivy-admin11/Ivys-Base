@@ -220,7 +220,21 @@ DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE: str = (
 # READWISE API
 # ============================================================================
 
-READWISE_API_ENDPOINT: str = "https://readwise.io/api/v2/highlights/"
+# /highlights/ is the LIST endpoint: capped at 20 requests/minute, and its
+# rows carry only a book_id — no title or author. fetch_readwise_highlights
+# read item["title"] from those rows, so every highlight reached the model
+# labelled "Saved Article". /export/ returns highlights grouped under their
+# book with title, author and category attached, in one call, under the
+# general 240/min cap.
+READWISE_EXPORT_ENDPOINT: str = "https://readwise.io/api/v2/export/"
+
+# Readwise's own spaced-repetition pick for today. No parameters, one call —
+# it has already chosen what is worth resurfacing.
+READWISE_REVIEW_ENDPOINT: str = "https://readwise.io/api/v2/review/"
+
+# /export/ with no bound returns the entire account. Ask only for what has
+# changed recently.
+READWISE_EXPORT_LOOKBACK_DAYS: int = 30
 """Readwise API endpoint for fetching highlights"""
 
 READWISE_HIGHLIGHTS_LIMIT: int = 15

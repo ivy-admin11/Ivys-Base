@@ -181,6 +181,54 @@ def fetch_market_news() -> BlockResult:
     return _feed_items(MARKET_FEEDS)
 
 
+def fetch_readwise_review() -> BlockResult:
+    """Readwise's Daily Review — its own spaced-repetition pick for today.
+
+    /api/v2/review/ takes no parameters and needs no tuning: Readwise has
+    already chosen what is worth resurfacing. The highlights it returns carry
+    their title and author, so each line can say where it came from — unlike
+    the /highlights/ LIST endpoint, whose rows have neither.
+
+    Highlights are printed as written. Nothing summarises them, so nothing
+    can put words in an author's mouth.
+    """
+    import requests
+
+    token = os.environ.get("READWISE_API_KEY", "")
+    if not token:
+        return BlockResult.unavailable("READWISE_API_KEY not set")
+    try:
+        r = requests.get(
+            "https://readwise.io/api/v2/review/",
+            headers={"Authorization": f"Token {token}"},
+            timeout=HTTP_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as exc:
+        return BlockResult.unavailable(f"readwise: {type(exc).__name__}")
+
+    highlights = payload.get("highlights") or []
+    if not highlights:
+        return BlockResult.unavailable("no highlights in today's review")
+
+    lines = []
+    for hl in highlights[:2]:
+        text = (hl.get("text") or "").strip()
+        if not text:
+            continue
+        if len(text) > 280:
+            text = text[:277].rstrip() + "…"
+        title = (hl.get("title") or "").strip()
+        author = (hl.get("author") or "").strip()
+        attribution = " — ".join(p for p in (title, author) if p)
+        lines.append(f"“{text}”" + (f"\n  {attribution}" if attribution else ""))
+
+    if not lines:
+        return BlockResult.unavailable("review returned no usable highlights")
+    return BlockResult(text="\n\n".join(lines), sources=["readwise.io/api/v2/review"])
+
+
 MARKET_SYMBOLS = [("S&P 500", "^spx"), ("Nasdaq", "^ndq"), ("Dow", "^dji")]
 
 
@@ -223,6 +271,7 @@ BLOCKS: List[Block] = [
     Block("weather", "☀️ Weather", MORNING, fetch_weather),
     Block("geopolitical", "🌍 World", MORNING, fetch_geopolitical),
     Block("ai_news", "🤖 AI", MORNING, fetch_ai_news),
+    Block("readwise", "📚 From your highlights", MORNING, fetch_readwise_review),
     Block("market_close", "📊 Market close", EVENING, fetch_market_close),
     Block("market_news", "📰 Markets", EVENING, fetch_market_news),
 ]

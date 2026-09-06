@@ -40,7 +40,7 @@ import requests
 import subprocess
 import google.generativeai as genai
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re as _re
 from typing import List, Optional, Dict, Any, Callable, Tuple
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -63,7 +63,8 @@ from config import (
     ADMIN_SECRET,
     GEMINI_SYSTEM_INSTRUCTION,
     DEEPSEEK_SYSTEM_INSTRUCTION_TEMPLATE,
-    READWISE_API_ENDPOINT,
+    READWISE_EXPORT_ENDPOINT,
+    READWISE_EXPORT_LOOKBACK_DAYS,
     READWISE_HIGHLIGHTS_LIMIT,
     READWISE_TOKEN_OPTIMIZATION_MAX_CHARS,
     LOG_LEVEL,
@@ -592,17 +593,27 @@ def optimize_token_payload(raw_text: str, max_chars: int = 3500) -> str:
 
 
 def fetch_readwise_highlights() -> str:
-    """Fetch saved articles and highlights from Readwise API."""
+    """Fetch recent highlights from Readwise, with their sources attached.
+
+    Uses /api/v2/export/ rather than /api/v2/highlights/. The LIST endpoint's
+    rows have no title or author — only a book_id — so the previous version
+    labelled every single highlight "Saved Article", which is worse than no
+    attribution because it looks like attribution. /export/ groups highlights
+    under their book and carries title, author and category.
+    """
     active_token = os.environ.get("READWISE_API_KEY", "")
     if not active_token:
         return "❌ Readwise pipeline offline: READWISE_API_KEY missing from environment."
 
     headers = {"Authorization": f"Token {active_token}"}
+    since = (datetime.now(timezone.utc)
+             - timedelta(days=READWISE_EXPORT_LOOKBACK_DAYS)).isoformat()
 
     try:
         response = requests.get(
-            READWISE_API_ENDPOINT,
+            READWISE_EXPORT_ENDPOINT,
             headers=headers,
+            params={"updatedAfter": since},
             timeout=EXTERNAL_API_TIMEOUT,
         )
         if response.status_code != 200:
@@ -610,20 +621,28 @@ def fetch_readwise_highlights() -> str:
                 f"❌ Readwise API connection issue. Status Code: {response.status_code}"
             )
 
-        data = response.json()
-        results = data.get("results", [])
-        if not results:
-            return "Your Readwise repository is currently clear of saved elements."
-
+        books = response.json().get("results", [])
         compiled_items = []
-        for item in results[: READWISE_HIGHLIGHTS_LIMIT]:
-            text = item.get("text", "")
-            note = item.get("note", "")
-            title = item.get("title", "Saved Article")
-            block = f"- From '{title}': \"{text}\""
-            if note:
-                block += f" (Note: {note})"
-            compiled_items.append(block)
+        for book in books:
+            title = (book.get("title") or "Untitled").strip()
+            author = (book.get("author") or "").strip()
+            source = f"{title} — {author}" if author else title
+            for hl in book.get("highlights", []):
+                text = (hl.get("text") or "").strip()
+                if not text:
+                    continue
+                block = f"- From '{source}': \"{text}\""
+                note = (hl.get("note") or "").strip()
+                if note:
+                    block += f" (Note: {note})"
+                compiled_items.append(block)
+                if len(compiled_items) >= READWISE_HIGHLIGHTS_LIMIT:
+                    break
+            if len(compiled_items) >= READWISE_HIGHLIGHTS_LIMIT:
+                break
+
+        if not compiled_items:
+            return "No Readwise highlights in the last %d days." % READWISE_EXPORT_LOOKBACK_DAYS
 
         raw_output = "\n".join(compiled_items)
         return optimize_token_payload(raw_output, max_chars=READWISE_TOKEN_OPTIMIZATION_MAX_CHARS)

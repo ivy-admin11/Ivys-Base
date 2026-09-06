@@ -253,3 +253,83 @@ class TestRun:
         monkeypatch.setattr(db, "require_env", lambda k: "+15555550100")
         db.run(db.MORNING, send=True, blocks=[ok("a"), boom("b")])
         assert captured["content_summary"] == "1/2 section(s)"
+
+
+class TestReadwiseReview:
+    """The Daily Review block.
+
+    Readwise's own spaced-repetition pick, which is why this block has no
+    tuning: it takes no parameters. The one thing it must get right is
+    attribution — the highlights endpoint the rest of the codebase used has
+    no title field, so every highlight was labelled "Saved Article", which
+    looks like attribution while being none.
+    """
+
+    PAYLOAD = {
+        "review_id": 1,
+        "review_completed": False,
+        "highlights": [
+            {"text": "The cost of a thing is the amount of life exchanged for it.",
+             "title": "Walden", "author": "Henry David Thoreau"},
+            {"text": "Second highlight.", "title": "Another Book", "author": "Someone"},
+            {"text": "Third — beyond the limit.", "title": "Third", "author": "X"},
+        ],
+    }
+
+    def _patch(self, monkeypatch, payload, ok=True, key="tok"):
+        import requests
+
+        class R:
+            def json(self): return payload
+            def raise_for_status(self):
+                if not ok:
+                    raise RuntimeError("401")
+        monkeypatch.setenv("READWISE_API_KEY", key)
+        monkeypatch.setattr(requests, "get", lambda *a, **k: R())
+
+    def test_the_highlight_is_quoted_verbatim(self, monkeypatch):
+        self._patch(monkeypatch, self.PAYLOAD)
+        r = db.fetch_readwise_review()
+        assert "amount of life exchanged for it" in r.text
+        assert not r.failed
+
+    def test_it_says_where_the_highlight_came_from(self, monkeypatch):
+        """The defect this replaces: every highlight read 'Saved Article'."""
+        self._patch(monkeypatch, self.PAYLOAD)
+        text = db.fetch_readwise_review().text
+        assert "Walden" in text and "Thoreau" in text
+        assert "Saved Article" not in text
+
+    def test_it_shows_at_most_two(self, monkeypatch):
+        self._patch(monkeypatch, self.PAYLOAD)
+        assert "beyond the limit" not in db.fetch_readwise_review().text
+
+    def test_a_long_highlight_is_truncated_visibly(self, monkeypatch):
+        self._patch(monkeypatch, {"highlights": [{"text": "x" * 400, "title": "T"}]})
+        text = db.fetch_readwise_review().text
+        assert "…" in text and len(text) < 400
+
+    def test_a_missing_author_does_not_print_a_dangling_dash(self, monkeypatch):
+        self._patch(monkeypatch, {"highlights": [{"text": "Quote.", "title": "Book"}]})
+        assert "— \n" not in db.fetch_readwise_review().text
+
+    def test_no_key_is_unavailable_not_an_exception(self, monkeypatch):
+        monkeypatch.setenv("READWISE_API_KEY", "")
+        r = db.fetch_readwise_review()
+        assert r.failed and "READWISE_API_KEY" in r.text
+
+    def test_an_api_error_is_unavailable(self, monkeypatch):
+        self._patch(monkeypatch, {}, ok=False)
+        assert db.fetch_readwise_review().failed
+
+    def test_an_empty_review_says_so(self, monkeypatch):
+        self._patch(monkeypatch, {"highlights": []})
+        r = db.fetch_readwise_review()
+        assert r.failed and "no highlights" in r.text
+
+    def test_it_names_its_source(self, monkeypatch):
+        self._patch(monkeypatch, self.PAYLOAD)
+        assert db.fetch_readwise_review().sources == ["readwise.io/api/v2/review"]
+
+    def test_it_is_in_the_morning_brief(self):
+        assert "readwise" in [b.key for b in db.blocks_for(db.MORNING)]
