@@ -25,6 +25,8 @@ JOB_PLISTS = {
     "sharp_picks": "com.ivy.sharppicks",
     "happy_hour": "com.ivy.happy_hour_scout",
     "familia_meal_planner": "com.ivy.familia_meal_planner",
+    "daily_brief_morning": "com.ivy.daily_brief_morning",
+    "daily_brief_evening": "com.ivy.daily_brief_evening",
 }
 
 # No daemons are watched today. com.ivy.brain was, until it was retired --

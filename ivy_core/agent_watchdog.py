@@ -55,6 +55,8 @@ EXPECTED_SILENCE_H: Dict[str, int] = {
     "sharp_picks": 20,           # daily at 09/15/21 -> 12h worst gap
     "happy_hour": 192,           # Sundays 12:00 -> 168h between runs
     "familia_meal_planner": 192, # Sundays 08:00 -> 168h between runs
+    "daily_brief_morning": 30,   # daily 07:30 -> 24h between runs
+    "daily_brief_evening": 30,   # daily 17:30 -> 24h between runs
 }
 
 # com.ivy.brain was briefly watched here. It is now RETIRED (2026-09-05, see
@@ -71,6 +73,8 @@ FRIENDLY_NAMES = {
     "sharp_picks": "Sharp Picks",
     "happy_hour": "Happy Hour Scout",
     "familia_meal_planner": "Familia Meal Planner",
+    "daily_brief_morning": "Morning Brief",
+    "daily_brief_evening": "Evening Brief",
 }
 
 # Log files are the second source of truth: a job that ran and produced no
@@ -79,6 +83,8 @@ LOG_FILES = {
     "sharp_picks": "logs/sharppicks_scheduled.log",
     "happy_hour": "logs/happy_hour_scheduled.log",
     "familia_meal_planner": "logs/familia_meal_planner.log",
+    "daily_brief_morning": "logs/daily_brief_morning.log",
+    "daily_brief_evening": "logs/daily_brief_evening.log",
 }
 
 # Never re-alert about the same job more often than this.
