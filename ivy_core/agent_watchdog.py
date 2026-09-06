@@ -55,20 +55,22 @@ EXPECTED_SILENCE_H: Dict[str, int] = {
     "sharp_picks": 20,           # daily at 09/15/21 -> 12h worst gap
     "happy_hour": 192,           # Sundays 12:00 -> 168h between runs
     "familia_meal_planner": 192, # Sundays 08:00 -> 168h between runs
-    # com.ivy.brain is not scheduled -- it is a KeepAlive daemon, so launchd
-    # restarts it on any exit and it should never be silent for long. This
-    # threshold is a liveness heuristic rather than a schedule: a week with no
-    # output from an always-on process means it is not doing anything. It went
-    # quiet on 2026-07-16 and nothing noticed for seven weeks, which is the
-    # whole reason it is listed here.
-    "ivy_brain": 168,
 }
+
+# com.ivy.brain was briefly watched here. It is now RETIRED (2026-09-05, see
+# deploy/launchd/retired/README.md), and watching a job that is meant to be
+# dead produces exactly one thing: a weekly false alarm about its silence.
+# Its log still sits in ~/ai-admin-api with a July mtime, so leaving it in
+# this table would have paged Henry on the next gateway restart.
+#
+# The rule this leaves behind: this table is for jobs that are supposed to be
+# running. Retiring a job means removing it from here, not lowering its
+# threshold.
 
 FRIENDLY_NAMES = {
     "sharp_picks": "Sharp Picks",
     "happy_hour": "Happy Hour Scout",
     "familia_meal_planner": "Familia Meal Planner",
-    "ivy_brain": "Ivy Brain (ai-admin-api)",
 }
 
 # Log files are the second source of truth: a job that ran and produced no
@@ -77,7 +79,6 @@ LOG_FILES = {
     "sharp_picks": "logs/sharppicks_scheduled.log",
     "happy_hour": "logs/happy_hour_scheduled.log",
     "familia_meal_planner": "logs/familia_meal_planner.log",
-    "ivy_brain": "~/ai-admin-api/ivy_brain_output.log",
 }
 
 # Never re-alert about the same job more often than this.

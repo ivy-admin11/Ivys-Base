@@ -138,6 +138,10 @@ for obsolete in com.ivy.weeklyplanner com.ivy.bravoscout; do
         echo "  - $obsolete.plist — points at a script that has never existed in this repo; no replacement template is installed for it."
     fi
 done
+if [ -f "$TARGET_DIR/com.ivy.brain.plist" ]; then
+    found_obsolete=true
+    echo "  - com.ivy.brain.plist — RETIRED 2026-09-05. Unrestricted iMessage trigger with a shell-execution tool, and a second poller on the same chat.db. Its template lives in deploy/launchd/retired/ and is deliberately not installed; see the README there before reviving it."
+fi
 if [ -f "$TARGET_DIR/com.lexi.ivy.plist" ]; then
     found_obsolete=true
     echo "  - com.lexi.ivy.plist — RETIRED 2026-09-02. Duplicate of com.ivy.gateway on /usr/bin/python3; it crash-loops on port 8000 whenever com.ivy.gateway is up. Move it back to $TARGET_DIR/disabled/ and 'launchctl bootout gui/\$(id -u)/com.lexi.ivy'."

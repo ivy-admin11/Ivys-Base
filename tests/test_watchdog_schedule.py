@@ -25,13 +25,14 @@ JOB_PLISTS = {
     "sharp_picks": "com.ivy.sharppicks",
     "happy_hour": "com.ivy.happy_hour_scout",
     "familia_meal_planner": "com.ivy.familia_meal_planner",
-    "ivy_brain": "com.ivy.brain",
 }
 
-# com.ivy.brain has no StartCalendarInterval: it is a KeepAlive daemon that
-# launchd restarts on any exit. Its threshold is a liveness heuristic, not a
-# derived schedule, so the gap check does not apply to it.
-DAEMONS = {"ivy_brain"}
+# No daemons are watched today. com.ivy.brain was, until it was retired --
+# see deploy/launchd/retired/README.md. Kept as an empty set because the
+# distinction is real: a KeepAlive daemon has no schedule to derive a
+# threshold from, so if one is ever watched again it needs the separate
+# treatment below rather than the gap check.
+DAEMONS: set[str] = set()
 
 
 def _load(label: str) -> dict:
@@ -105,33 +106,20 @@ def test_every_plist_template_is_valid_xml(template: str) -> None:
     plistlib.loads((TEMPLATES / template).read_bytes())
 
 
-@pytest.mark.parametrize("job", sorted(DAEMONS))
-def test_daemons_are_keepalive_with_no_schedule(job: str) -> None:
-    """A daemon's threshold cannot be derived, so pin what it actually is.
+def test_retired_jobs_are_not_watched() -> None:
+    """A retired job must be removed from the table, not given a bigger number.
 
-    com.ivy.brain runs KeepAlive=true with no calendar interval -- launchd
-    relaunches it on any exit, so it should never be quiet for long. It went
-    silent on 2026-07-16 and nothing reported it for seven weeks, because the
-    watchdog only knew about the three scheduled agents.
+    com.ivy.brain was added here, then retired the same day. Its log still
+    exists with a July timestamp, so leaving it watched would have alerted on
+    the next gateway restart about a job that is supposed to be dead -- the
+    false-alarm failure this watchdog exists to avoid.
     """
-    plist = _load(JOB_PLISTS[job])
-    assert plist.get("KeepAlive") is True
-    assert "StartCalendarInterval" not in plist
-    assert EXPECTED_SILENCE_H[job] > 0
-
-
-def test_a_daemon_log_outside_the_repo_still_resolves(tmp_path, monkeypatch) -> None:
-    """brain's log lives in ~/ai-admin-api, not in this repo."""
-    from datetime import datetime, timezone
-
-    from ivy_core import agent_watchdog as wd
-
-    log = tmp_path / "ivy_brain_output.log"
-    log.write_text("alive\n")
-    monkeypatch.setitem(wd.LOG_FILES, "ivy_brain", str(log))   # absolute
-    seen = wd.last_activity("ivy_brain")
-    assert seen is not None, "an absolute log path must be readable"
-    assert (datetime.now(timezone.utc) - seen).total_seconds() < 120
+    retired = {"ivy_brain"}
+    assert not (set(EXPECTED_SILENCE_H) & retired), (
+        "a retired job is still in EXPECTED_SILENCE_H; it will alert forever"
+    )
+    from ivy_core.agent_watchdog import LOG_FILES
+    assert not (set(LOG_FILES) & retired)
 
 
 def test_a_missing_daemon_log_does_not_false_alarm(tmp_path, monkeypatch) -> None:
