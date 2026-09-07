@@ -30,7 +30,23 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("ivy.historical_scores")
 
-ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+# site.api.espn.com answers 403 Forbidden to this client; site.web.api is the
+# host that serves it. Both are tried, in that order, because which one works
+# has changed before and an undocumented endpoint gives no notice.
+ESPN_HOSTS = (
+    "https://site.web.api.espn.com/apis/site/v2/sports",
+    "https://site.api.espn.com/apis/site/v2/sports",
+)
+
+# A non-browser User-Agent is refused. This is a plain browser string, not an
+# attempt to look like a person: the endpoint simply rejects anything else.
+ESPN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
 HTTP_TIMEOUT_S = 20
 
 # Ivy's sport label -> (ESPN sport, ESPN league), and the sport_key
@@ -123,17 +139,26 @@ def fetch_completed_games(sport: str, date: str) -> List[dict]:
 
     import requests
 
-    try:
-        resp = requests.get(
-            f"{ESPN_BASE}/{espn_sport}/{league}/scoreboard",
-            params={"dates": date.replace("-", ""), "limit": 400},
-            timeout=HTTP_TIMEOUT_S,
-            headers={"User-Agent": "ivy-backfill (personal use)"},
-        )
-        resp.raise_for_status()
-        events = resp.json().get("events") or []
-    except Exception as exc:
-        logger.warning("ESPN %s/%s on %s: %s", espn_sport, league, date, exc)
+    events, last_error = None, None
+    for base in ESPN_HOSTS:
+        url = f"{base}/{espn_sport}/{league}/scoreboard"
+        try:
+            resp = requests.get(
+                url,
+                params={"dates": date.replace("-", "")},
+                timeout=HTTP_TIMEOUT_S,
+                headers=ESPN_HEADERS,
+            )
+            resp.raise_for_status()
+            events = resp.json().get("events") or []
+            break
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if events is None:
+        logger.warning("ESPN %s/%s on %s unreachable: %s",
+                       espn_sport, league, date, last_error)
         return []
 
     games = [g for g in (normalise_event(e, sport_key) for e in events) if g]

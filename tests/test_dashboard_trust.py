@@ -480,3 +480,38 @@ class TestAutoSyncDoesNotDuplicate:
         api.appended.clear()
         self._sync()
         assert sum(len(b) for b in api.appended) == 0
+
+
+class TestTheClosingSummaryIsTrue:
+    """The repair script reported "88 pick(s) marked unverifiable" on a run
+    that marked exactly one.
+
+    `marked` held the write-off count, then step 6 reassigned it to
+    mark_all_synced()'s row count — 88 — and the closing line printed that.
+    A summary that overstates by 88x is the same class of fault as everything
+    else this pipeline has produced: confidently wrong, nothing raised.
+    """
+
+    def test_the_write_off_count_is_not_shadowed(self):
+        import re
+
+        src = (REPO / "scripts" / "repair_dashboard.py").read_text()
+        body = src[src.index("def main("):]
+        assigns = re.findall(r"^\s*marked\s*=", body, re.M)
+        assert len(assigns) == 1, (
+            f"`marked` is assigned {len(assigns)} times in main(); a second "
+            "assignment is what made the closing line report the wrong number"
+        )
+
+    def test_mark_all_synced_uses_its_own_name(self):
+        src = (REPO / "scripts" / "repair_dashboard.py").read_text()
+        assert "confirmed = mark_all_synced()" in src
+
+    def test_the_backfill_runs_before_the_write_off(self):
+        """Writing a pick off as ungradeable and then trying to grade it is
+        backwards; the write-off should only cover what nothing reached."""
+        src = (REPO / "scripts" / "repair_dashboard.py").read_text()
+        body = src[src.index("def main("):]
+        assert body.index("Backfill from historical scoreboards") < body.index(
+            "Ungraded picks still with no source"
+        )

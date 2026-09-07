@@ -178,3 +178,53 @@ class TestBackfill:
             backfill_pick({"sport": "MLB", "matchup": "A @ B", "side": "A ML",
                            "game_day": "2026-07-19"}, cache)
         assert len(calls) == 1
+
+
+class TestEspnAccess:
+    """The first live run returned 403 from every request.
+
+    site.api.espn.com refuses this client; site.web.api.espn.com serves it.
+    A non-browser User-Agent is also refused. Both are undocumented endpoints
+    with no compatibility promise, so the fetch tries each host rather than
+    betting the backfill on one.
+    """
+
+    def test_the_working_host_is_tried_first(self):
+        assert hs.ESPN_HOSTS[0].startswith("https://site.web.api.espn.com")
+
+    def test_the_other_host_is_still_a_fallback(self):
+        assert any("site.api.espn.com" in h for h in hs.ESPN_HOSTS)
+        assert len(hs.ESPN_HOSTS) >= 2
+
+    def test_a_browser_user_agent_is_sent(self):
+        """The endpoint rejects anything else."""
+        assert "Mozilla" in hs.ESPN_HEADERS["User-Agent"]
+
+    def test_a_403_on_the_first_host_falls_through_to_the_second(self, monkeypatch):
+        import requests
+        tried = []
+
+        class R:
+            def __init__(self, ok): self.ok = ok
+            def raise_for_status(self):
+                if not self.ok:
+                    raise RuntimeError("403 Client Error: Forbidden")
+            def json(self): return {"events": [event()]}
+
+        def fake_get(url, params=None, timeout=None, headers=None):
+            tried.append(url)
+            return R(ok="site.web.api" in url)
+        monkeypatch.setattr(requests, "get", fake_get)
+
+        games = hs.fetch_completed_games("MLB", "2026-07-19")
+        assert len(games) == 1, "the fallback host should have served it"
+        assert len(tried) == 1, "the working host is first, so one call suffices"
+
+    def test_every_host_failing_yields_no_games_not_an_exception(self, monkeypatch):
+        import requests
+
+        class R:
+            def raise_for_status(self): raise RuntimeError("403")
+            def json(self): return {}
+        monkeypatch.setattr(requests, "get", lambda *a, **k: R())
+        assert hs.fetch_completed_games("MLB", "2026-07-19") == []

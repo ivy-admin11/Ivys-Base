@@ -149,35 +149,11 @@ def main() -> int:
                 print("         nothing can be graded until it is. If the key was")
                 print("         rotated, put the new one in .env and re-run.")
 
-    # ---- 2. write off what can never be graded ----------------------------
-    conn = sqlite3.connect(PICKS_DB)
-    try:
-        stale, recent, undated = find_unverifiable(
-            conn, today=args.today, window_days=args.window_days
-        )
-        print(f"\n2. Ungraded picks, as of {args.today}")
-        print(f"   {len(recent)} still inside the {args.window_days}-day scores window — left pending")
-        print(f"   {len(undated)} with no usable date — left pending")
-        print(f"   {len(stale)} older than the window — {'marking' if args.apply else 'would mark'} unverifiable")
-        for row in stale[:5]:
-            print(f"      #{row[0]} {pick_date(row[2], row[1])} {row[4]} — {row[5]}")
-        if len(stale) > 5:
-            print(f"      ... and {len(stale) - 5} more")
-        marked = mark_unverifiable(conn, stale, apply=args.apply)
-
-        from ivy_core.picks_tracker import format_stats_for_pdf, get_stats_overall
-        overall = get_stats_overall(days_back=3650)
-        print("\n3. Record after repair" if args.apply else "\n3. Record as it stands now")
-        for line in format_stats_for_pdf(days_back=3650).splitlines():
-            print(f"   {line}")
-    finally:
-        conn.close()
-
     # ---- 2a. backfill old picks from historical scoreboards ---------------
     if args.no_backfill:
-        print("\n2b. Backfill from historical scoreboards: skipped (--no-backfill)")
+        print("\n2. Backfill from historical scoreboards: skipped (--no-backfill)")
     else:
-        print("\n2b. Backfill from historical scoreboards")
+        print("\n2. Backfill from historical scoreboards")
         conn = sqlite3.connect(PICKS_DB)
         try:
             rows = conn.execute("""
@@ -219,11 +195,39 @@ def main() -> int:
         if unsupported:
             print(f"   supported: {', '.join(sorted(SPORT_ROUTES))}")
 
+    # ---- 3. write off what no source can reach ----------------------------
+    #
+    # After the backfill, not before it. Marking a pick unverifiable and then
+    # trying to grade it is backwards: the write-off should only cover what
+    # nothing could reach.
+    conn = sqlite3.connect(PICKS_DB)
+    try:
+        stale, recent, undated = find_unverifiable(
+            conn, today=args.today, window_days=args.window_days
+        )
+        print(f"\n3. Ungraded picks still with no source, as of {args.today}")
+        print(f"   {len(recent)} still inside the {args.window_days}-day scores window — left pending")
+        print(f"   {len(undated)} with no usable date — left pending")
+        print(f"   {len(stale)} older than the window — {'marking' if args.apply else 'would mark'} unverifiable")
+        for row in stale[:5]:
+            print(f"      #{row[0]} {pick_date(row[2], row[1])} {row[4]} — {row[5]}")
+        if len(stale) > 5:
+            print(f"      ... and {len(stale) - 5} more")
+        marked = mark_unverifiable(conn, stale, apply=args.apply)
+
+        from ivy_core.picks_tracker import format_stats_for_pdf, get_stats_overall
+        overall = get_stats_overall(days_back=3650)
+        print("\n4. Record after repair" if args.apply else "\n4. Record as it stands now")
+        for line in format_stats_for_pdf(days_back=3650).splitlines():
+            print(f"   {line}")
+    finally:
+        conn.close()
+
     # ---- 2b. reconcile grades the sheet never received --------------------
     from ivy_core.picks_tracker import resync_grades, unsynced_grades
 
     missing = unsynced_grades()
-    print(f"\n3b. Grades recorded but missing from the sheet: {len(missing)}")
+    print(f"\n5. Grades recorded but missing from the sheet: {len(missing)}")
     for row in missing[:5]:
         print(f"      #{row['pick_id']} {row['matchup']} — {row['side']} = {row['result']}")
     if len(missing) > 5:
@@ -231,7 +235,7 @@ def main() -> int:
     if missing and not args.no_sheet:
         # The rebuild below rewrites every row from this database, so it
         # resolves all of these at once; a targeted retry would be wasted work.
-        print("   the rebuild in step 4 rewrites every row, which covers these")
+        print("   the rebuild in step 6 rewrites every row, which covers these")
     elif missing and args.apply:
         outcome = resync_grades()
         print(f"   reconciled {outcome['fixed']}; {outcome['still_missing']} still missing")
@@ -242,9 +246,9 @@ def main() -> int:
 
     # ---- 3. rebuild the sheet from the database ---------------------------
     if args.no_sheet:
-        print("\n4. Rebuild sheet: skipped (--no-sheet)")
+        print("\n6. Rebuild sheet: skipped (--no-sheet)")
     else:
-        print("\n4. Rebuild sheet from the database")
+        print("\n6. Rebuild sheet from the database")
         if not args.apply:
             print("   would clear the tab and rewrite every row from the database")
         else:
@@ -261,9 +265,12 @@ def main() -> int:
                 print(f"   {line}")
             if proc.returncode == 0:
                 from ivy_core.picks_tracker import mark_all_synced
-                marked = mark_all_synced()
+                # Distinct name: this used to be `marked`, which shadowed the
+                # unverifiable count and made the closing line report 88
+                # picks written off when the real number was 1.
+                confirmed = mark_all_synced()
                 print(f"   sheet rewritten from the database "
-                      f"({marked} grade(s) confirmed present)")
+                      f"({confirmed} grade(s) confirmed present)")
             else:
                 sheet_ok = False
                 print(f"   REBUILD FAILED (exit {proc.returncode}) — the sheet was NOT updated")
