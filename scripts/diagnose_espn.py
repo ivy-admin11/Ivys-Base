@@ -67,17 +67,33 @@ def pick_a_target():
 
 
 def matchups_for(sport, day):
+    """Ungraded matchups whose game resolves to `day`.
+
+    Filtering in SQL with COALESCE(NULLIF(game_day,''), report_date) printed
+    nothing: game_day holds "today", which is not empty, so NULLIF kept it and
+    nothing matched the date. The resolution rule lives in one place now, so
+    this filters in Python using that rule rather than restating it in SQL.
+    """
+    from ivy_core.pick_stats import resolve_pick_date
+
     conn = sqlite3.connect(PICKS_DB)
     try:
-        return [r[0] for r in conn.execute("""
-            SELECT DISTINCT p.matchup FROM picks p
+        rows = conn.execute("""
+            SELECT p.matchup, p.game_day, p.report_date FROM picks p
             LEFT JOIN results r ON r.pick_id = p.id
             WHERE (r.result IS NULL OR r.result = 'U')
               AND LOWER(p.sport) = LOWER(?)
-              AND COALESCE(NULLIF(p.game_day,''), p.report_date) LIKE ?
-        """, (sport, f"{day}%"))]
+        """, (sport,)).fetchall()
     finally:
         conn.close()
+    seen, out = set(), []
+    for matchup, game_day, report_date in rows:
+        if resolve_pick_date(game_day, report_date) != day:
+            continue
+        if matchup not in seen:
+            seen.add(matchup)
+            out.append(matchup)
+    return out
 
 
 def main() -> int:
