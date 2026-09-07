@@ -192,6 +192,14 @@ def main() -> int:
 
         print(f"   {graded} gradeable, {unreachable} no match found, "
               f"{unsupported} in a sport with no scoreboard route")
+        # "no match found" covers three different failures — nothing came
+        # back, nothing looked completed, or the names did not line up — and
+        # they need different fixes. Say which, instead of one number.
+        fetched = sum(len(v) for v in cache.values())
+        if unreachable and not graded:
+            print(f"   {len(cache)} scoreboard(s) fetched, {fetched} completed "
+                  f"game(s) parsed from them")
+            print("   scripts/diagnose_espn.py prints the raw response for one date")
         if unsupported:
             print(f"   supported: {', '.join(sorted(SPORT_ROUTES))}")
 
