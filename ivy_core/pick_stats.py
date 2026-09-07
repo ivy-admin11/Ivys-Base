@@ -7,7 +7,8 @@ and they already did once, over which column held the grade.
 """
 from __future__ import annotations
 
-from typing import Dict
+from datetime import datetime
+from typing import Dict, Optional
 
 
 # A pick's result is W, L, P, or NULL while it waits for its game. "U" is a
@@ -49,3 +50,27 @@ def format_hit_rate(stats: Dict) -> str:
     if stats["hit_rate"] is None:
         return f"no rate yet — {stats['decided']} of {MIN_DECIDED_FOR_RATE} decided"
     return f"{stats['hit_rate']:.1f}% of {stats['decided']} decided"
+
+
+def resolve_pick_date(game_day, report_date) -> Optional[str]:
+    """The date a pick's game was played, as YYYY-MM-DD, or None.
+
+    game_day is written by an LLM parsing free-form posts, so it is often not
+    a date at all: 79 of 81 ungraded picks hold the literal string "today".
+    Each falls back to its report_date, which is always a real date.
+
+    This lived in two places with two behaviours. The backfill's copy did
+    `game_day or report_date`, and "today" is truthy — so it took the garbage,
+    failed to parse it, and skipped the pick instead of falling back. Every
+    one of those 79 picks was silently unreachable. One definition now.
+    """
+    for value in (game_day, report_date):
+        if not value:
+            continue
+        text = str(value).strip()[:10]
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+            return text
+        except ValueError:
+            continue
+    return None

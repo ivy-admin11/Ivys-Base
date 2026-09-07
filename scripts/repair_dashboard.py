@@ -52,18 +52,12 @@ SCORES_WINDOW_DAYS = 3
 UNVERIFIABLE_NOTE = "ungradeable: game outside the scores window when grading was repaired"
 
 
-def pick_date(game_day: str | None, report_date: str | None) -> str | None:
-    """The date a pick's game was played, as best the row records it."""
-    for value in (game_day, report_date):
-        if not value:
-            continue
-        text = str(value).strip()[:10]
-        try:
-            datetime.strptime(text, "%Y-%m-%d")
-            return text
-        except ValueError:
-            continue
-    return None
+def pick_date(game_day, report_date):
+    """The date a pick's game was played. See pick_stats.resolve_pick_date —
+    this used to be a second implementation, and the two disagreed."""
+    from ivy_core.pick_stats import resolve_pick_date
+
+    return resolve_pick_date(game_day, report_date)
 
 
 def find_unverifiable(conn, *, today: str, window_days: int = SCORES_WINDOW_DAYS):

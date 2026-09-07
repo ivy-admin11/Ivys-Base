@@ -514,12 +514,12 @@ def backfill_pick(pick: Dict, games_by_key: Dict) -> Tuple[Optional[str], Option
     """
     from ivy_core.historical_scores import fetch_completed_games
 
+    from ivy_core.pick_stats import resolve_pick_date
+
     sport = (pick.get("sport") or "").strip()
-    day = (pick.get("game_day") or pick.get("report_date") or "").strip()[:10]
-    try:
-        datetime.strptime(day, "%Y-%m-%d")
-    except ValueError:
-        return None, None                      # e.g. a game_day of "today"
+    day = resolve_pick_date(pick.get("game_day"), pick.get("report_date"))
+    if day is None:
+        return None, None
 
     key = (sport.lower(), day)
     if key not in games_by_key:

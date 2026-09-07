@@ -36,14 +36,34 @@ def pick_a_target():
     conn = sqlite3.connect(PICKS_DB)
     try:
         row = conn.execute("""
-            SELECT p.sport, COALESCE(NULLIF(p.game_day,''), p.report_date), COUNT(*)
+            SELECT p.sport, p.report_date, COUNT(*)
             FROM picks p LEFT JOIN results r ON r.pick_id = p.id
             WHERE (r.result IS NULL OR r.result = 'U') AND LOWER(p.sport) = 'mlb'
             GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 1
         """).fetchone()
     finally:
         conn.close()
-    return (row[0], row[1][:10]) if row else ("MLB", "2026-07-19")
+    from ivy_core.pick_stats import resolve_pick_date
+
+    if row:
+        # The first version of this returned game_day unchecked and asked ESPN
+        # for ?dates=today, which is a 400. That is how the real bug surfaced.
+        day = resolve_pick_date(row[1], None)
+        if day:
+            return row[0], day
+    conn = sqlite3.connect(PICKS_DB)
+    try:
+        alt = conn.execute("""
+            SELECT p.sport, p.report_date FROM picks p
+            LEFT JOIN results r ON r.pick_id = p.id
+            WHERE (r.result IS NULL OR r.result = 'U') AND LOWER(p.sport) = 'mlb'
+            ORDER BY p.id LIMIT 1
+        """).fetchone()
+    finally:
+        conn.close()
+    if alt and resolve_pick_date(alt[1], None):
+        return alt[0], resolve_pick_date(alt[1], None)
+    return "MLB", "2026-07-19"
 
 
 def matchups_for(sport, day):

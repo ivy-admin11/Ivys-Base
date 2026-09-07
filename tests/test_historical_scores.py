@@ -228,3 +228,87 @@ class TestEspnAccess:
             def json(self): return {}
         monkeypatch.setattr(requests, "get", lambda *a, **k: R())
         assert hs.fetch_completed_games("MLB", "2026-07-19") == []
+
+
+class TestDateResolution:
+    """79 of 81 ungraded picks were unreachable because of one `or`.
+
+    game_day is written by a model reading free-form posts, and it holds the
+    literal string "today" for nearly every pick. The backfill did
+    `game_day or report_date`; "today" is truthy, so it took the garbage,
+    failed to parse it, and skipped the pick — never reaching the usable
+    report_date sitting beside it. The correct logic already existed in
+    repair_dashboard; this was a second, worse copy of it.
+    """
+
+    @pytest.mark.parametrize("game_day,report_date,expected", [
+        ("today", "2026-07-19", "2026-07-19"),
+        (None, "2026-09-01", "2026-09-01"),
+        ("", "2026-09-01", "2026-09-01"),
+        ("2026-07-20", "2026-07-19", "2026-07-20"),
+        ("2026-07-20T19:05:00Z", "2026-07-19", "2026-07-20"),
+        ("garbage", "also garbage", None),
+        (None, None, None),
+    ])
+    def test_it_falls_back_past_an_unusable_game_day(self, game_day, report_date, expected):
+        from ivy_core.pick_stats import resolve_pick_date
+        assert resolve_pick_date(game_day, report_date) == expected
+
+    def test_the_backfill_reaches_a_today_pick(self, monkeypatch):
+        """The exact shape of the 79."""
+        from ivy_core.result_updater import backfill_pick
+        asked = {}
+
+        def record(sport, day):
+            asked["day"] = day
+            return [hs.normalise_event(event(), "baseball_mlb")]
+        monkeypatch.setattr(hs, "fetch_completed_games", record)
+
+        pick = {"sport": "MLB", "game_day": "today", "report_date": "2026-07-19",
+                "matchup": "San Diego Padres @ Kansas City Royals",
+                "side": "Kansas City Royals ML"}
+        result, _ = backfill_pick(pick, {})
+        assert asked["day"] == "2026-07-19", "it must fall back, not skip"
+        assert result == "W"
+
+    def test_there_is_only_one_implementation(self):
+        """Two copies is how they came to disagree."""
+        import inspect
+
+        import scripts.repair_dashboard as rd
+        assert "resolve_pick_date" in inspect.getsource(rd.pick_date)
+
+
+class TestGarbageIsNotStored:
+    def test_an_unparseable_game_day_is_stored_as_none(self, tmp_path, monkeypatch):
+        """Keeping "today" shadows the usable report_date for every reader."""
+        import sqlite3
+
+        from ivy_core import picks_tracker as pt
+
+        monkeypatch.setattr(pt, "PICKS_DB", tmp_path / "p.db")
+        monkeypatch.setattr(pt, "log_picks_to_sheet", lambda *a, **k: True)
+        monkeypatch.setattr(pt, "auto_sync_to_export_sheet", lambda *a, **k: True)
+        pt.save_picks([{"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+                        "game_day": "today"}], "2026-07-19")
+        conn = sqlite3.connect(tmp_path / "p.db")
+        try:
+            assert conn.execute("SELECT game_day FROM picks").fetchone()[0] is None
+        finally:
+            conn.close()
+
+    def test_a_real_game_day_is_kept(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from ivy_core import picks_tracker as pt
+
+        monkeypatch.setattr(pt, "PICKS_DB", tmp_path / "p.db")
+        monkeypatch.setattr(pt, "log_picks_to_sheet", lambda *a, **k: True)
+        monkeypatch.setattr(pt, "auto_sync_to_export_sheet", lambda *a, **k: True)
+        pt.save_picks([{"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+                        "game_day": "2026-07-20"}], "2026-07-19")
+        conn = sqlite3.connect(tmp_path / "p.db")
+        try:
+            assert conn.execute("SELECT game_day FROM picks").fetchone()[0] == "2026-07-20"
+        finally:
+            conn.close()

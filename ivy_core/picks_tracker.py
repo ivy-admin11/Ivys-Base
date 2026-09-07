@@ -16,6 +16,7 @@ from ivy_core.pick_stats import (  # noqa: F401  (re-exported for callers)
     MIN_DECIDED_FOR_RATE,
     UNVERIFIABLE,
     format_hit_rate,
+    resolve_pick_date,
     summarize,
 )
 from ivy_core.sheets_logger import log_picks_to_sheet, update_result_in_sheet
@@ -88,6 +89,19 @@ def save_picks(picks: List[Dict], report_date: str):
     for pick in picks:
         # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
         start_time = pick.get("start_time") or pick.get("start")
+
+        # game_day comes from a model reading free-form posts and is routinely
+        # not a date -- "today" appears in 79 of the first 88 picks. Storing
+        # the string keeps a value that no consumer can use and that shadows
+        # the usable report_date. Store nothing instead; date resolution falls
+        # back to report_date, which is always real.
+        raw_game_day = pick.get("game_day")
+        game_day = resolve_pick_date(raw_game_day, None)
+        if raw_game_day and not game_day:
+            logger.info(
+                "Pick game_day %r is not a date; storing none and relying on "
+                "report_date", raw_game_day,
+            )
         handicappers = pick.get("handicappers") or pick.get("handicapper")
         
         # Count the number of sharps backing this pick
@@ -115,7 +129,7 @@ def save_picks(picks: List[Dict], report_date: str):
                 pick.get("odds"),
                 handicapper,
                 pick.get("confidence"),
-                pick.get("game_day"),
+                game_day,
                 start_time,
                 pick.get("reasoning"),
                 report_date,
