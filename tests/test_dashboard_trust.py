@@ -515,3 +515,69 @@ class TestTheClosingSummaryIsTrue:
         assert body.index("Backfill from historical scoreboards") < body.index(
             "Ungraded picks still with no source"
         )
+
+
+class TestTheRecordCountsBetsNotMentions:
+    """The first successful backfill produced 14W-13L over "27 decided".
+
+    It was 11W-10L over 21. "Over 9.5" on one Padres/Royals game was recorded
+    four times and counted as four wins. Four handicappers agreeing is
+    consensus — worth knowing, and not four independent outcomes. Counting it
+    four times inflates the sample and moves the rate on a single game, which
+    matters at a threshold: 51.9% and 52.4% sit either side of break-even at
+    standard -110 juice.
+    """
+
+    def _seed(self, db, picks):
+        pt.save_picks(picks, "2026-09-05")
+        return ids(db)
+
+    def test_the_same_bet_from_four_sources_counts_once(self, isolated_db):
+        same = [pick(matchup="A @ B", side="Over 9.5", handicapper=f"@h{i}",
+                     game_day="2026-09-05") for i in range(4)]
+        for pid in self._seed(isolated_db, same):
+            pt.update_pick_result(pid, "W")
+        s = pt.get_stats_overall()
+        assert s["wins"] == 1, "one game, one outcome"
+        assert s["decided"] == 1
+
+    def test_the_collapse_is_reported_not_hidden(self, isolated_db):
+        same = [pick(matchup="A @ B", side="Over 9.5", handicapper=f"@h{i}",
+                     game_day="2026-09-05") for i in range(4)]
+        for pid in self._seed(isolated_db, same):
+            pt.update_pick_result(pid, "W")
+        s = pt.get_stats_overall()
+        assert s["graded_picks"] == 4
+        assert s["duplicate_picks"] == 3
+        assert "same bet posted more than once" in pt.format_stats_for_pdf()
+
+    def test_different_sides_of_one_game_stay_separate(self):
+        """Over and Under on the same game are two bets, not a duplicate."""
+        rows = [("A @ B", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
+                ("A @ B", "Under 9.5", "L", "2026-09-05", "2026-09-05")]
+        assert len(pt._distinct_bets(rows)) == 2
+
+    def test_the_same_side_on_different_days_stays_separate(self):
+        rows = [("A @ B", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
+                ("A @ B", "Over 9.5", "L", "2026-09-06", "2026-09-06")]
+        assert len(pt._distinct_bets(rows)) == 2
+
+    def test_casing_and_spacing_do_not_defeat_the_collapse(self):
+        rows = [("A @ B", "Over 9.5", "W", None, "2026-09-05"),
+                ("a @ b", "  over 9.5 ", "W", None, "2026-09-05")]
+        assert len(pt._distinct_bets(rows)) == 1
+
+    def test_a_today_game_day_still_collapses(self):
+        """resolve_pick_date has to run before the key is built, or the same
+        bet lands under two different keys."""
+        rows = [("A @ B", "Over 9.5", "W", "today", "2026-09-05"),
+                ("A @ B", "Over 9.5", "W", None, "2026-09-05")]
+        assert len(pt._distinct_bets(rows)) == 1
+
+    def test_no_duplicates_reports_nothing_extra(self, isolated_db):
+        distinct = [pick(matchup=f"A{i} @ B{i}", side="Over 9.5",
+                         game_day="2026-09-05") for i in range(3)]
+        for pid in self._seed(isolated_db, distinct):
+            pt.update_pick_result(pid, "W")
+        assert pt.get_stats_overall()["duplicate_picks"] == 0
+        assert "same bet posted more than once" not in pt.format_stats_for_pdf()

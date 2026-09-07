@@ -192,7 +192,9 @@ class TestUpdateResult:
 
 class TestOverallStats:
     def test_counts_and_hit_rate(self, isolated_db):
-        pt.save_picks([pick() for _ in range(5)], "2026-09-05")
+        # Distinct games: five identical picks now collapse to one bet, which
+        # is correct but not what this test is measuring.
+        pt.save_picks([pick(matchup=f"A{i} @ B{i}") for i in range(5)], "2026-09-05")
         ids = pick_ids(isolated_db)
         for pid, res in zip(ids, ["W", "W", "W", "L", "P"]):
             pt.update_pick_result(pid, res)

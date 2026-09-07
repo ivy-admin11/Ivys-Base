@@ -349,6 +349,33 @@ def get_stats_by_handicapper(days_back: int = 30) -> Dict[str, Dict]:
     return stats
 
 
+def _distinct_bets(rows):
+    """Collapse rows to one entry per (game, date, side).
+
+    Four handicappers posting "Over 9.5" on the same game is four picks and
+    one bet. Counting it four times inflates the sample and moves the hit
+    rate on a single outcome -- the record read 14W-13L over "27 decided"
+    when it was 11W-10L over 21. Consensus is worth knowing, but it is not
+    independent evidence, and a rate computed as if it were overstates how
+    much the record proves.
+
+    Later duplicates are dropped; the outcome is identical, so which survives
+    does not matter.
+    """
+    seen, out = set(), []
+    for matchup, side, result, game_day, report_date in rows:
+        key = (
+            (matchup or "").strip().lower(),
+            resolve_pick_date(game_day, report_date),
+            (side or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(result)
+    return out
+
+
 def get_stats_overall(days_back: int = 30) -> Dict:
     """Get overall win/loss/push stats (last N days)."""
     _init_db()
@@ -369,10 +396,30 @@ def get_stats_overall(days_back: int = 30) -> Dict:
     """, (days_back,))
     
     total, wins, losses, pushes, pending, unverifiable = cursor.fetchone()
+
+    # The graded counts above are per pick. The record is per bet: re-derive
+    # W/L/P from distinct (game, date, side) so a pick four handicappers
+    # happened to agree on counts once.
+    decided_rows = conn.execute("""
+        SELECT p.matchup, p.side, r.result, p.game_day, p.report_date
+        FROM picks p JOIN results r ON r.pick_id = p.id
+        WHERE r.result IN ('W', 'L', 'P')
+          AND datetime(p.created_at) >= datetime('now', '-' || ? || ' days')
+    """, (days_back,)).fetchall()
     conn.close()
-    
-    stats = summarize(wins, losses, pushes, pending, unverifiable, total=total)
+
+    outcomes = _distinct_bets(decided_rows)
+    graded_picks = wins or 0
+    graded_picks += (losses or 0) + (pushes or 0)
+
+    stats = summarize(
+        outcomes.count("W"), outcomes.count("L"), outcomes.count("P"),
+        pending, unverifiable, total=total,
+    )
     stats["roi"] = 0  # TODO: Calculate ROI based on odds if odds are tracked
+    # Kept so the difference is visible rather than quietly smoothed away.
+    stats["graded_picks"] = graded_picks
+    stats["duplicate_picks"] = max(0, graded_picks - len(outcomes))
     return stats
 
 
@@ -433,6 +480,14 @@ def format_stats_for_pdf(days_back: int = 30) -> str:
         tail.append(f"{overall['unverifiable']} ungradeable (game outside the scores window)")
     if tail:
         lines.append("  " + " · ".join(tail))
+    
+    dupes = overall.get("duplicate_picks") or 0
+    if dupes:
+        lines.append(
+            f"  {overall['decided']} distinct bet(s) from "
+            f"{overall.get('graded_picks')} graded pick(s) — "
+            f"{dupes} were the same bet posted more than once"
+        )
     
     behind = len(unsynced_grades())
     if behind:
