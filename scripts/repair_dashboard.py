@@ -109,6 +109,8 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="actually write changes")
     ap.add_argument("--no-regrade", action="store_true",
                     help="skip the API re-grade of recent picks")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="skip grading old picks from historical scoreboards")
     ap.add_argument("--no-sheet", action="store_true",
                     help="skip rebuilding the Google Sheet")
     ap.add_argument("--window-days", type=int, default=SCORES_WINDOW_DAYS)
@@ -170,6 +172,52 @@ def main() -> int:
             print(f"   {line}")
     finally:
         conn.close()
+
+    # ---- 2a. backfill old picks from historical scoreboards ---------------
+    if args.no_backfill:
+        print("\n2b. Backfill from historical scoreboards: skipped (--no-backfill)")
+    else:
+        print("\n2b. Backfill from historical scoreboards")
+        conn = sqlite3.connect(PICKS_DB)
+        try:
+            rows = conn.execute("""
+                SELECT p.id, p.sport, p.matchup, p.side, p.game_day, p.report_date
+                FROM picks p LEFT JOIN results r ON r.pick_id = p.id
+                WHERE r.result IS NULL OR r.result = ?
+                ORDER BY p.id
+            """, (UNVERIFIABLE,)).fetchall()
+        finally:
+            conn.close()
+
+        from ivy_core.historical_scores import SPORT_ROUTES
+        from ivy_core.result_updater import backfill_pick
+        from ivy_core.picks_tracker import update_pick_result
+
+        cache, graded, unreachable, unsupported = {}, 0, 0, 0
+        for pid, sport, matchup, side, game_day, report_date in rows:
+            if (sport or "").strip().lower() not in SPORT_ROUTES:
+                unsupported += 1
+                continue
+            pick = {"sport": sport, "matchup": matchup, "side": side,
+                    "game_day": game_day, "report_date": report_date}
+            try:
+                result, final = backfill_pick(pick, cache)
+            except Exception as exc:
+                print(f"   #{pid}: {type(exc).__name__}: {exc}")
+                result = None
+            if not result:
+                unreachable += 1
+                continue
+            graded += 1
+            if args.apply:
+                update_pick_result(pid, result, final)
+            print(f"   #{pid} {matchup} — {side} = {result}"
+                  + ("" if args.apply else "  (dry run)"))
+
+        print(f"   {graded} gradeable, {unreachable} no match found, "
+              f"{unsupported} in a sport with no scoreboard route")
+        if unsupported:
+            print(f"   supported: {', '.join(sorted(SPORT_ROUTES))}")
 
     # ---- 2b. reconcile grades the sheet never received --------------------
     from ivy_core.picks_tracker import resync_grades, unsynced_grades

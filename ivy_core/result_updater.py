@@ -51,6 +51,12 @@ def parse_score(value: Any) -> Optional[Decimal]:
         return None
 
 
+# The Odds API documents daysFrom as "integers from 1 to 3". 3 is the ceiling,
+# not a tuning knob: nothing configured here reaches a game older than that.
+# ivy_core.historical_scores is the answer for older games.
+ODDS_MAX_DAYS_FROM = 3
+
+
 def get_completed_games(sport_key: str = None, hours_back: int = 48) -> list:
     """Fetch completed games from The Odds API.
     
@@ -97,7 +103,7 @@ def get_completed_games(sport_key: str = None, hours_back: int = 48) -> list:
         try:
             resp = requests.get(
                 f"{ODDS_API_BASE}/sports/{sport_key_i}/scores",
-                params={"api_key": api_key, "daysFrom": 2},
+                params={"api_key": api_key, "daysFrom": ODDS_MAX_DAYS_FROM},
                 timeout=10
             )
             resp.raise_for_status()
@@ -496,3 +502,29 @@ if __name__ == "__main__":
     result = auto_update_results()
     print(f"\n✅ Result update complete: {result['updated']} updated, {result['pending']} still pending")
     sys.exit(0 if result["updated"] > 0 or result["pending"] == 0 else 1)
+
+
+def backfill_pick(pick: Dict, games_by_key: Dict) -> Tuple[Optional[str], Optional[str]]:
+    """Grade one old pick against historical scoreboard games.
+
+    Delegates to match_pick_to_game, so an old game is graded by exactly the
+    same logic as a recent one -- including the team-name matching and the
+    name-keyed score lookup that were repaired earlier. Nothing about grading
+    is duplicated here.
+    """
+    from ivy_core.historical_scores import fetch_completed_games
+
+    sport = (pick.get("sport") or "").strip()
+    day = (pick.get("game_day") or pick.get("report_date") or "").strip()[:10]
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        return None, None                      # e.g. a game_day of "today"
+
+    key = (sport.lower(), day)
+    if key not in games_by_key:
+        games_by_key[key] = fetch_completed_games(sport, day)
+    games = games_by_key[key]
+    if not games:
+        return None, None
+    return match_pick_to_game(pick, games)
