@@ -759,11 +759,44 @@ def check_apple_calendar(timeframe: str) -> str:
 # DeepSeek path — the primary brain — passed the model's raw value straight
 # through, so an inbound text could name any list and the add script would
 # create it on demand. Enforced here so every provider path shares one rule.
-_ALLOWED_REMINDER_LISTS = ("Household", "Meal Plan")
+# Configurable, because a hardcoded pair was wrong: Henry's shared list is
+# "Recipes / Grocery", which was not in the tuple, so every request naming it
+# was silently rewritten to "Household".
+_ALLOWED_REMINDER_LISTS = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "IVY_REMINDER_LISTS", "Household,Meal Plan,Recipes / Grocery"
+    ).split(",")
+    if name.strip()
+)
 
 
-def _clamp_reminder_list(list_name: str) -> str:
-    return list_name if list_name in _ALLOWED_REMINDER_LISTS else "Household"
+def _resolve_reminder_list(list_name: str):
+    """Match a requested list against the allowlist. Returns (name, note).
+
+    Returns (None, reason) when nothing matches, rather than redirecting.
+    The old version silently rewrote any unrecognised name to "Household",
+    so a request naming a real shared list landed somewhere else and said
+    "Added" — a wrong outcome reported as success.
+
+    Matching is case- and space-insensitive so "recipes/grocery" finds
+    "Recipes / Grocery", but only ever resolves to a name on the allowlist:
+    an inbound iMessage still cannot name an arbitrary list.
+    """
+    requested = (list_name or "").strip()
+    if not requested:
+        return _ALLOWED_REMINDER_LISTS[0], ""
+
+    def norm(v):
+        return "".join(v.lower().split()).replace("/", "")
+
+    for allowed in _ALLOWED_REMINDER_LISTS:
+        if norm(allowed) == norm(requested):
+            return allowed, ""
+    for allowed in _ALLOWED_REMINDER_LISTS:
+        if norm(requested) in norm(allowed) or norm(allowed) in norm(requested):
+            return allowed, f"(matched '{requested}' to '{allowed}')"
+    return None, requested
 
 
 def fetch_apple_reminders(list_name: str = "Household") -> str:
@@ -772,7 +805,13 @@ def fetch_apple_reminders(list_name: str = "Household") -> str:
     ``list_name`` is passed as a process argument, never interpolated into
     AppleScript source (see utils.applescript).
     """
-    list_name = _clamp_reminder_list(list_name)
+    resolved, note = _resolve_reminder_list(list_name)
+    if resolved is None:
+        return (
+            f"❌ I don't have a list called '{note}'. I can use: "
+            f"{', '.join(_ALLOWED_REMINDER_LISTS)}."
+        )
+    list_name = resolved
     result = _GATEWAY_APPLESCRIPT.fetch_reminders_argv(list_name)
 
     # An empty read and a failed read used to be indistinguishable: the old
@@ -785,24 +824,63 @@ def fetch_apple_reminders(list_name: str = "Household") -> str:
 
 
 def add_apple_reminder(title: str, list_name: str = "Household") -> str:
-    """Add a task to Apple Reminders."""
-    # Auto-categorize based on keywords
-    if any(word in list_name.lower() for word in ["meal", "food", "dinner", "recipe", "taco"]):
-        list_name = "Meal Plan"
-    elif any(word in list_name.lower() for word in ["house", "chore", "clean", "task"]):
-        list_name = "Household"
+    """Add a task to Apple Reminders.
 
-    # After the keyword auto-categorisation above, so "meal"/"chore" routing
-    # still works — but an arbitrary or dash-leading name cannot get through.
-    list_name = _clamp_reminder_list(list_name)
-    result = _GATEWAY_APPLESCRIPT.add_reminder_argv(list_name, title)
+    Never creates a list, and never silently retargets one. If the requested
+    name does not resolve, or the list does not exist on this Mac, the reply
+    says so and names what is available — which is what Henry needed when a
+    recipe went into a freshly-created "Household" instead of the
+    "Recipes / Grocery" list he actually shares.
+    """
+    requested = list_name
 
-    # Exact match, not a substring test: the old `"SUCCESS" in raw_output`
-    # would also fire on an error message that happened to quote a title
-    # containing the word.
+    # Resolve what was actually asked for FIRST. Keyword routing only gets a
+    # say when the name matches nothing — otherwise "Meal Plan" contains
+    # "meal" and would be hijacked to the recipes list, overriding an
+    # explicit choice with a guess.
+    resolved, note = _resolve_reminder_list(list_name)
+    if resolved is None:
+        lowered = (list_name or "").lower()
+        if any(w in lowered for w in ["recipe", "grocery", "shopping"]):
+            resolved, note = _resolve_reminder_list("Recipes / Grocery")
+        elif any(w in lowered for w in ["meal", "food", "dinner", "taco"]):
+            resolved, note = _resolve_reminder_list("Meal Plan")
+        elif any(w in lowered for w in ["house", "chore", "clean", "task"]):
+            resolved, note = _resolve_reminder_list("Household")
+        if resolved is not None:
+            note = f"(matched '{requested}' to '{resolved}')"
+
+    if resolved is None:
+        return (
+            f"❌ I don't have a list called '{note}'. I can use: "
+            f"{', '.join(_ALLOWED_REMINDER_LISTS)}."
+        )
+
+    result = _GATEWAY_APPLESCRIPT.add_reminder_argv(resolved, title)
+
     if result == "SUCCESS":
-        return f"✅ Added to your '{list_name}' list: {title}"
-    logger.error("Reminder add failed for list %r: %s", list_name, result[:200])
+        # Say which list it actually went to, and say so loudly when that is
+        # not the one that was asked for.
+        line = f"✅ Added to your '{resolved}' list: {title}"
+        if requested and _resolve_reminder_list(requested)[0] != resolved:
+            line += f"\n(You asked for '{requested}' — I used '{resolved}'.)"
+        elif note:
+            line += f"\n{note}"
+        return line
+
+    if "NO_SUCH_LIST" in result:
+        available = _GATEWAY_APPLESCRIPT.list_reminder_lists()
+        if available.startswith("ERROR:"):
+            return (
+                f"❌ There's no '{resolved}' list on this Mac, and I couldn't read "
+                f"the list of lists to tell you what there is."
+            )
+        return (
+            f"❌ There's no '{resolved}' list on this Mac, so I didn't add anything. "
+            f"Your lists: {available}"
+        )
+
+    logger.error("Reminder add failed for list %r: %s", resolved, result[:200])
     return f"❌ Reminders Integration Error: {result}"
 
 

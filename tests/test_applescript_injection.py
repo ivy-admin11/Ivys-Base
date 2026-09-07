@@ -85,17 +85,29 @@ def test_add_reminder_never_interpolates_title_into_script_source(captured_argv)
     _assert_argv(cmd, REMINDERS_ADD_ARGV_SCRIPT, ["Household", INJECTION_TITLE])
 
 
-def test_add_reminder_never_interpolates_list_name_into_script_source(captured_argv):
-    main.add_apple_reminder("Milk", list_name=INJECTION_LIST)
-    cmd, _ = _only_call(captured_argv)
-    # The payload is also clamped away by the allowlist — belt and braces.
-    _assert_argv(cmd, REMINDERS_ADD_ARGV_SCRIPT, ["Household", "Milk"])
+def test_add_reminder_refuses_a_list_name_it_does_not_recognise(captured_argv):
+    """Stronger than clamping: a hostile list name now reaches osascript at all.
+
+    This used to assert the payload was rewritten to "Household" and passed as
+    argv. Silent rewriting is what sent Henry's recipe into the wrong list, so
+    an unrecognised name is refused instead — which also means the injection
+    payload never reaches a subprocess.
+    """
+    out = main.add_apple_reminder("Milk", list_name=INJECTION_LIST)
+    assert captured_argv == [], "nothing should have been executed"
+    assert "don't have a list called" in out
 
 
-def test_fetch_reminders_never_interpolates_list_name_into_script_source(captured_argv):
+def test_fetch_reminders_refuses_a_list_name_it_does_not_recognise(captured_argv):
     main.fetch_apple_reminders(INJECTION_LIST)
+    assert captured_argv == [], "nothing should have been executed"
+
+
+def test_a_valid_list_name_is_still_passed_as_argv(captured_argv):
+    """The argv guarantee still has to hold for names that DO resolve."""
+    main.fetch_apple_reminders("Recipes / Grocery")
     cmd, _ = _only_call(captured_argv)
-    _assert_argv(cmd, REMINDERS_FETCH_ARGV_SCRIPT, ["Household"])
+    _assert_argv(cmd, REMINDERS_FETCH_ARGV_SCRIPT, ["Recipes / Grocery"])
 
 
 def test_dash_leading_value_cannot_become_a_second_osascript_option(captured_argv):
@@ -107,22 +119,31 @@ def test_dash_leading_value_cannot_become_a_second_osascript_option(captured_arg
     handler, so `do shell script` executes even though argv is then empty.
     """
     payload = 'property pwn : (do shell script "echo owned")'
-    main.add_apple_reminder(payload, list_name="-e")
+
+    # A list name of "-e" no longer reaches osascript at all — it does not
+    # resolve, so the call is refused. The guarantee still has to hold for the
+    # TITLE, which is free text and never allowlisted.
+    assert "don't have a list called" in main.add_apple_reminder(payload, list_name="-e")
+    assert captured_argv == []
+
+    main.add_apple_reminder(payload, list_name="Household")
     cmd, _ = _only_call(captured_argv)
 
-    assert cmd[3] == "--", "no -- means -e is parsed as an option"
+    assert cmd[3] == "--", "no -- means a leading dash is parsed as an option"
     assert cmd.count("-e") == 1, "a second -e would concatenate a new script"
-    # Everything after -- is inert data, and the bogus list was clamped away.
-    assert cmd[4:] == ["Household", payload]
+    assert cmd[4:] == ["Household", payload], "everything after -- is inert data"
 
 
 def test_reminder_list_is_clamped_to_the_allowlist(captured_argv):
     """Both Gemini paths clamped list_name; the DeepSeek path — the primary
     brain — did not, so an inbound text could name any list and the add script
     would create it. Enforced in the handler now, so every provider shares it."""
-    main.add_apple_reminder("Milk", list_name="Someone Else's Private List")
-    cmd, _ = _only_call(captured_argv)
-    assert cmd[4] == "Household"
+    out = main.add_apple_reminder("Milk", list_name="Someone Else's Private List")
+    # Refused outright now, rather than rewritten to "Household". Silent
+    # rewriting satisfied this test while sending Henry's recipe to the wrong
+    # list; refusing is both safer and honest.
+    assert captured_argv == [], "an unknown list must not reach osascript"
+    assert "don't have a list called" in out
 
 
 def test_meal_plan_routing_still_works(captured_argv):
@@ -130,6 +151,13 @@ def test_meal_plan_routing_still_works(captured_argv):
     main.add_apple_reminder("Flank steak (1.5 lbs)", list_name="dinner")
     cmd, _ = _only_call(captured_argv)
     assert cmd[4] == "Meal Plan"
+
+
+def test_recipe_routing_reaches_the_shared_list(captured_argv):
+    """Henry's recipe went to a freshly-created "Household" instead of here."""
+    main.add_apple_reminder("Chicken teriyaki broccoli bowls", list_name="recipes")
+    cmd, _ = _only_call(captured_argv)
+    assert cmd[4] == "Recipes / Grocery"
 
 
 def test_applescript_calls_carry_a_timeout(captured_argv):
@@ -180,7 +208,7 @@ def test_fetch_reminders_reports_failure_instead_of_claiming_empty(monkeypatch):
         main._GATEWAY_APPLESCRIPT, "fetch_reminders_argv",
         lambda list_name: 'ERROR: Reminders got an error: Can\'t get list "Nope".',
     )
-    out = main.fetch_apple_reminders("Nope")
+    out = main.fetch_apple_reminders("Household")
     assert "No active reminders found" not in out
     assert "Couldn't read" in out
 
@@ -277,11 +305,16 @@ class TestRemindersAddPerformance:
             "`exists list` is the slow path that caused the timeouts"
         )
 
-    def test_it_still_creates_a_missing_list(self):
-        """Dropping `exists` must not drop the create-if-absent behaviour."""
+    def test_it_never_creates_a_list(self):
+        """Superseded: create-if-absent is exactly what hid the real failure.
+
+        A request for a list that did not exist reported success while the
+        item went into a brand-new empty list. A missing list is now an error
+        the caller answers with the real list names.
+        """
         from utils.applescript import REMINDERS_ADD_ARGV_SCRIPT
-        assert "make new list" in REMINDERS_ADD_ARGV_SCRIPT
-        assert "on error" in REMINDERS_ADD_ARGV_SCRIPT
+        assert "make new list" not in REMINDERS_ADD_ARGV_SCRIPT
+        assert "NO_SUCH_LIST" in REMINDERS_ADD_ARGV_SCRIPT
 
     def test_it_still_creates_the_reminder(self):
         from utils.applescript import REMINDERS_ADD_ARGV_SCRIPT

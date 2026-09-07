@@ -132,12 +132,35 @@ on run argv
 end run
 """
 
+# Adding an item never creates a list. It used to: a missing list was made on
+# demand, so a request for a list that did not exist reported success and the
+# item landed in a brand-new empty list nobody opens. Henry watched a recipe go
+# into a freshly-created "Household" while the list he actually shares is
+# "Recipes / Grocery". A name that does not resolve is now an error the caller
+# can answer usefully.
+#
 # `exists list X` is the slow path in Reminders scripting: it makes the app
 # enumerate and sync every list before answering, which regularly outran the
 # 30s subprocess timeout and surfaced to Henry as "AppleScript execution timed
 # out" on every add, while reads — which reference the list directly — kept
 # working. Referencing the list and catching the failure is the same logic
 # without the enumeration.
+# Enumerating every list is expensive, which is what made adds time out in the
+# first place. This is deliberately NOT called on the happy path — only when a
+# name failed to resolve and the reply needs to say what does exist.
+REMINDERS_LIST_NAMES_SCRIPT = """
+on run argv
+    tell application "Reminders"
+        try
+            set AppleScript's text item delimiters to ", "
+            return (name of every list) as text
+        on error errMsg
+            return "ERROR: " & errMsg
+        end try
+    end tell
+end run
+"""
+
 REMINDERS_ADD_ARGV_SCRIPT = """
 on run argv
     set listNameValue to item 1 of argv
@@ -147,7 +170,7 @@ on run argv
             try
                 set targetList to list listNameValue
             on error
-                set targetList to make new list with properties {name:listNameValue}
+                return "ERROR: NO_SUCH_LIST"
             end try
             make new reminder at end of targetList with properties {name:titleValue}
             return "SUCCESS"
@@ -308,6 +331,16 @@ class AppleScriptRunner:
         return self.run_argv(
             REMINDERS_ADD_ARGV_SCRIPT, [list_name, title],
             timeout=REMINDERS_WRITE_TIMEOUT_S,
+        )
+
+    def list_reminder_lists(self) -> str:
+        """Comma-joined names of every Reminders list, or "ERROR: ...".
+
+        Enumeration is slow, so this takes the write timeout and is only
+        called when a list name has already failed to resolve.
+        """
+        return self.run_argv(
+            REMINDERS_LIST_NAMES_SCRIPT, [], timeout=REMINDERS_WRITE_TIMEOUT_S
         )
 
     def send_imessage_file_argv(self, recipient: str, file_path: str) -> str:
