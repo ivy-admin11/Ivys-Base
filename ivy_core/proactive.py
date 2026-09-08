@@ -151,6 +151,50 @@ def picks_aging_out() -> List[Finding]:
 
 
 @check
+def commits_not_pushed() -> List[Finding]:
+    """Work sitting on this Mac and nowhere else.
+
+    com.ivy.autopush pushes every 15 minutes, so a backlog older than a day
+    means that job is failing — most likely a passphrase-protected SSH key
+    with no agent under launchd, which looks exactly like success from the
+    outside. Without this the commits simply stop leaving the machine and
+    nothing says so.
+    """
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), *args],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if not upstream:
+        return []
+    count = git("rev-list", "--count", f"{upstream}..HEAD")
+    if not count.isdigit() or int(count) == 0:
+        return []
+    oldest = git("log", "--reverse", "--format=%ct", f"{upstream}..HEAD")
+    first = oldest.splitlines()[0] if oldest else ""
+    if not first.isdigit():
+        return []
+    age_h = (datetime.now(timezone.utc).timestamp() - int(first)) / 3600
+    if age_h < 24:
+        return []
+    return [Finding(
+        key="commits_unpushed",
+        severity=NORMAL,
+        title=f"⬆️ {count} commit(s) have not left this Mac",
+        detail=(
+            f"The oldest is {age_h / 24:.0f} day(s) old. autopush runs every 15 "
+            "minutes, so it is failing — usually an SSH key that needs a "
+            "passphrase, which launchd cannot supply."
+        ),
+        fix="tail logs/autopush.log",
+    )]
+
+
+@check
 def logs_growing_unchecked() -> List[Finding]:
     """Housekeeping is meant to rotate these; if it is not installed, nothing does."""
     log_dir = PROJECT_ROOT / "logs"

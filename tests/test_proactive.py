@@ -247,3 +247,58 @@ class TestRendering:
 
     def test_no_fix_line_when_there_is_no_fix(self):
         assert "Fix:" not in finding(fix="").render()
+
+
+class TestUnpushedCommitsAreNoticed:
+    """autopush runs every 15 minutes, so a backlog means it is failing.
+
+    The usual cause is an SSH key with a passphrase, which launchd cannot
+    supply — and from the outside that looks exactly like success. Without
+    this check the commits simply stop leaving the Mac and nothing says so,
+    which is the failure shape this whole codebase keeps producing.
+    """
+
+    def _git(self, monkeypatch, upstream="origin/main", count="3", age_days=3):
+        import subprocess
+        from datetime import datetime, timezone
+
+        ts = int(datetime.now(timezone.utc).timestamp() - age_days * 86400)
+        replies = {
+            "rev-parse": upstream,
+            "rev-list": count,
+            "log": f"{ts}\n{ts + 60}",
+        }
+
+        class R:
+            def __init__(self, out): self.stdout = out
+
+        def fake_run(cmd, **kw):
+            for key, value in replies.items():
+                if key in cmd:
+                    return R(value)
+            return R("")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+    def test_an_old_backlog_is_reported(self, monkeypatch):
+        self._git(monkeypatch)
+        found = [f for f in pro.commits_not_pushed()]
+        assert found and found[0].key == "commits_unpushed"
+        assert "3 commit" in found[0].title
+
+    def test_a_fresh_commit_is_not_reported(self, monkeypatch):
+        """autopush gets 15 minutes to do its job before anyone is told."""
+        self._git(monkeypatch, age_days=0)
+        assert pro.commits_not_pushed() == []
+
+    def test_nothing_unpushed_is_not_reported(self, monkeypatch):
+        self._git(monkeypatch, count="0")
+        assert pro.commits_not_pushed() == []
+
+    def test_no_upstream_is_not_reported(self, monkeypatch):
+        """A branch with no upstream is a deliberate state, not a fault."""
+        self._git(monkeypatch, upstream="")
+        assert pro.commits_not_pushed() == []
+
+    def test_it_points_at_the_log(self, monkeypatch):
+        self._git(monkeypatch)
+        assert "autopush.log" in pro.commits_not_pushed()[0].fix
