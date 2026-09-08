@@ -286,7 +286,20 @@ def test_sports_bettor_stays_quiet_on_an_unchanged_below_bar_board(monkeypatch, 
     assert sent == [], "an unchanged below-the-bar board must not nag"
 
 
-def test_player_props_do_not_borrow_the_game_market_price():
+@pytest.fixture
+def pricing_on(monkeypatch):
+    """Turn pricing at flag time back on for tests that exercise it.
+
+    ENABLE_PICK_PRICING now defaults to False: a shared W/L ledger does not
+    need the market price, and the Odds API was the dependency that kept
+    breaking. The pricing machinery is staying — prices return from ESPN's
+    scoreboard, which carries odds alongside the score — so these tests keep
+    protecting it rather than being deleted for the length of the switchover.
+    """
+    monkeypatch.setattr(sports_bettor, "ENABLE_PICK_PRICING", True)
+
+
+def test_player_props_do_not_borrow_the_game_market_price(pricing_on):
     """Live run 2026-09-02: 'David Peterson Under 4.5 Strikeouts' was texted with
     '(Over 8 (-117) / Under 8 (-103))' — the game's run total, not the prop's
     price, and a contradicting number besides."""
@@ -310,7 +323,7 @@ def test_player_props_do_not_borrow_the_game_market_price():
     assert picks[1]["odds"] == "Under 8 (-103)", "real game totals still fill, narrowed to the side"
 
 
-def test_home_run_props_do_not_borrow_the_game_moneyline():
+def test_home_run_props_do_not_borrow_the_game_moneyline(pricing_on):
     """Sep 3 9am report: 'Coby Mayo HR (Baltimore Orioles +108 / Boston Red Sox
     -126)' — the game moneyline beside a home-run prop. 'HR' matched none of the
     long-form stat words, so the prop guard let it through."""
@@ -370,7 +383,7 @@ class TestNCAAFCoverage:
         assert "\U0001F3C8" in body
         assert "Texas +7" in body
 
-    def test_ncaaf_odds_attach_by_team_name(self):
+    def test_ncaaf_odds_attach_by_team_name(self, pricing_on):
         games = [{
             "away": "Ohio State Buckeyes", "home": "Texas Longhorns", "sport": "NCAAF",
             "spread": "Texas +7 (-110)", "moneyline": "OSU -280 / TEX +230",
@@ -507,7 +520,7 @@ class TestCardAnalysis:
         assert "consensus play" in captured["signal_note"]
 
 
-def test_team_totals_do_not_borrow_the_game_total():
+def test_team_totals_do_not_borrow_the_game_total(pricing_on):
     """Real board 2026-09-05 09:49: "Auburn Tigers TT Over 34.5" was printed
     with "(Over 58.5 (-115) / Under 58.5 (-105))" — the game total. A team
     total and a game total are different numbers for different bets."""
@@ -563,7 +576,7 @@ class TestOddsNarrowing:
     def test_one_sided_market_passes_through(self):
         assert sports_bettor._price_for_side("Auburn -7.5", "Auburn -7.5 (-105)") == "Auburn -7.5 (-105)"
 
-    def test_grok_supplied_two_sided_odds_are_narrowed_too(self):
+    def test_grok_supplied_two_sided_odds_are_narrowed_too(self, pricing_on):
         picks = [{"matchup": "Clemson Tigers @ LSU Tigers", "side": "Clemson Tigers +10.5",
                   "odds": self.SPREAD}]
         sports_bettor.attach_odds(picks, [])
@@ -665,7 +678,7 @@ def test_a_game_market_copied_onto_a_prop_is_cleared_not_narrowed():
     assert picks[0]["odds"] == ""
 
 
-def test_a_genuine_prop_price_from_grok_survives():
+def test_a_genuine_prop_price_from_grok_survives(pricing_on):
     picks = [{"matchup": "A @ B", "side": "Coby Mayo HR", "odds": "+450"}]
     sports_bettor.attach_odds(picks, [])
     assert picks[0]["odds"] == "+450"
@@ -957,7 +970,7 @@ class TestMatchupRepair:
         pick, _ = self._one("Some Unlisted Team @ Another Team", "Another Team -3")
         assert pick["matchup"] == "Some Unlisted Team @ Another Team"
 
-    def test_repair_runs_before_odds_so_repaired_games_get_priced(self):
+    def test_repair_runs_before_odds_so_repaired_games_get_priced(self, pricing_on):
         games = [{"away": "Miami Marlins", "home": "Kansas City Royals",
                   "moneyline": "Miami Marlins +120 / Kansas City Royals -140",
                   "spread": "", "total": "", "sport": "MLB", "commence": "2026-09-05T23:40:00Z"}]
@@ -971,3 +984,36 @@ class TestMatchupRepair:
         prompt = sports_bettor._build_sweep_prompt(["h"], "", sports_bettor.SPORT_HINTS)
         assert "never a placeholder" in prompt
         assert "'ML' or '-1.5' alone is not a side" in prompt
+
+
+class TestPricingIsOffByDefault:
+    """Pricing at flag time is switched off, not deleted.
+
+    A shared win/loss ledger does not need the market price, and the Odds API
+    was the dependency that kept breaking — a 401 on Sep 6 locked it out
+    entirely. Prices return from ESPN's scoreboard, which carries odds in the
+    same payload as the score, so the machinery and its tests stay.
+    """
+
+    def test_no_price_is_attached_by_default(self):
+        assert sports_bettor.ENABLE_PICK_PRICING is False
+
+    def test_a_price_copied_from_a_post_is_dropped(self):
+        """Otherwise the board is half-priced: some picks carry a line
+        because a handicapper happened to type one, others do not."""
+        merged = [{
+            "sport": "MLB", "matchup": "A @ B", "side": "A ML",
+            "odds": "-136", "handicappers": ["@x"],
+        }]
+        out = sports_bettor.attach_odds(merged, [])
+        assert out[0]["odds"] == ""
+
+    def test_the_slate_is_still_fetched_for_validation(self):
+        """Pricing and validation share a source but not a purpose. Removing
+        the price must not remove repair_matchups' slate — that is the only
+        check between a handicapper's post and the database."""
+        import inspect
+
+        src = inspect.getsource(sports_bettor._run_pipeline)
+        assert "fetch_live_odds()" in src
+        assert "repair_matchups(" in src

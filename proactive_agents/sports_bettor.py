@@ -595,7 +595,13 @@ def merge_picks(picks):
                 "odds": p.get("odds"),
                 "handicappers": [],
                 "confidence": p.get("confidence"),
-                "game_day": _norm(p.get("game_day")) or "today",
+                # Was `or "today"`. That literal is where the unusable
+                # game_day in 79 of the first 88 picks came from: it is not a
+                # date, it shadowed the usable report_date for every reader,
+                # and it made the whole historical backfill inert until the
+                # resolver learned to fall past it. Absent is honest; the
+                # report date is the fallback.
+                "game_day": _norm(p.get("game_day")) or "",
                 "start": p.get("start_time"),
                 "reasoning": p.get("reasoning"),
             }
@@ -984,7 +990,8 @@ def attach_odds(merged, games):
             # Player props and team totals are deliberately left blank: the feed
             # only carries full-game markets, and a wrong price is worse than
             # no price.
-            if not e.get("odds") and not _is_player_prop(e.get("side")):
+            if (ENABLE_PICK_PRICING and not e.get("odds")
+                    and not _is_player_prop(e.get("side"))):
                 market = _odds_for_side(e.get("side"), best)
                 e["odds"] = _price_for_side(e.get("side"), market, e.get("matchup"))
             # The odds feed is authoritative for the scheduled start time.
@@ -994,7 +1001,12 @@ def attach_odds(merged, games):
         # Grok is asked to copy the price "for that side" out of the slate, but
         # routinely copies the whole two-sided line. Narrow whatever we ended up
         # with, whichever source it came from.
-        if e.get("odds") and " / " in str(e["odds"]):
+        if not ENABLE_PICK_PRICING:
+            # A price copied out of a handicapper's post is still a price, and
+            # pricing is off — drop it rather than shipping a half-populated
+            # board where some picks carry a line and others do not.
+            e["odds"] = ""
+        elif e.get("odds") and " / " in str(e["odds"]):
             # A two-sided market next to a prop or team total is a GAME market
             # that got copied across — the feed has no price for that bet, so
             # drop it rather than narrowing it to a confidently wrong half.
@@ -1004,6 +1016,23 @@ def attach_odds(merged, games):
             else:
                 e["odds"] = _price_for_side(e.get("side"), e["odds"], e.get("matchup"))
     return merged
+
+
+# Pricing at flag time is OFF.
+#
+# The Odds API attached a line to each pick on the way in ("Guardians -136").
+# That is being dropped: a shared W/L ledger does not need the market price,
+# and it was the dependency that kept breaking. Prices come back from ESPN's
+# scoreboard, which carries odds in the same payload as the score — so this is
+# a switch rather than a deletion, and _price_for_side and its tests stay
+# intact for that.
+#
+# The odds feed is NOT removed here. fetch_live_odds also supplies the slate
+# that repair_matchups validates picks against, which is the only check
+# between a handicapper's post and the database — the thing that catches
+# "LAD @ ?" and would catch "Kia @ Doosan" on a day Kia played KT. Removing
+# pricing must not remove validation.
+ENABLE_PICK_PRICING = False
 
 
 # ===================== GROK ENRICHMENT =====================
@@ -1723,9 +1752,10 @@ def _run_pipeline(
         odds_source.mark_failure(e, status_code=e.status_code)
         result.status = PipelineStatus.DEGRADED
         result.admin_message = (
-            f"Sharp Picks: Odds API authentication failed (live odds/pricing "
-            f"disabled for this run — The Odds API isn't a required source, "
-            f"so the X sweep continues without it).\n"
+            f"Sharp Picks: Odds API authentication failed.\n"
+            f"The X sweep continues, but two things stop: matchup validation "
+            f"against the live slate (bad parses reach the database unchecked) "
+            f"and score-based grading. Pricing is unaffected — it is off.\n"
             f"Status: HTTP {e.status_code}\n"
             f"Message: {e.message}\n"
             f"Admin action required: Verify ODDS_API_KEY is current and authorized."
