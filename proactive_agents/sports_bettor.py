@@ -51,7 +51,7 @@ from filelock import FileLock, Timeout
 from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
-from ivy_core.text_delivery import build_detail, deliver_report
+from ivy_core.text_delivery import ATTACH_VERIFIED, build_detail, deliver_report
 from picks_dashboard import build_dashboard
 from ivy_core.pipeline_status import (
     PipelineStatus,
@@ -1613,6 +1613,33 @@ def format_picks_digest(merged, top_n=DIGEST_TOP_N):
     return "\n\n".join(blocks), detail
 
 
+def format_picks_summary(merged):
+    """The short covering message for a PDF-first send.
+
+    Not a teaser: it carries the counts and the single best play, so the text
+    is worth something on its own if Henry is somewhere he cannot open an
+    attachment. The rest of the board is in the PDF, and the full text follows
+    automatically whenever that attachment cannot be confirmed.
+    """
+    ranked = _rank_picks(merged)
+    consensus_n = sum(1 for e in ranked if e.get("is_consensus"))
+
+    header = f"\U0001F512 Ivy's Sharp Picks \u2014 {datetime.now():%b %-d, %-I:%M %p}"
+    blocks = [f"{header}\n{_count(len(ranked), 'pick')} \u00b7 {consensus_n} consensus"]
+
+    if ranked:
+        lead = "\U0001F525 TOP PLAY" if ranked[0].get("is_consensus") else "Leading the board"
+        blocks.append(f"{lead}\n{_pick_headline(ranked[0], 1)}")
+
+    remaining = len(ranked) - 1
+    if remaining > 0:
+        blocks.append(f"The other {_count(remaining, 'pick')} are in the PDF attached.")
+    else:
+        blocks.append("Full card attached as a PDF.")
+    return "\n\n".join(blocks)
+
+
+
 def _count(n, noun, plural=None):
     """"1 pick" / "12 picks" — the report is read on a phone, and "pick(s)"
     is the kind of thing that makes software look unfinished."""
@@ -2029,15 +2056,29 @@ def _run_pipeline(
     # attachment sends came back "submitted_unverified" far more often than
     # they came back delivered, and the old code treated that as success —
     # which is exactly how reports went missing with no fallback text.
-    body, detail = format_picks_digest(filtered_picks)
+    full_body, detail = format_picks_digest(filtered_picks)
 
     pdf_path = None
     try:
         pdf_path = format_picks_pdf(filtered_picks)
-        print(f"📄 PDF archived for on-request delivery: {pdf_path}")
+        print(f"\U0001F4C4 PDF built: {pdf_path}")
     except Exception as _pe:
         # A broken PDF must never cost Henry the picks themselves.
-        print(f"⚠️  PDF generation skipped: {_pe}")
+        print(f"\u26A0\uFE0F  PDF generation skipped: {_pe}")
+
+    # PDF-first for Sharp Picks (Henry, 2026-09-09): a short covering message,
+    # the board in the attachment. This is only safe because deliver_report
+    # counts the attachment as delivered on a chat.db confirmation and nothing
+    # else, and sends fallback_body as text on any other outcome. Without that
+    # guard this is exactly the configuration that recorded SP-20260828-2107,
+    # SP-20260829-1502 and SP-20260901-1525 as sent while Henry got nothing.
+    # With no PDF to attach it stays text-first.
+    if pdf_path:
+        body = format_picks_summary(filtered_picks)
+        attach_pdf, fallback_body = True, full_body
+    else:
+        body = full_body
+        attach_pdf, fallback_body = False, None
 
     delivery = deliver_report(
         HENRY_PHONE,
@@ -2048,16 +2089,29 @@ def _run_pipeline(
         pdf_path=pdf_path,
         content_summary=content_summary,
         commands=("MORE", "WHY <n>", "PDF"),
+        attach_pdf=attach_pdf,
+        fallback_body=fallback_body,
     )
 
-    if delivery.delivered:
+    if delivery.attachment_status == ATTACH_VERIFIED:
+        print("\U0001F4CE PDF confirmed delivered in chat.db.")
+    elif delivery.fallback_sent:
+        print(
+            f"\u26A0\uFE0F  Attachment {delivery.attachment_status} \u2014 "
+            "full board sent as text instead."
+        )
+
+    # content_reached_henry, not delivered: with attach_pdf the covering text
+    # can succeed while the board itself rode on an attachment that never
+    # landed, and stamping the fingerprint then would suppress the retry.
+    if delivery.content_reached_henry:
         save_last_report(signature, body)
         print(
             f"✅ {len(filtered_picks)} pick(s) texted to Henry "
             f"({consensus_n} consensus) in {delivery.bubbles_total} bubble(s)."
         )
         result.sent = True
-        result.attached = False
+        result.attached = delivery.attachment_status == ATTACH_VERIFIED
         result.status = PipelineStatus.SUCCESS
         result.message = f"Report {report_id} sent as text."
         return result.to_dict()

@@ -1,6 +1,8 @@
 """Proactive agents: standardized run() signature, fake-pick removal, and
 text-first delivery — every job must put its content in the message body on
-every run, and must never push a PDF attachment unasked. Every test mocks
+every run. Sharp Picks pushes a PDF as well (Henry, 2026-09-09) but must
+still text the board whenever that attachment is not confirmed in chat.db;
+the other jobs must never push one at all. Every test mocks
 messaging/LLM/PDF calls — none of these send a real iMessage or call a
 real external API.
 """
@@ -46,10 +48,8 @@ def test_sports_bettor_no_picks_does_not_send_when_send_false(monkeypatch):
     assert sent == []
 
 
-def test_sports_bettor_texts_the_picks_and_never_pushes_a_pdf(monkeypatch, tmp_path):
-    """The regression that started all this: a PDF-only send that came back
-    'submitted_unverified' was treated as success, so nothing was ever texted
-    and Henry got silence. Picks must now always arrive as message text."""
+def _sports_bettor_run(monkeypatch, tmp_path, receipt_status):
+    """Drive one full Sharp Picks run with a stubbed attachment outcome."""
     fake_pdf = tmp_path / "fake_picks.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake")
     monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
@@ -57,7 +57,8 @@ def test_sports_bettor_texts_the_picks_and_never_pushes_a_pdf(monkeypatch, tmp_p
                         lambda: [{"away": "A", "home": "B", "sport": "MLB",
                                   "spread": "", "moneyline": "", "total": "",
                                   "commence": ""}])
-    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real", "matchup": "A vs B"}])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry",
+                        lambda games: [{"account": "@real", "matchup": "A vs B"}])
     monkeypatch.setattr(
         sports_bettor, "merge_picks",
         lambda picks: [{
@@ -76,22 +77,47 @@ def test_sports_bettor_texts_the_picks_and_never_pushes_a_pdf(monkeypatch, tmp_p
     monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: saved.append((sig, msg)))
     monkeypatch.setattr(sports_bettor, "format_picks_pdf", lambda merged: str(fake_pdf))
 
+    class _R:
+        status = receipt_status
+        def __bool__(self):
+            return True
+
     sent = []
     monkeypatch.setattr(
         text_delivery, "send_imessage",
         lambda phone, body: sent.append((phone, body)) or True,
     )
+    monkeypatch.setattr(text_delivery, "send_imessage_attachment",
+                        lambda *a, **k: _R())
     monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
 
     result = sports_bettor.run(force=True, send=True)
+    return result, sent, saved
 
-    assert sent, "the picks were never texted"
+
+def test_sports_bettor_pushes_the_pdf_and_texts_a_short_cover(monkeypatch, tmp_path):
+    """PDF-first: the board rides in the attachment, the text is a cover note."""
+    result, sent, saved = _sports_bettor_run(monkeypatch, tmp_path, "verified_delivered")
     joined = "\n".join(b for _, b in sent)
-    assert "A vs B" in joined and "-110" in joined, "the text didn't carry the actual pick"
     assert result["sent"] is True
-    assert result["attached"] is False, "a PDF must not be pushed unasked"
-    # The fingerprint is only stamped once the text actually went out.
+    assert result["attached"] is True, "a verified PDF must be reported as attached"
+    assert "A vs B" in joined, "even the cover note names the leading play"
+    assert "didn't confirm" not in joined, "texted a fallback despite a delivered PDF"
+    assert saved, "fingerprint not stamped after a confirmed delivery"
+
+
+def test_sports_bettor_texts_the_full_board_when_the_pdf_is_unverified(monkeypatch, tmp_path):
+    """The regression that started all this: a PDF-only send that came back
+    'submitted_unverified' was treated as success, so nothing was ever texted
+    and Henry got silence. The picks must still arrive as message text."""
+    result, sent, saved = _sports_bettor_run(monkeypatch, tmp_path, "submitted_unverified")
+    joined = "\n".join(b for _, b in sent)
+    assert result["sent"] is True
+    assert result["attached"] is False, "unverified is not attached"
+    assert "A vs B" in joined and "-110" in joined, "the text didn't carry the actual pick"
+    assert "didn't confirm" in joined, "Henry wasn't told why he got both"
     assert saved and saved[0][1] != saved[0][0], "last-report body must be the message, not the hash"
+
 
 
 def test_sports_bettor_does_not_stamp_fingerprint_when_text_fails(monkeypatch, tmp_path):
