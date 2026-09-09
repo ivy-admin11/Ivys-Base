@@ -29,6 +29,7 @@ Cost Optimization:
 """
 
 import os
+import shutil
 import socket
 import sys
 import time
@@ -2112,6 +2113,29 @@ def capabilities_endpoint(authenticated: bool = Depends(verify_api_key)):
     }
 
 
+# Ivy writes continuously: SQLite receipts, the picks database, rotating logs,
+# and a PDF per report. SQLite does not degrade gracefully when a volume fills
+# — it raises "database or disk is full" and the write is simply lost, which
+# in this codebase means a report that was delivered but has no receipt, the
+# exact ambiguity everything else here is built to avoid.
+#
+# So this is a warning rather than a check: free space is the host's business
+# and Ivy must not take herself out of rotation over it, but she must not be
+# the last to know either. The threshold is headroom for a busy day of
+# reports plus log rotation keeping up to three generations, not a guess at
+# what the machine needs overall.
+LOW_DISK_WARN_GB = 5.0
+
+
+def _disk_free_gb(path: str = PROJECT_ROOT_DIR) -> Optional[float]:
+    """Free gigabytes on the volume Ivy writes to, or None if unreadable."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return usage.free / (1024 ** 3)
+
+
 @app.get("/ready")
 def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     """Readiness probe — distinct from /health's bare liveness check.
@@ -2163,6 +2187,15 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
         warnings.append(
             "no_working_failover: the primary is the only authenticated brain; "
             "an outage there takes Ivy silent"
+        )
+
+    free_gb = _disk_free_gb()
+    if free_gb is not None and free_gb < LOW_DISK_WARN_GB:
+        warnings.append(
+            f"low_disk_space: {free_gb:.1f} GB free, under the "
+            f"{LOW_DISK_WARN_GB:.0f} GB floor — SQLite receipts and report PDFs "
+            f"fail hard when a volume fills, and a delivered report with no "
+            f"receipt is indistinguishable from one that never ran"
         )
 
     ready = all(checks.values())

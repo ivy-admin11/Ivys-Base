@@ -101,3 +101,52 @@ def test_run_job_response_never_claims_success_for_unavailable_job(unavailable_b
     body = resp.json()
     assert "unavailable" in body["result"].lower()
     assert "✅" not in body["result"]
+
+
+# ---------------------------------------------------------------------------
+# Low disk: a warning, never a readiness failure
+# ---------------------------------------------------------------------------
+
+def _ready_body(resp):
+    """/ready answers 503 with the payload under "detail" when a hard check
+    fails, and 200 with it at the top level otherwise. Under TestClient the
+    poller is not running, so 503 is the normal case here."""
+    return resp.json() if resp.status_code == 200 else resp.json()["detail"]
+
+
+def test_low_disk_is_reported_as_a_warning(monkeypatch):
+    """SQLite does not degrade gracefully when a volume fills — it raises
+    "database or disk is full" and the write is lost. In this codebase that
+    means a report delivered with no receipt, which is the one ambiguity
+    everything else here exists to prevent. Ivy has to see it coming."""
+    monkeypatch.setattr(main, "_disk_free_gb", lambda *a, **k: 1.2)
+    body = _ready_body(client.get("/ready", headers=HEADERS))
+    assert any("low_disk_space" in w for w in body.get("warnings", []))
+    assert "1.2 GB free" in " ".join(body["warnings"])
+
+
+def test_low_disk_is_never_a_readiness_check(monkeypatch):
+    """Free space is the host's business. Ivy is still serving, and pulling a
+    working gateway out of rotation over the machine's storage would be the
+    same overreaction as failing readiness for a dead failover. It belongs in
+    warnings, and must never appear among the checks that gate readiness."""
+    monkeypatch.setattr(main, "_disk_free_gb", lambda *a, **k: 0.1)
+    body = _ready_body(client.get("/ready", headers=HEADERS))
+    assert not any("disk_space" in name for name in body["checks"]), (
+        "low disk must not gate readiness"
+    )
+    assert any("low_disk_space" in w for w in body.get("warnings", []))
+
+
+def test_ample_disk_produces_no_warning(monkeypatch):
+    monkeypatch.setattr(main, "_disk_free_gb", lambda *a, **k: 500.0)
+    body = _ready_body(client.get("/ready", headers=HEADERS))
+    assert not any("low_disk" in w for w in body.get("warnings", []))
+
+
+def test_an_unreadable_volume_is_not_reported_as_full(monkeypatch):
+    """None means "could not measure", which is not the same claim as "nearly
+    out of space" — inventing the alarming reading would be its own bug."""
+    monkeypatch.setattr(main, "_disk_free_gb", lambda *a, **k: None)
+    body = _ready_body(client.get("/ready", headers=HEADERS))
+    assert not any("low_disk" in w for w in body.get("warnings", []))
