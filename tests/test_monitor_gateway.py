@@ -539,3 +539,73 @@ class TestAlertSendFailure:
         gw.be_down()
         sms.ok = False
         assert mg.main() == 0
+
+
+# ---------------------------------------------------------------------------
+# Readiness warnings: serving, but a guarantee behind it is gone
+# ---------------------------------------------------------------------------
+
+READY_WITH_DEAD_FAILOVER = (200, {
+    "checks": {"imessage_poller": True, "chat_db": True},
+    "warnings": ["llm_failover_unavailable: gemini — 429 quota exceeded"],
+})
+
+
+class TestReadinessWarnings:
+    """The gateway answered every probe correctly for weeks while the failover
+    brain behind it sat on a 429. Nothing was down, so nothing alerted, and the
+    dual-brain guarantee was fiction the whole time."""
+
+    def test_a_warning_does_not_make_the_gateway_degraded(self, gw, sms):
+        """It is still serving — flunking it would take a working gateway out."""
+        gw.ready = [READY_WITH_DEAD_FAILOVER]
+        assert mg.check_gateway()[0] == "up"
+
+    def test_a_new_warning_is_texted_even_though_nothing_is_down(self, gw, sms):
+        """No baseline grace period, unlike the status machine. A warning is a
+        standing statement rather than a transition, so one that is already
+        true on the first run would otherwise be recorded as normal and never
+        reported at all — which is exactly how the dead failover stayed quiet."""
+        gw.ready = [READY_WITH_DEAD_FAILOVER]
+        mg.main()
+        assert len(sms.sent) == 1, "a vanished guarantee has to reach Henry"
+        assert "failover" in sms.sent[0][1].lower()
+
+    def test_the_same_warning_is_not_repeated_every_run(self, gw, sms):
+        """Re-texting a known warning every couple of minutes trains him to
+        ignore the channel, which is the failure this whole file exists for."""
+        gw.ready = [READY_WITH_DEAD_FAILOVER]
+        mg.main()
+        sms.sent.clear()
+        mg.main()
+        mg.main()
+        assert sms.sent == []
+
+    def test_a_warning_that_clears_and_returns_alerts_again(self, gw, sms):
+        gw.ready = [READY_WITH_DEAD_FAILOVER]
+        mg.main()
+        sms.sent.clear()
+        gw.ready = [READY_OK]          # failover comes back
+        mg.main()
+        assert read_state()["warnings"] == []
+        gw.ready = [READY_WITH_DEAD_FAILOVER]   # and dies again
+        mg.main()
+        assert len(sms.sent) == 1
+
+    def test_an_undelivered_warning_is_retried_rather_than_marked_seen(self, gw, sms):
+        """Same rule the status machine already follows: a text that never sent
+        is not a text that happened."""
+        gw.ready = [READY_WITH_DEAD_FAILOVER]
+        sms.ok = False
+        mg.main()
+        assert read_state().get("warnings", []) == [], "must not record an undelivered warning"
+        sms.ok = True
+        sms.sent.clear()
+        mg.main()
+        assert len(sms.sent) == 1, "the dropped warning has to be retried"
+
+    def test_a_payload_with_no_warnings_key_is_fine(self, gw, sms):
+        gw.ready = [READY_OK]
+        mg.main()
+        mg.main()
+        assert sms.sent == []

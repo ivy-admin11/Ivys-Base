@@ -107,6 +107,32 @@ def _failed_checks(body) -> list:
     return sorted(name for name, ok in checks.items() if not ok)
 
 
+def _ready_warnings(body) -> list:
+    """Pull /ready's non-fatal warnings out of its payload.
+
+    These are conditions where the gateway serves fine but a guarantee behind
+    it is gone — a dead failover brain being the one that mattered. They are
+    deliberately not check failures: flunking readiness for them would take a
+    working gateway out of rotation. But nothing watched them either, which is
+    how the DeepSeek->Gemini failover sat broken for weeks while every probe
+    reported green.
+    """
+    if not isinstance(body, dict):
+        return []
+    payload = body.get("detail") if isinstance(body.get("detail"), dict) else body
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list):
+        return []
+    return sorted(str(w) for w in warnings)
+
+
+def fetch_ready_warnings() -> list:
+    """Probe /ready purely for its warnings. Separate from check_gateway() so
+    the up/degraded/down verdict keeps its exact shape."""
+    _, body = _probe_with_retries(GATEWAY_READY_URL)
+    return _ready_warnings(body)
+
+
 def check_gateway() -> tuple:
     """Classify the gateway as up / degraded / down, with a reason.
 
@@ -206,6 +232,22 @@ def main() -> int:
     # dropped "DOWN" text stayed silent until an hour after some *earlier*
     # alert. Holding the old status makes the next run see the same transition
     # and try again.
+    # Warnings ride alongside the status machine rather than inside it: the
+    # gateway is up, so no transition fires, but a guarantee that quietly
+    # disappeared still has to reach Henry once. Alert on newly-appeared
+    # warnings only — repeating a known one every two minutes would train him
+    # to ignore the channel.
+    warnings = fetch_ready_warnings()
+    previously_warned = set(state.get("warnings", []))
+    new_warnings = [w for w in warnings if w not in previously_warned]
+    if new_warnings and not alert_text:
+        alert_text = (
+            "⚠️ Ivy is serving, but a guarantee behind it is gone:\n"
+            + "\n".join(f"• {w}" for w in new_warnings)
+        )
+    elif new_warnings:
+        print(f"[{timestamp}] additional warnings held back behind a status alert: {new_warnings}")
+
     alert_delivered = True
     if alert_text:
         print(f"[{timestamp}] {alert_text}")
@@ -222,6 +264,10 @@ def main() -> int:
     # eventual confirmed alert still reads as an up->degraded transition.
     state["status"] = prev_status if (suppress_transition or not alert_delivered) else new_status
     state["reason"] = reason
+    # Only record warnings as "seen" once the text carrying them actually went
+    # out, for the same reason the status is held back on a failed send.
+    if alert_delivered:
+        state["warnings"] = warnings
     save_state(state)
     return 0
 

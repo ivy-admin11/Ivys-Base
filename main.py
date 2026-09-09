@@ -320,7 +320,21 @@ def _probe_deepseek() -> Dict[str, Any]:
 
 
 def _probe_gemini() -> Dict[str, Any]:
-    """Make a minimal (~1-token) call to Gemini and map the result."""
+    """Check that the Gemini key is valid, WITHOUT spending generation quota.
+
+    This used to call generate_content on every probe. With a 60 s cache TTL
+    and a monitor polling /health continuously, that is up to 1440 generate
+    calls a day — against a free-tier ceiling of 20 a day for gemini-2.5-flash.
+    The health check therefore consumed the entire failover budget many times
+    over, every day, and guaranteed that the failover brain was exhausted at
+    the exact moment it would have been needed. The probe was not observing the
+    outage; it was causing it.
+
+    Listing models is an authenticated metadata call: a bad key gets 400
+    API_KEY_INVALID, a good key gets 200, and it does not touch the
+    generate_content quota. That is the whole question a health probe should
+    be asking.
+    """
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         return {
@@ -329,19 +343,28 @@ def _probe_gemini() -> Dict[str, Any]:
         }
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        model.generate_content("hi", generation_config={"max_output_tokens": 1})
+        # Pull a single page; we only care that the call is accepted.
+        next(iter(genai.list_models()), None)
         return {
             "configured": True, "authenticated": True, "reachable": True,
             "role": "failover", "status": "ready", "reason": None,
         }
     except Exception as exc:
         msg = str(exc)
-        if any(code in msg for code in ("401", "403", "API_KEY_INVALID", "PERMISSION_DENIED")):
+        if any(code in msg for code in
+               ("401", "403", "400", "API_KEY_INVALID", "PERMISSION_DENIED")):
             return {
                 "configured": True, "authenticated": False, "reachable": True,
                 "role": "failover", "status": "degraded",
                 "reason": "Provider returned auth error",
+            }
+        # A 429 here would mean the metadata endpoint itself is throttled — the
+        # key is still valid, so this is not an auth failure.
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            return {
+                "configured": True, "authenticated": True, "reachable": True,
+                "role": "failover", "status": "rate_limited",
+                "reason": "Provider rate-limited the probe; key is valid",
             }
         return {
             "configured": True, "authenticated": False, "reachable": True,
@@ -2044,8 +2067,31 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
     any_authenticated = any(p.get("authenticated") for p in providers.values())
     checks["llm_provider_authenticated"] = any_authenticated
 
+    # A dead failover is not a reason to fail readiness — the primary is still
+    # answering and Ivy is still serving. But it used to be invisible: this
+    # endpoint reported all-green for weeks while Gemini sat on a 429, so the
+    # dual-brain guarantee was fiction and nothing said so. Warnings are the
+    # difference between "degraded but serving" and "fine".
+    warnings: List[str] = []
+    for name, info in providers.items():
+        if info.get("role") == "failover" and not info.get("authenticated"):
+            reason = (info.get("reason") or "no reason given").strip()
+            warnings.append(
+                f"llm_failover_unavailable: {name} — {reason[:160]}"
+            )
+    if any_authenticated and not any(
+        info.get("role") == "failover" and info.get("authenticated")
+        for info in providers.values()
+    ) and len(providers) > 1:
+        warnings.append(
+            "no_working_failover: the primary is the only authenticated brain; "
+            "an outage there takes Ivy silent"
+        )
+
     ready = all(checks.values())
     payload: Dict[str, Any] = {"ready": ready, "checks": checks}
+    if warnings:
+        payload["warnings"] = warnings
     if not ready:
         raise HTTPException(status_code=503, detail=payload)
     return payload
