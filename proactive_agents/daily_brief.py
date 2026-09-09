@@ -203,6 +203,14 @@ def fetch_readwise_review() -> BlockResult:
             headers={"Authorization": f"Token {token}"},
             timeout=HTTP_TIMEOUT_S,
         )
+        # Readwise answers 404 "Review not found" when there is simply nothing
+        # to resurface — an empty library, or a review already dismissed. That
+        # is an ordinary state of the world, not a broken integration, and
+        # raise_for_status turned it into a bare "readwise: HTTPError" that
+        # reads like a credentials problem and sends someone to check a token
+        # that is working perfectly.
+        if r.status_code == 404:
+            return BlockResult.unavailable("no review from Readwise today")
         r.raise_for_status()
         payload = r.json()
     except Exception as exc:
@@ -229,34 +237,48 @@ def fetch_readwise_review() -> BlockResult:
     return BlockResult(text="\n\n".join(lines), sources=["readwise.io/api/v2/review"])
 
 
-MARKET_SYMBOLS = [("S&P 500", "^spx"), ("Nasdaq", "^ndq"), ("Dow", "^dji")]
+# Yahoo's chart endpoint: free, keyless, and — unlike the Stooq CSV feed this
+# used to read — still there. Stooq retired /q/l/ entirely (every symbol 404s
+# on both stooq.com and stooq.pl) and put a proof-of-work bot wall in front of
+# the daily-history path, so the block returned "no index data reachable" on
+# every evening run. It failed honestly, which is why it never looked urgent,
+# but an evening market block that has never once printed a number is not a
+# market block.
+MARKET_SYMBOLS = [("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Dow", "^DJI")]
 
 
 def fetch_market_close() -> BlockResult:
-    """Index closes from Stooq's CSV endpoint — no key, no quota.
+    """Index closes from Yahoo's chart endpoint — no key, no quota.
 
     Every figure here is parsed from the response. If the source is
     unreachable or a row does not parse, the block says so rather than
     presenting a number it is not sure of.
-    """
-    import csv
-    import io
 
+    The move is measured against the previous close, not against the day's
+    open. "On the day" means the former everywhere it is quoted, and the old
+    open-to-close arithmetic quietly reported a different number under the
+    same words.
+    """
     import requests
 
     rows, sources = [], []
     for label, sym in MARKET_SYMBOLS:
         try:
             r = requests.get(
-                f"https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv",
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                params={"range": "5d", "interval": "1d"},
+                headers={"User-Agent": "Mozilla/5.0"},
                 timeout=HTTP_TIMEOUT_S,
             )
             r.raise_for_status()
-            rec = next(csv.DictReader(io.StringIO(r.text)))
-            close, open_ = float(rec["Close"]), float(rec["Open"])
-            pct = ((close - open_) / open_ * 100) if open_ else 0.0
+            result = r.json()["chart"]["result"][0]
+            closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
+            close = float(closes[-1])
+            prev = result["meta"].get("chartPreviousClose")
+            prev = float(prev) if prev else None
+            pct = ((close - prev) / prev * 100) if prev else 0.0
             rows.append(f"{label}: {close:,.2f} ({pct:+.2f}% on the day)")
-            sources.append("stooq.com")
+            sources.append("finance.yahoo.com")
         except Exception:
             rows.append(f"{label}: unavailable")
     if all("unavailable" in r for r in rows):

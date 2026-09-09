@@ -1,6 +1,7 @@
 """config.py: fail-closed ADMIN_SECRET, canonical env vars, .env load order."""
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -190,7 +191,12 @@ def test_grocery_automation_stays_deleted():
         except OSError:
             continue
         for needle in _forbidden_markers():
-            if needle in text:
+            # Word boundaries, not bare substrings. The retailer names are
+            # three and six letters, and a plain `in` match fires on any word
+            # that happens to contain them — "SpendTheBudget" lowercases to
+            # something containing one of them, and a false positive here
+            # reads exactly like the regression this is guarding against.
+            if re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", text):
                 offenders.append(f"{rel}: {needle}")
 
     assert not offenders, "grocery automation is back: " + "; ".join(offenders)

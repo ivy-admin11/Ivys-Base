@@ -127,12 +127,21 @@ class TestWeather:
 
 
 class TestMarketClose:
-    CSV = ("Symbol,Date,Time,Open,High,Low,Close,Volume\n"
-           "^SPX,2026-09-05,22:00:00,5500.00,5560.00,5490.00,5555.00,0\n")
+    """Reads Yahoo's chart endpoint. The Stooq CSV feed this used to call was
+    retired outright — every symbol 404s — so the block printed "no index data
+    reachable" on every evening run until 2026-09-09."""
 
-    def _resp(self, text="", status_ok=True):
+    @staticmethod
+    def PAYLOAD(close=5555.0, prev=5500.0):
+        return {"chart": {"result": [{
+            "meta": {"chartPreviousClose": prev},
+            "indicators": {"quote": [{"close": [None, close]}]},
+        }]}}
+
+    def _resp(self, payload=None, status_ok=True):
         class R:
-            def __init__(self): self.text = text
+            status_code = 200 if status_ok else 503
+            def json(self): return payload
             def raise_for_status(self):
                 if not status_ok:
                     raise RuntimeError("503")
@@ -140,32 +149,45 @@ class TestMarketClose:
 
     def test_close_and_move_come_from_the_payload(self, monkeypatch):
         import requests
-        monkeypatch.setattr(requests, "get", lambda *a, **k: self._resp(self.CSV))
+        monkeypatch.setattr(requests, "get", lambda *a, **k: self._resp(self.PAYLOAD()))
         r = db.fetch_market_close()
         assert "5,555.00" in r.text
         assert "+1.00%" in r.text, "1.00% is (5555-5500)/5500 — computed, not guessed"
+
+    def test_the_move_is_against_the_previous_close(self, monkeypatch):
+        """"On the day" means versus yesterday's close everywhere it is quoted.
+        The old code measured open-to-close and printed the same words."""
+        import requests
+        monkeypatch.setattr(requests, "get",
+                            lambda *a, **k: self._resp(self.PAYLOAD(close=110.0, prev=100.0)))
+        assert "+10.00%" in db.fetch_market_close().text
 
     def test_a_failing_symbol_is_marked_unavailable_not_omitted(self, monkeypatch):
         """A missing index must not silently vanish from the list."""
         import requests
         monkeypatch.setattr(requests, "get",
-                            lambda *a, **k: self._resp(self.CSV, status_ok=False))
+                            lambda *a, **k: self._resp(self.PAYLOAD(), status_ok=False))
         r = db.fetch_market_close()
         assert r.failed
         assert "unavailable" in r.text
 
     def test_every_configured_index_appears(self, monkeypatch):
         import requests
-        monkeypatch.setattr(requests, "get", lambda *a, **k: self._resp(self.CSV))
+        monkeypatch.setattr(requests, "get", lambda *a, **k: self._resp(self.PAYLOAD()))
         text = db.fetch_market_close().text
         for label, _ in db.MARKET_SYMBOLS:
             assert label in text
 
-    def test_a_zero_open_does_not_divide_by_zero(self, monkeypatch):
+    def test_a_missing_previous_close_does_not_divide_by_zero(self, monkeypatch):
         import requests
-        csv = self.CSV.replace("5500.00,5560.00,5490.00", "0.00,5560.00,5490.00")
-        monkeypatch.setattr(requests, "get", lambda *a, **k: self._resp(csv))
+        monkeypatch.setattr(requests, "get",
+                            lambda *a, **k: self._resp(self.PAYLOAD(prev=0.0)))
         assert "+0.00%" in db.fetch_market_close().text
+
+    def test_the_symbols_are_the_ones_yahoo_answers_to(self, monkeypatch):
+        """Stooq's carets (^spx) are not Yahoo's (^GSPC), and a wrong symbol
+        fails exactly like an outage — quietly, forever."""
+        assert [s for _, s in db.MARKET_SYMBOLS] == ["^GSPC", "^IXIC", "^DJI"]
 
 
 class TestFeeds:
@@ -280,12 +302,32 @@ class TestReadwiseReview:
         import requests
 
         class R:
+            status_code = 200
             def json(self): return payload
             def raise_for_status(self):
                 if not ok:
                     raise RuntimeError("401")
         monkeypatch.setenv("READWISE_API_KEY", key)
         monkeypatch.setattr(requests, "get", lambda *a, **k: R())
+
+    def test_an_empty_library_is_not_reported_as_an_error(self, monkeypatch):
+        """Readwise answers 404 "Review not found" when there is nothing to
+        resurface. raise_for_status turned that into a bare "readwise:
+        HTTPError", which reads like a broken token and sends someone to check
+        a key that is working perfectly."""
+        import requests
+
+        class R:
+            status_code = 404
+            def json(self): return {"detail": "Review not found."}
+            def raise_for_status(self): raise RuntimeError("404")
+
+        monkeypatch.setenv("READWISE_API_KEY", "tok")
+        monkeypatch.setattr(requests, "get", lambda *a, **k: R())
+        r = db.fetch_readwise_review()
+        assert r.failed
+        assert "HTTPError" not in r.text and "Error" not in r.text
+        assert "no review" in r.text.lower()
 
     def test_the_highlight_is_quoted_verbatim(self, monkeypatch):
         self._patch(monkeypatch, self.PAYLOAD)
