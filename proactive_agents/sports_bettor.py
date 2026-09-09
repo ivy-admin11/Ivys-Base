@@ -339,10 +339,24 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
             
             # Handle authentication/authorization failures
             if r.status_code in (401, 403):
+                # The Odds API says WHY in the body, and 401 covers two very
+                # different problems: a key that is wrong, and a key that is
+                # right but out of quota. Throwing the body away left the alert
+                # advising "verify ODDS_API_KEY is current and authorized" for
+                # a key that was current, authorized, and simply used up.
+                # Redacted because the key travels in the query string and
+                # providers echo the request back often enough to matter.
+                try:
+                    reason = _redact(r.text or "").strip()[:200]
+                except Exception:
+                    reason = ""
                 raise ProviderAuthenticationError(
                     provider="odds_api",
                     status_code=r.status_code,
-                    message=f"Odds API credentials were rejected (HTTP {r.status_code})",
+                    message=(
+                        f"Odds API credentials were rejected (HTTP {r.status_code})"
+                        + (f" — {reason}" if reason else "")
+                    ),
                     endpoint=_redact(r.url),
                 )
             

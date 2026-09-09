@@ -227,3 +227,15 @@ def test_empty_enrichment_is_named_as_the_reason_nothing_qualified():
     src = inspect.getsource(sb._run_pipeline)
     assert 'if not any((e.get("enrichment") or {}).get("confidence") for e in merged)' in src
     assert "broken step, not a quiet" in src
+
+
+def test_odds_api_401_carries_the_provider_reason():
+    """401 covers two different problems: a wrong key and an exhausted one.
+
+    The alert used to say "verify ODDS_API_KEY is current and authorized" in
+    both cases, which is unhelpful advice for a key that is current, authorized
+    and simply out of quota. The provider says which in the response body.
+    """
+    src = inspect.getsource(sb.fetch_live_odds)
+    assert "_redact(r.text" in src, "the 401 body is thrown away again"
+    assert "reason" in src
