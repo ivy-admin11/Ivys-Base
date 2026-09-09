@@ -585,7 +585,7 @@ def merge_picks(picks):
     """Merge picks on the same game/side, tagging multi-handicapper plays as consensus."""
     merged = {}
     for p in picks:
-        key = (_norm(p.get("matchup")), _norm(p.get("side")))
+        key = _bet_key(p)
         entry = merged.get(key)
         if entry is None:
             entry = {
@@ -671,6 +671,68 @@ def _side_direction(pick):
         # opposing picks identical.
         return " ".join(sorted(_team_tokens(hits[0]))) if len(hits) == 1 else None
     return None
+
+
+def _side_line(side):
+    """The number a total or spread is set at: "OVER 8.5" -> 8.5, "LAA +1.5" -> 1.5.
+
+    Part of the bet's identity, and deliberately separate from the price. Two
+    handicappers on "OVER 8" and "OVER 5.5" for the same game have not agreed
+    on anything; merging them would manufacture a consensus nobody posted.
+    """
+    s = _norm(side)
+    family = _market_family(s)
+    if family == "total":
+        m = re.search(r"(?:over|under|\bo|\bu)\s*(\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    if family == "spread":
+        m = re.search(r"([+-]\s?\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        try:
+            value = abs(float(m.group(1).replace(" ", "")))
+        except ValueError:
+            return None
+        # No handicap reaches three digits: "TEX -150" is a moneyline written
+        # with its price attached, and has no line of its own.
+        return None if value >= 100 else value
+    return None
+
+
+def _bet_key(pick):
+    """Identity of the BET, not of the words used to describe it.
+
+    "MIL Brewers ML" and "Milwaukee Brewers ML" on the same game are one bet
+    with two sharps on it. Keyed on the raw strings they stayed two separate
+    one-sharp picks -- which is why a board carrying five independent sources
+    reported zero consensus plays for four days straight, and therefore
+    nothing that cleared the quality bar.
+
+    Strict about the bet, loose about the wording: the game, the market, the
+    side taken, the number it is set at and the period all have to agree.
+    This depends on repair_matchups having already rewritten both matchups to
+    the slate's own team names -- without the slate, the spellings still
+    differ and consensus is undetectable.
+    """
+    game = _game_key(pick.get("matchup"))
+    side = pick.get("side")
+    direction = _side_direction(pick)
+    if direction is None:
+        # Player props, parlays, "NE Patriots props" -- nothing here can be
+        # read as a side. Fall back to the literal text so that two different
+        # props on one game never collapse into a consensus that isn't real.
+        return ("literal", game, _norm(side))
+    family = _market_family(side)
+    line = _side_line(side)
+    if family == "spread" and line is None:
+        family = "moneyline"
+    period = "period" if _is_period_bet(side) else "full"
+    return (game, family, direction, line, period)
 
 
 def drop_conflicting_picks(merged):
@@ -1753,9 +1815,12 @@ def _run_pipeline(
         result.status = PipelineStatus.DEGRADED
         result.admin_message = (
             f"Sharp Picks: Odds API authentication failed.\n"
-            f"The X sweep continues, but two things stop: matchup validation "
-            f"against the live slate (bad parses reach the database unchecked) "
-            f"and score-based grading. Pricing is unaffected — it is off.\n"
+            f"The X sweep continues, but three things stop: matchup validation "
+            f"against the live slate (bad parses reach the database unchecked), "
+            f"score-based grading, and consensus detection — two sharps on one "
+            f"game only merge into one bet once the slate has canonicalised both "
+            f"spellings, so expect a board of 1-sharp picks that never clears the "
+            f"bar. Pricing is unaffected — it is off.\n"
             f"Status: HTTP {e.status_code}\n"
             f"Message: {e.message}\n"
             f"Admin action required: Verify ODDS_API_KEY is current and authorized."
@@ -1815,13 +1880,18 @@ def _run_pipeline(
         result.status = PipelineStatus.NO_QUALIFYING_PICKS
         return result.to_dict()
 
-    merged = merge_picks(picks)
-
-    # Complete the half-formed matchups before anything tries to match them
-    # against the slate — "LAD @ ?" finds no game, and so gets no price.
-    merged, unusable = repair_matchups(merged, games)
+    # Complete the half-formed matchups and rewrite every one of them to the
+    # slate's own team names BEFORE merging. This ran four lines later for
+    # months, and the order was the entire bug: merge_picks keys on the
+    # matchup, so "MIA Marlins @ ATL Braves" and "Miami Marlins @ Atlanta
+    # Braves" — one game, written by two different handicappers — never
+    # merged. Each kept a single sharp, neither reached the 2-sharp bar, and
+    # a board with five independent sources reported zero consensus plays.
+    picks, unusable = repair_matchups(picks, games)
     if unusable:
         print(f"\U0001F9F9 Dropped {len(unusable)} pick(s) with no identifiable team.")
+
+    merged = merge_picks(picks)
 
     attach_odds(merged, games)
 
@@ -1881,6 +1951,22 @@ def _run_pipeline(
         # Naming the CAUSE matters: a board sourced from one handle can never
         # reach a 2-sharp consensus, so "nothing qualified" is about coverage,
         # not about a quiet day.
+        # The single-sharp route to qualifying runs entirely on the enrichment
+        # grade. When enrichment comes back empty the route is shut for the
+        # whole board, so only a 2-sharp consensus can clear the bar -- and a
+        # board of genuinely different bets then reports as "nothing bettable"
+        # when what actually happened is that a pipeline step returned nothing.
+        # That is a broken step wearing the costume of a quiet slate, which is
+        # the failure mode this whole agent keeps having to be taught to name.
+        if not any((e.get("enrichment") or {}).get("confidence") for e in merged):
+            body += (
+                "\n\nNo confidence grade came back for a single one of them, so "
+                "the one-sharp route to qualifying was shut for the whole board "
+                "\u2014 only a 2-sharp consensus could have cleared the bar. The "
+                "enrichment step returning nothing is a broken step, not a quiet "
+                "slate."
+            )
+
         sources = {h for e in merged for h in (e.get("handicappers") or [])}
         if len(sources) == 1:
             only = next(iter(sources))
