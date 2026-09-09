@@ -7,7 +7,7 @@ iMessage notification bus for weekly recipe delivery.
 
 Architecture:
 - Environment routing via require_env (dual-brain failover: Gemini → DeepSeek)
-- Stateful 48-hour cron gatekeeping (JSON state tracking at ~/openclaw-admin/data/meal_plan_state.json)
+- Stateful cadence gatekeeping, MIN_HOURS_BETWEEN_RUNS (JSON state at ~/openclaw-admin/data/meal_plan_state.json)
 - Specialized menu rotation: arepas, cachapas, fusion burgers, macro bowls, sushi, Ooni pizza
 - Ultra-condensed SMS text compression for iMessage delivery
 """
@@ -129,18 +129,31 @@ def save_state(state: Dict[str, Any]) -> None:
         logger.error(f"Failed to save state: {e}")
 
 
+# The gate exists so a retried or double-fired launchd run cannot text the
+# household twice. It is NOT the schedule — the plist is. Those two were the
+# same number while the job ran weekly, so nobody had to tell them apart; when
+# the schedule moved to daily on 2026-09-09 a 48-hour gate would have silently
+# delivered every OTHER day and looked like a broken agent rather than a
+# deliberate cadence. Keep this strictly shorter than the plist interval.
+MIN_HOURS_BETWEEN_RUNS = 24
+
+
 def check_48h_gate(force: bool = False) -> bool:
     """
-    Check if 48 hours have elapsed since last execution.
+    Check whether MIN_HOURS_BETWEEN_RUNS have elapsed since last execution.
 
     force=True bypasses the gate entirely — for explicitly requested ad-hoc
     runs. Scheduled runs must always call this with force=False so the
-    48-hour cadence is preserved.
+    cadence is preserved.
 
-    Returns True if execution should proceed, False if within 48-hour window.
+    The name is historical: the window was 48 hours when the job ran weekly.
+    Callers and tests reference it, so it keeps its name rather than churning
+    them for a rename that changes nothing.
+
+    Returns True if execution should proceed, False if within the window.
     """
     if force:
-        logger.info("⚡ force=True — bypassing 48h gate (ad-hoc run)")
+        logger.info("⚡ force=True — bypassing the cadence gate (ad-hoc run)")
         return True
 
     state = load_state()
@@ -155,12 +168,18 @@ def check_48h_gate(force: bool = False) -> bool:
     now = datetime.now(timezone.utc).astimezone()
     elapsed = now - (last_run if last_run.tzinfo else last_run.replace(tzinfo=timezone.utc).astimezone())
 
-    if elapsed >= timedelta(hours=48):
-        logger.info(f"✅ 48h gate passed ({elapsed.total_seconds()/3600:.1f}h elapsed)")
+    if elapsed >= timedelta(hours=MIN_HOURS_BETWEEN_RUNS):
+        logger.info(
+            f"✅ cadence gate passed ({elapsed.total_seconds()/3600:.1f}h elapsed, "
+            f"needs {MIN_HOURS_BETWEEN_RUNS}h)"
+        )
         return True
     else:
-        remaining = timedelta(hours=48) - elapsed
-        logger.info(f"⏭️  Within 48h window ({remaining.total_seconds()/3600:.1f}h remaining)")
+        remaining = timedelta(hours=MIN_HOURS_BETWEEN_RUNS) - elapsed
+        logger.info(
+            f"⏭️  Within the {MIN_HOURS_BETWEEN_RUNS}h window "
+            f"({remaining.total_seconds()/3600:.1f}h remaining)"
+        )
         return False
 
 

@@ -78,7 +78,7 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.sharppicks",  # scheduled cadence — still installed via launchd
         entrypoint="proactive_agents.sports_bettor:run",  # ad-hoc requests bypass launchd entirely
-        schedule="Every 30 min (4 CST windows daily)",
+        schedule="Daily 9am, 3pm, 9pm CST",
     ),
     Job(
         name="happy_hour",
@@ -88,11 +88,12 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.happy_hour_scout",
         entrypoint="proactive_agents.happy_hour_scout:run",
-        # NOTE: the actual installed plist's StartCalendarInterval sets
-        # Weekday=1, which is Monday in launchd's convention (0/7=Sunday),
-        # not Sunday as this description previously (incorrectly) claimed.
-        # Preserved as-is pending confirmation of which day was intended.
-        schedule="Mondays 12pm CST",
+        # Daily since 2026-09-09. Was Weekday=0 (Sunday); the note that used
+        # to sit here claimed Weekday=1/Monday, which the installed plist
+        # never said. These strings are what `./ivy list` and /capabilities
+        # show, and all three had drifted from their plists — Sharp Picks
+        # advertised "every 30 min" for a job that runs three times a day.
+        schedule="Daily 12pm CST",
     ),
     Job(
         name="bravo_scout",
@@ -122,7 +123,7 @@ JOB_REGISTRY = [
         executor="entrypoint",
         target="com.ivy.familia_meal_planner",  # new scheduled label — see deploy/launchd/
         entrypoint="proactive_agents.Familia_meal_planner:run",
-        schedule="Sundays 8am CST",
+        schedule="Daily 8am CST",
     ),
     Job(
         # RETIRED 2026-09-05. com.ivy.brain was an unrestricted iMessage

@@ -52,10 +52,15 @@ class TestStaleness:
         _seen(monkeypatch, {"sharp_picks": clock - timedelta(hours=12)})
         assert wd.stale_agents(clock) == []
 
-    def test_the_weekly_meal_planner_gets_a_long_leash(self, monkeypatch, clock):
-        _seen(monkeypatch, {"familia_meal_planner": clock - timedelta(days=8)})
-        assert wd.stale_agents(clock) == []
-        _seen(monkeypatch, {"familia_meal_planner": clock - timedelta(days=11)})
+    def test_the_daily_meal_planner_tolerates_one_missed_run_not_a_week(
+        self, monkeypatch, clock
+    ):
+        """It ran weekly until 2026-09-09 and carried a 10-day leash to match.
+        Daily now, so the leash came down with it: one skipped morning is
+        forgivable, a second means nobody is cooking from it."""
+        _seen(monkeypatch, {"familia_meal_planner": clock - timedelta(hours=30)})
+        assert wd.stale_agents(clock) == [], "one missed run must not cry wolf"
+        _seen(monkeypatch, {"familia_meal_planner": clock - timedelta(hours=60)})
         assert [s["job"] for s in wd.stale_agents(clock)] == ["familia_meal_planner"]
 
     def test_a_job_with_no_history_is_not_reported(self, monkeypatch, clock):

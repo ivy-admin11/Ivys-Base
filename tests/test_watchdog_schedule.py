@@ -88,10 +88,21 @@ def test_every_watched_job_has_a_plist() -> None:
     )
 
 
-def test_happy_hour_is_weekly_not_daily() -> None:
-    """Regression pin for the specific misdiagnosis."""
-    assert _load("com.ivy.happy_hour_scout")["StartCalendarInterval"]["Weekday"] == 0
-    assert EXPECTED_SILENCE_H["happy_hour"] > 168
+def test_happy_hour_is_daily_and_watched_as_such() -> None:
+    """Happy Hour ran Weekday=0 until 2026-09-09, and an audit read the
+    six-day silence as "stopped since Sep 1" — the misdiagnosis this file was
+    written to prevent. It is daily now, at Henry's request, so the pin flips:
+    the schedule must carry no Weekday key, and the watchdog must not still be
+    waiting a week before it says anything.
+
+    The threshold and the plist have to move together in either direction.
+    Whichever one is left behind, the watchdog is wrong: too loud on a weekly
+    job, or silent through a dead daily one.
+    """
+    interval = _load("com.ivy.happy_hour_scout")["StartCalendarInterval"]
+    assert "Weekday" not in interval, "a leftover Weekday makes it weekly again"
+    assert interval["Hour"] == 12
+    assert EXPECTED_SILENCE_H["happy_hour"] <= 48
 
 
 @pytest.mark.parametrize(

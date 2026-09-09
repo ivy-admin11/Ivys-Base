@@ -36,25 +36,22 @@ STATE_PATH = PROJECT_ROOT / "data" / "watchdog_state.json"
 
 # Hours of silence before a job is considered stopped. Each is several times
 # the job's OBSERVED cadence, so a skipped run or a quiet slate never trips it.
-#   sharp_picks  three reports a day                → 3 missed cycles
-#   happy_hour   daily                              → 2 missed days
-#   meal_planner writes weekly, not daily: its log
-#                carries one entry every 7 days from
-#                19 Jul to 30 Aug without exception  → 10 days
-# Measured from what the logs actually show, not from what the plists say —
-# the meal planner's template reads as a daily 08:00 start but has produced a
-# strictly weekly log for seven weeks, and the watchdog has to match reality
-# or it cries wolf every Monday.
 # Derived from deploy/launchd/*.plist.template, NOT from how often a job
 # happens to appear in the logs. Reading cadence off the logs is what made an
-# earlier audit call Happy Hour "stopped since Sep 1": it runs Weekday 0, so a
-# Monday-to-Saturday silence is the schedule working, not a failure. Each value
-# is the longest legitimate gap plus roughly one interval of slack.
-# test_watchdog_thresholds_match_plists holds these honest.
+# earlier audit call Happy Hour "stopped": a weekly job is silent six days out
+# of seven, and that was the schedule working. Each value is the longest
+# legitimate gap plus roughly one interval of slack, and
+# test_watchdog_thresholds_match_plists holds it to at most two intervals —
+# any looser and a genuinely dead agent stays quiet past a full missed run.
+#
+# happy_hour and familia_meal_planner moved from Sundays to daily on
+# 2026-09-09 at Henry's request, so their thresholds came down from 192h with
+# them. Leaving those behind would have been the same bug in reverse: a
+# week-long tolerance on a job that should report every morning.
 EXPECTED_SILENCE_H: Dict[str, int] = {
     "sharp_picks": 20,           # daily at 09/15/21 -> 12h worst gap
-    "happy_hour": 192,           # Sundays 12:00 -> 168h between runs
-    "familia_meal_planner": 192, # Sundays 08:00 -> 168h between runs
+    "happy_hour": 48,            # daily 12:00 -> 24h between runs
+    "familia_meal_planner": 48,  # daily 08:00 -> 24h between runs
     "daily_brief_morning": 30,   # daily 07:30 -> 24h between runs
     "daily_brief_evening": 30,   # daily 17:30 -> 24h between runs
 }

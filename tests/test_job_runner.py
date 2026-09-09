@@ -250,3 +250,25 @@ def test_the_retired_brain_job_says_why_it_is_gone():
     assert brain.available is False
     assert "2026-09-05" in (brain.unavailable_reason or "")
     assert "chat.db" in (brain.unavailable_reason or "")
+
+
+def test_the_daily_agents_have_no_weekday_key():
+    """launchd matches only the keys present in StartCalendarInterval, so a
+    leftover Weekday silently turns a daily job back into a weekly one — and
+    it looks like a dead agent rather than a schedule."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for label in ("com.ivy.happy_hour_scout", "com.ivy.familia_meal_planner"):
+        text = (root / "deploy" / "launchd" / f"{label}.plist.template").read_text()
+        assert "<key>Weekday</key>" not in text, f"{label} is still weekly"
+
+
+def test_the_meal_planner_gate_is_shorter_than_its_schedule():
+    """The gate is a double-fire guard, not the schedule. It was 48 hours while
+    the job ran weekly, where the two were indistinguishable. On a daily
+    schedule a 48-hour gate delivers every OTHER day, which reads as a broken
+    agent rather than a cadence — so it must stay under 24."""
+    from proactive_agents.Familia_meal_planner import MIN_HOURS_BETWEEN_RUNS
+
+    assert MIN_HOURS_BETWEEN_RUNS <= 24

@@ -19,13 +19,17 @@
     <string>__PROJECT_ROOT__/logs/happy_hour_scout.log</string>
     <key>StandardErrorPath</key>
     <string>__PROJECT_ROOT__/logs/happy_hour_scout.log</string>
+    <!--
+      Daily as of 2026-09-09, at Henry's request. Omitting Weekday is what
+      makes StartCalendarInterval fire every day: launchd matches only the
+      keys present, so Hour+Minute alone means "every day at that time".
+      Weekday 0 (Sunday) is what made it weekly.
+    -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
         <integer>12</integer>
         <key>Minute</key>
-        <integer>0</integer>
-        <key>Weekday</key>
         <integer>0</integer>
     </dict>
 </dict>
