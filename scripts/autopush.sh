@@ -38,6 +38,16 @@ if ! UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/n
     exit 0
 fi
 
+# Push to the ref the branch actually tracks, not to a remote branch that
+# merely shares its name. `git push origin "$BRANCH"` silently created a
+# second remote branch whenever local and upstream names differed, leaving
+# the tracked ref behind and the commits still counted as unpushed.
+REMOTE="$(git config --get "branch.$BRANCH.remote" 2>/dev/null || true)"
+[ -n "$REMOTE" ] || REMOTE="origin"
+REMOTE_REF="$(git config --get "branch.$BRANCH.merge" 2>/dev/null || true)"
+REMOTE_BRANCH="${REMOTE_REF#refs/heads/}"
+[ -n "$REMOTE_BRANCH" ] || REMOTE_BRANCH="$BRANCH"
+
 AHEAD="$(git rev-list --count "$UPSTREAM".."$BRANCH" 2>/dev/null || echo 0)"
 if [ "$AHEAD" -eq 0 ]; then
     exit 0                                  # nothing to do, and nothing to say
@@ -64,8 +74,8 @@ if git diff "$UPSTREAM".."$BRANCH" -- . ':(exclude)*.md' \
     exit 2
 fi
 
-say "pushing $AHEAD commit(s): $BRANCH -> $UPSTREAM"
-if git push origin "$BRANCH" 2>&1 | sed 's/^/    /'; then
+say "pushing $AHEAD commit(s): $BRANCH -> $REMOTE/$REMOTE_BRANCH"
+if git push "$REMOTE" "$BRANCH:$REMOTE_BRANCH" 2>&1 | sed 's/^/    /'; then
     say "pushed $AHEAD commit(s)"
     exit 0
 fi

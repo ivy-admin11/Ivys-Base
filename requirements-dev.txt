@@ -3,3 +3,7 @@ pytest==9.1.1
 pytest-mock==3.15.1
 ruff==0.15.22
 bandit==1.9.4
+
+# Reads back the PDFs the picks tests generate, to assert the single-page
+# guarantee. Test-only: production writes PDFs with reportlab and never reads one.
+pypdf==6.18.0
