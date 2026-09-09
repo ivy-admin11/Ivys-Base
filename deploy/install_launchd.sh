@@ -4,9 +4,9 @@
 #
 # SAFE BY DEFAULT: with no flags, this only prints what WOULD change. It
 # never writes a file and never calls launchctl. Even with --apply, it
-# refuses to touch any of Ivy's currently-installed LIVE labels (com.ivy.gateway,
-# com.ivy.sharppicks, com.ivy.happy_hour_scout, com.ivy.brain) unless
-# --yes-i-know-this-is-live is also passed. This script never itself
+# refuses to touch any of Ivy's currently-installed LIVE labels (see
+# LIVE_LABELS below — every unit that is actually loaded on this machine)
+# unless --yes-i-know-this-is-live is also passed. This script never itself
 # runs `launchctl bootstrap/load/kickstart` — writing the file and loading it
 # into launchd are kept as two separate, deliberate steps.
 #
@@ -50,7 +50,10 @@ fi
 # it duplicated com.ivy.gateway, lost the port-8000 race at every boot, and
 # crash-looped every ~10 s. Its plist lives in $TARGET_DIR/disabled/ — do not
 # reintroduce the label here or as a template.
-LIVE_LABELS=("com.ivy.gateway" "com.ivy.sharppicks" "com.ivy.happy_hour_scout" "com.ivy.brain")
+LIVE_LABELS=("com.ivy.gateway" "com.ivy.sharppicks" "com.ivy.happy_hour_scout" "com.ivy.brain"
+             "com.ivy.result-updater" "com.ivy.familia_meal_planner" "com.ivy.gateway_monitor"
+             "com.ivy.housekeeping" "com.ivy.autopush" "com.ivy.daily_brief_morning"
+             "com.ivy.daily_brief_evening")
 
 is_live_label() {
     local label="$1"
