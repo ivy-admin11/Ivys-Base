@@ -151,7 +151,7 @@ class TestBackfill:
         called = []
         monkeypatch.setattr(hs, "fetch_completed_games",
                             lambda *a: called.append(a) or [])
-        pick = {"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+        pick = {"sport": "MLB", "matchup": "Jets @ Dolphins", "side": "Jets ML",
                 "game_day": "today", "report_date": ""}
         assert backfill_pick(pick, {}) == (None, None)
         assert called == []
@@ -163,7 +163,7 @@ class TestBackfill:
             seen["day"] = day
             return []
         monkeypatch.setattr("ivy_core.historical_scores.fetch_completed_games", record)
-        backfill_pick({"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+        backfill_pick({"sport": "MLB", "matchup": "Jets @ Dolphins", "side": "Jets ML",
                        "game_day": "", "report_date": "2026-07-19"}, {})
         assert seen["day"] == "2026-07-19"
 
@@ -175,7 +175,7 @@ class TestBackfill:
                             lambda sport, day: calls.append((sport, day)) or [])
         cache = {}
         for _ in range(5):
-            backfill_pick({"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+            backfill_pick({"sport": "MLB", "matchup": "Jets @ Dolphins", "side": "Jets ML",
                            "game_day": "2026-07-19"}, cache)
         assert len(calls) == 1
 
@@ -289,7 +289,7 @@ class TestGarbageIsNotStored:
         monkeypatch.setattr(pt, "PICKS_DB", tmp_path / "p.db")
         monkeypatch.setattr(pt, "log_picks_to_sheet", lambda *a, **k: True)
         monkeypatch.setattr(pt, "auto_sync_to_export_sheet", lambda *a, **k: True)
-        pt.save_picks([{"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+        pt.save_picks([{"sport": "MLB", "matchup": "Jets @ Dolphins", "side": "Jets ML",
                         "game_day": "today"}], "2026-07-19")
         conn = sqlite3.connect(tmp_path / "p.db")
         try:
@@ -305,7 +305,7 @@ class TestGarbageIsNotStored:
         monkeypatch.setattr(pt, "PICKS_DB", tmp_path / "p.db")
         monkeypatch.setattr(pt, "log_picks_to_sheet", lambda *a, **k: True)
         monkeypatch.setattr(pt, "auto_sync_to_export_sheet", lambda *a, **k: True)
-        pt.save_picks([{"sport": "MLB", "matchup": "A @ B", "side": "A ML",
+        pt.save_picks([{"sport": "MLB", "matchup": "Jets @ Dolphins", "side": "Jets ML",
                         "game_day": "2026-07-20"}], "2026-07-19")
         conn = sqlite3.connect(tmp_path / "p.db")
         try:

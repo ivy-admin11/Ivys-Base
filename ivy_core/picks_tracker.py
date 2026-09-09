@@ -79,6 +79,25 @@ def _init_db():
     conn.close()
 
 
+# Matchups that are template text rather than a game. These come out of the
+# model echoing the shape of the prompt back — "A vs B" with side "A" — and
+# eight of them reached the live database on 2026-09-01, during the weeks when
+# the Odds API was exhausted and could not validate anything against a real
+# slate. Validation is back, but a placeholder is recognisable without it, and
+# a row that names no real teams can never be graded, priced, or reported.
+_PLACEHOLDER_MATCHUPS = {
+    "a vs b", "a @ b", "team a vs team b", "team a @ team b",
+    "home vs away", "away @ home", "x vs y", "a versus b",
+}
+
+
+def _is_placeholder_matchup(matchup) -> bool:
+    """True for template text standing in for a game that was never parsed."""
+    if not matchup:
+        return False
+    return " ".join(str(matchup).split()).strip().lower() in _PLACEHOLDER_MATCHUPS
+
+
 def save_picks(picks: List[Dict], report_date: str):
     """Save a batch of picks from a report to SQLite and Google Sheets."""
     _init_db()
@@ -116,6 +135,14 @@ def save_picks(picks: List[Dict], report_date: str):
         # posts, so one of them arriving incomplete is routine -- and letting
         # that IntegrityError escape used to discard the whole batch before
         # the commit, losing every good pick alongside the bad one.
+        if _is_placeholder_matchup(pick.get("matchup")):
+            skipped += 1
+            logger.warning(
+                "Skipping placeholder pick: matchup %r is template text, not a game",
+                pick.get("matchup"),
+            )
+            continue
+
         try:
             cursor.execute("""
                 INSERT INTO picks (

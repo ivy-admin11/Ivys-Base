@@ -79,7 +79,7 @@ class TestSavePicks:
         posts, so an incomplete one is routine. Losing the whole night's board
         to a single bad parse is not.
         """
-        pt.save_picks([pick(), pick(side=None), pick(matchup="A @ B")], "2026-09-05")
+        pt.save_picks([pick(), pick(side=None), pick(matchup="Jets @ Dolphins")], "2026-09-05")
         saved = rows(isolated_db)
         assert len(saved) == 2, "good picks in the batch must survive"
 
@@ -111,7 +111,7 @@ class TestSavePicks:
     def test_accepts_merged_field_names(self, isolated_db):
         """Merged picks use start/handicappers; raw picks use start_time/handicapper."""
         pt.save_picks(
-            [{"sport": "NFL", "matchup": "A @ B", "side": "A -1",
+            [{"sport": "NFL", "matchup": "Jets @ Dolphins", "side": "Jets -1",
               "start": "19:00", "handicappers": ["@a", "@b"]}],
             "2026-09-05",
         )
@@ -235,7 +235,7 @@ class TestHandicapperStats:
         real handle -- which quietly distorts any read of who is producing.
         """
         pt.save_picks(
-            [{"sport": "NFL", "matchup": "A @ B", "side": "A -1",
+            [{"sport": "NFL", "matchup": "Jets @ Dolphins", "side": "Jets -1",
               "handicappers": ["@alice", "@bob"]}],
             "2026-09-05",
         )
@@ -249,7 +249,7 @@ class TestHandicapperStats:
 
     def test_solo_and_consensus_picks_accumulate_together(self, isolated_db):
         pt.save_picks([
-            {"sport": "NFL", "matchup": "A @ B", "side": "A -1", "handicapper": "@alice"},
+            {"sport": "NFL", "matchup": "Jets @ Dolphins", "side": "Jets -1", "handicapper": "@alice"},
             {"sport": "NFL", "matchup": "C @ D", "side": "C -2",
              "handicappers": ["@alice", "@bob"]},
         ], "2026-09-05")
@@ -272,7 +272,7 @@ class TestHandicapperStats:
 
     def test_ordered_by_wins(self, isolated_db):
         pt.save_picks([
-            {"sport": "NFL", "matchup": "A @ B", "side": "A", "handicapper": "@few"},
+            {"sport": "NFL", "matchup": "Jets @ Dolphins", "side": "Jets", "handicapper": "@few"},
             {"sport": "NFL", "matchup": "C @ D", "side": "C", "handicapper": "@many"},
             {"sport": "NFL", "matchup": "E @ F", "side": "E", "handicapper": "@many"},
         ], "2026-09-05")
@@ -326,7 +326,7 @@ class TestPdfSummary:
 
     def test_names_individual_handicappers(self, isolated_db):
         pt.save_picks(
-            [{"sport": "NFL", "matchup": "A @ B", "side": "A -1",
+            [{"sport": "NFL", "matchup": "Jets @ Dolphins", "side": "Jets -1",
               "handicappers": ["@alice", "@bob"]}],
             "2026-09-05",
         )

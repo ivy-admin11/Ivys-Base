@@ -533,7 +533,7 @@ class TestTheRecordCountsBetsNotMentions:
         return ids(db)
 
     def test_the_same_bet_from_four_sources_counts_once(self, isolated_db):
-        same = [pick(matchup="A @ B", side="Over 9.5", handicapper=f"@h{i}",
+        same = [pick(matchup="Jets @ Dolphins", side="Over 9.5", handicapper=f"@h{i}",
                      game_day="2026-09-05") for i in range(4)]
         for pid in self._seed(isolated_db, same):
             pt.update_pick_result(pid, "W")
@@ -542,7 +542,7 @@ class TestTheRecordCountsBetsNotMentions:
         assert s["decided"] == 1
 
     def test_the_collapse_is_reported_not_hidden(self, isolated_db):
-        same = [pick(matchup="A @ B", side="Over 9.5", handicapper=f"@h{i}",
+        same = [pick(matchup="Jets @ Dolphins", side="Over 9.5", handicapper=f"@h{i}",
                      game_day="2026-09-05") for i in range(4)]
         for pid in self._seed(isolated_db, same):
             pt.update_pick_result(pid, "W")
@@ -553,25 +553,25 @@ class TestTheRecordCountsBetsNotMentions:
 
     def test_different_sides_of_one_game_stay_separate(self):
         """Over and Under on the same game are two bets, not a duplicate."""
-        rows = [("A @ B", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
-                ("A @ B", "Under 9.5", "L", "2026-09-05", "2026-09-05")]
+        rows = [("Jets @ Dolphins", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
+                ("Jets @ Dolphins", "Under 9.5", "L", "2026-09-05", "2026-09-05")]
         assert len(pt._distinct_bets(rows)) == 2
 
     def test_the_same_side_on_different_days_stays_separate(self):
-        rows = [("A @ B", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
-                ("A @ B", "Over 9.5", "L", "2026-09-06", "2026-09-06")]
+        rows = [("Jets @ Dolphins", "Over 9.5", "W", "2026-09-05", "2026-09-05"),
+                ("Jets @ Dolphins", "Over 9.5", "L", "2026-09-06", "2026-09-06")]
         assert len(pt._distinct_bets(rows)) == 2
 
     def test_casing_and_spacing_do_not_defeat_the_collapse(self):
-        rows = [("A @ B", "Over 9.5", "W", None, "2026-09-05"),
-                ("a @ b", "  over 9.5 ", "W", None, "2026-09-05")]
+        rows = [("Jets @ Dolphins", "Over 9.5", "W", None, "2026-09-05"),
+                ("jets @ dolphins", "  over 9.5 ", "W", None, "2026-09-05")]
         assert len(pt._distinct_bets(rows)) == 1
 
     def test_a_today_game_day_still_collapses(self):
         """resolve_pick_date has to run before the key is built, or the same
         bet lands under two different keys."""
-        rows = [("A @ B", "Over 9.5", "W", "today", "2026-09-05"),
-                ("A @ B", "Over 9.5", "W", None, "2026-09-05")]
+        rows = [("Jets @ Dolphins", "Over 9.5", "W", "today", "2026-09-05"),
+                ("Jets @ Dolphins", "Over 9.5", "W", None, "2026-09-05")]
         assert len(pt._distinct_bets(rows)) == 1
 
     def test_no_duplicates_reports_nothing_extra(self, isolated_db):
