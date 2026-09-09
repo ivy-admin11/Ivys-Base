@@ -125,12 +125,29 @@ JOB_REGISTRY = [
         schedule="Sundays 8am CST",
     ),
     Job(
+        # RETIRED 2026-09-05. com.ivy.brain was an unrestricted iMessage
+        # trigger wired to a shell-execution tool, running a second poller on
+        # the same chat.db. Its plist is gone from ~/Library/LaunchAgents and
+        # its template sits in deploy/launchd/retired/.
+        #
+        # The entry stays so the name resolves to an explanation rather than
+        # "unknown job", but it must not advertise itself as available:
+        # /capabilities reported available=True for a launchd label that does
+        # not exist in any domain, so Ivy was offering a capability whose only
+        # possible outcome was a failed dispatch. Claiming a job is ready is
+        # the same class of error as claiming one ran.
         name="brain",
         display_name="Brain (Grok xAI)",
         aliases=["brain", "grok", "xai"],
-        description="Brain agent — uses Grok for knowledge queries",
+        description="Brain agent — RETIRED 2026-09-05, no longer dispatchable",
         executor="launchctl",
         target="com.ivy.brain",
+        available=False,
+        unavailable_reason=(
+            "Retired 2026-09-05: unrestricted iMessage trigger with a shell "
+            "tool, and a second poller on the same chat.db. See "
+            "deploy/launchd/retired/ before reviving it."
+        ),
     ),
 ]
 

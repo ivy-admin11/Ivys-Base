@@ -209,3 +209,44 @@ def test_entrypoint_job_spawns_detached_subprocess_not_thread(tmp_path, monkeypa
     assert "--force" in argv
     assert "--send" in argv
     assert kwargs.get("start_new_session") is True
+
+
+# ---------------------------------------------------------------------------
+# The registry must not advertise what it cannot run
+# ---------------------------------------------------------------------------
+
+def test_a_launchctl_job_is_not_offered_without_an_installed_plist():
+    """/capabilities reported brain as available=True for a launchd label that
+    exists in no domain, so the only possible outcome of dispatching it was a
+    failed launchctl call. `available` is a hand-set flag, not a live probe, so
+    nothing caught the drift when the plist was retired underneath it.
+
+    Claiming a job is ready is the same class of error as claiming one ran.
+    """
+    import os
+    from pathlib import Path
+
+    from job_runner import JOB_REGISTRY
+
+    agents = Path(os.path.expanduser("~/Library/LaunchAgents"))
+    offenders = []
+    for job in JOB_REGISTRY:
+        if job.executor != "launchctl" or not job.available:
+            continue
+        if not (agents / f"{job.target}.plist").exists():
+            offenders.append(f"{job.name} -> {job.target}")
+    assert not offenders, (
+        "these jobs advertise themselves but have no installed plist: "
+        + "; ".join(offenders)
+    )
+
+
+def test_the_retired_brain_job_says_why_it_is_gone():
+    """A bare "unknown job" would invite someone to wire it back up. The entry
+    stays so the name resolves to the reason it was retired."""
+    from job_runner import JOB_REGISTRY
+
+    brain = next(j for j in JOB_REGISTRY if j.name == "brain")
+    assert brain.available is False
+    assert "2026-09-05" in (brain.unavailable_reason or "")
+    assert "chat.db" in (brain.unavailable_reason or "")
