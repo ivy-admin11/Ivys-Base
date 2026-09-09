@@ -17,10 +17,12 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+# No SDK import here on purpose. This module only ever built message
+# structures, and both the retired google.generativeai and its replacement
+# google-genai accept plain {"role": ..., "parts": [{"text": ...}]} dicts.
+# Importing an SDK to construct a dict tied this module to whichever one was
+# installed, and made it return None — silently disabling caching — when the
+# import failed for reasons that had nothing to do with caching.
 
 logger = logging.getLogger("ivy.cache")
 
@@ -164,35 +166,21 @@ Cache enabled: This content is cached across requests to save ~80% input tokens.
         is Anthropic's API, and the Gemini SDK rejects any Part dict carrying
         keys it does not know.
         """
-        if genai is None:
-            logger.warning("google.generativeai not installed, caching disabled")
-            return None
-            
         if not self.enable_caching:
             # Fallback: send everything in a single message (no caching)
-            return [genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=f"{system_instruction}\n\nUser: {user_message}")]
-            )]
+            return [{
+                "role": "user",
+                "parts": [{"text": f"{system_instruction}\n\nUser: {user_message}"}],
+            }]
 
         messages = []
 
         # PART 1: Cached system + tools (byte-identical across requests)
         cached_system = self.build_cached_system_prompt(system_instruction, tool_declarations)
-        messages.append(
-            genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=cached_system)]
-            )
-        )
+        messages.append({"role": "user", "parts": [{"text": cached_system}]})
 
         # ✅ PART 2: Current user message (unique, not cached)
-        messages.append(
-            genai.types.ContentDict(
-                role="user",
-                parts=[genai.types.PartDict(text=user_message)]
-            )
-        )
+        messages.append({"role": "user", "parts": [{"text": user_message}]})
 
         return messages
 

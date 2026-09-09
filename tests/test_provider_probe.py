@@ -27,7 +27,11 @@ import main  # noqa: E402
 
 @pytest.fixture
 def gemini(monkeypatch):
-    """Records what the probe does to the SDK."""
+    """Stands in for the google-genai client and records what the probe does.
+
+    generate_content is present and counted precisely so a regression that
+    reaches for it is a test failure rather than a silent daily outage.
+    """
 
     class Recorder:
         def __init__(self):
@@ -35,27 +39,25 @@ def gemini(monkeypatch):
             self.generated = 0
             self.list_raises = None
 
-        def configure(self, api_key=None):
-            self.api_key = api_key
-
-        def list_models(self):
+        # --- client.models.* ---
+        def list(self):
             self.listed += 1
             if self.list_raises:
                 raise self.list_raises
             return iter([object()])
 
-        def GenerativeModel(self, *a, **k):
-            rec = self
+        def generate_content(self, *a, **k):
+            self.generated += 1
+            return object()
 
-            class _M:
-                def generate_content(self, *a, **k):
-                    rec.generated += 1
-                    return object()
-
-            return _M()
+        # the client exposes these under .models
+        @property
+        def models(self):
+            return self
 
     rec = Recorder()
-    monkeypatch.setattr(main, "genai", rec)
+    monkeypatch.setattr(main, "gemini_client", rec)
+    monkeypatch.setattr(main, "_build_gemini_client", lambda: rec)
     monkeypatch.setenv("GEMINI_API_KEY", "k" * 39)
     return rec
 

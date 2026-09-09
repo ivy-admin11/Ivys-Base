@@ -101,8 +101,14 @@ class TestUsageMetadataFieldNames:
         The stub above is only as good as its resemblance to the genuine
         protobuf; this builds the genuine one.
         """
-        glm = pytest.importorskip("google.ai.generativelanguage")
-        usage = glm.GenerateContentResponse.UsageMetadata(
+        from google.genai import types as genai_types
+
+        # Built from the SDK that now produces these responses. google-genai
+        # happens to spell the fields identically to the retired protobuf
+        # layer, which is why the migration did not silently report every
+        # request as a cache miss — but "happens to" is exactly why this is
+        # pinned against the real object rather than a stub.
+        usage = genai_types.GenerateContentResponseUsageMetadata(
             prompt_token_count=10_000,
             cached_content_token_count=9_000,
             candidates_token_count=250,
@@ -258,13 +264,17 @@ class TestCreateCachedGeminiRequest:
         caching-enabled request blew up inside generate_content. main.py's only
         guard is `if messages is None`, which this sails straight past.
         """
-        content_types = pytest.importorskip("google.generativeai.types.content_types")
+        from google.genai import types as genai_types
+
         messages = manager.create_cached_gemini_request("Who plays tonight?", "You are Ivy.", TOOLS)
 
-        content_types.to_contents(messages)  # raises if a part is malformed
+        # Validated against the SDK that actually ships now. Confirmed to still
+        # bite: Content.model_validate rejects a part carrying cache_control,
+        # so this is a real check and not a no-op that happens to pass.
+        for message in messages:
+            genai_types.Content.model_validate(message)
 
     def test_no_anthropic_cache_control_key_leaks_into_a_part(self, manager):
-        pytest.importorskip("google.generativeai")
         messages = manager.create_cached_gemini_request("Who plays tonight?", "You are Ivy.", TOOLS)
 
         for message in messages:
@@ -274,7 +284,6 @@ class TestCreateCachedGeminiRequest:
     def test_user_text_is_kept_out_of_the_cached_prefix(self, manager):
         """If the per-request question were folded into the prefix, the prefix
         would differ every time and nothing would ever be cached."""
-        pytest.importorskip("google.generativeai")
         messages = manager.create_cached_gemini_request("Who plays tonight?", "You are Ivy.", TOOLS)
 
         assert len(messages) == 2
@@ -284,14 +293,12 @@ class TestCreateCachedGeminiRequest:
         assert messages[1]["parts"][0]["text"] == "Who plays tonight?"
 
     def test_the_prefix_is_identical_across_two_requests(self, manager):
-        pytest.importorskip("google.generativeai")
         first = manager.create_cached_gemini_request("q1", "You are Ivy.", TOOLS)
         second = manager.create_cached_gemini_request("q2", "You are Ivy.", TOOLS)
 
         assert first[0]["parts"][0]["text"] == second[0]["parts"][0]["text"]
 
     def test_caching_disabled_collapses_to_one_combined_message(self):
-        pytest.importorskip("google.generativeai")
         off = PromptCacheManager(enable_caching=False)
         messages = off.create_cached_gemini_request("Who plays tonight?", "You are Ivy.", TOOLS)
 
@@ -299,12 +306,25 @@ class TestCreateCachedGeminiRequest:
         assert "You are Ivy." in messages[0]["parts"][0]["text"]
         assert "Who plays tonight?" in messages[0]["parts"][0]["text"]
 
-    def test_returns_none_when_the_sdk_is_absent(self, manager, monkeypatch):
-        """main.py branches on `messages is None` to fall back to an uncached
-        request, so this contract has a caller depending on it."""
-        monkeypatch.setattr(cache_manager_module, "genai", None)
+    def test_it_no_longer_needs_an_sdk_to_build_a_dict(self, manager):
+        """This returned None whenever `import google.generativeai` failed, and
+        main.py read that as "caching unavailable" and silently dropped to an
+        uncached request. The import had nothing to do with caching: the module
+        only ever assembled {"role", "parts"} dicts, which both the retired SDK
+        and google-genai accept. So the dependency is gone, and with it the
+        failure mode where an unrelated import error quietly cost every request
+        its cache.
 
-        assert manager.create_cached_gemini_request("q", "sys", TOOLS) is None
+        main.py still branches on `messages is None` and that branch is
+        harmless, but nothing here reaches it any more.
+        """
+        assert not hasattr(cache_manager_module, "genai"), (
+            "cache_manager must not import an SDK to construct a dict"
+        )
+        out = manager.create_cached_gemini_request("q", "sys", TOOLS)
+        assert out is not None
+        assert out[0]["role"] == "user"
+        assert isinstance(out[0]["parts"][0]["text"], str)
 
 
 class TestStatisticsReporting:

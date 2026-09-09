@@ -4,7 +4,7 @@ Ivy Local Admin API Gateway v2.2 — Voice Assistant Edition
 Architecture:
 - Phase 1: Critical fixes (duplicates, auth, f-string bugs)
 - Phase 2: Config consolidation (tool schemas, timeouts, feature flags)
-- Phase 3: Gemini SDK refactor (use google.generativeai official library)
+- Phase 3: Gemini SDK refactor (google-genai; google.generativeai retired 2026-09-09)
 - Phase 4: Prompt caching for 80-90% token cost reduction ✅ IMPLEMENTED
 - Phase 5: Voice assistant with session management and cache optimization ✅ IMPLEMENTED
 
@@ -38,7 +38,8 @@ import logging
 import json
 import requests
 import subprocess
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import re as _re
@@ -129,8 +130,92 @@ logger = logging.getLogger("ivy.gateway")
 # GEMINI SDK CONFIGURATION
 # ============================================================================
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def _build_gemini_client() -> Optional["genai.Client"]:
+    """Construct the Gemini client, or None when no key is configured.
+
+    google.generativeai reached end of support; google-genai is the
+    replacement and was already a dependency here, already used by
+    ivy_core/llm.py. The client is constructed once rather than per call.
+
+    The scoped unset is borrowed from ivy_core.llm and matters in this process
+    specifically: main.py also builds Google service clients from
+    ~/ai-admin-api/token.json, and leaving Application Default Credentials
+    visible makes the Generative Language client try to authenticate as that
+    service account instead of with the API key. Restoring the values keeps
+    Docs/Sheets auth untouched.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    saved = {
+        k: os.environ.pop(k)
+        for k in ("GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")
+        if k in os.environ
+    }
+    try:
+        return genai.Client(api_key=api_key)
+    finally:
+        os.environ.update(saved)
+
+
+gemini_client = _build_gemini_client()
+
+
+def _gemini_tool_turns(prior, model_parts, tool_results):
+    """Build the two turns that hand tool output back to Gemini.
+
+    google-genai wants the function results in a Content whose role is "user",
+    carrying Part.from_function_response — not the old SDK's role "function"
+    with a raw {"function_response": ...} dict. Getting this wrong does not
+    raise: the model simply never sees the tool output and answers as though
+    the call never happened, which is the quietest possible way for a
+    migration to break. Verified against the live API before being written.
+    """
+    return [
+        *prior,
+        genai_types.Content(role="model", parts=model_parts),
+        genai_types.Content(
+            role="user",
+            parts=[
+                genai_types.Part.from_function_response(
+                    name=name, response={"result": result}
+                )
+                for name, result in tool_results
+            ],
+        ),
+    ]
+
+
+def gemini_generate(contents, *, tools=None, system_instruction=None):
+    """Call Gemini with the old SDK's argument shape.
+
+    Keeping this signature means the call sites did not have to be rewritten
+    around google-genai's config object, which is where a migration of the
+    path every inbound iMessage takes would most easily go wrong.
+    """
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not set; Gemini failover unavailable")
+    config = genai_types.GenerateContentConfig(
+        tools=tools or None,
+        system_instruction=system_instruction or None,
+        # google-genai turns Automatic Function Calling on by default, which
+        # would execute tools inside the SDK and hand back only the final text.
+        # This gateway executes its own tools — it enforces the Household
+        # reminders list, logs every call, and passes inbound_text for
+        # injection checks — and none of that runs if the SDK calls them for
+        # us. AFC is inert today only because the declarations are dicts rather
+        # than Python callables; saying so explicitly keeps a future change
+        # from silently routing around the tool handling.
+        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+            disable=True
+        ),
+    )
+    return gemini_client.models.generate_content(
+        model=GEMINI_MODEL, contents=contents, config=config
+    )
 
 # ============================================================================
 # PYDANTIC MODELS (Voice Assistant)
@@ -342,9 +427,11 @@ def _probe_gemini() -> Dict[str, Any]:
             "role": "failover", "status": "unconfigured", "reason": "GEMINI_API_KEY not set",
         }
     try:
-        genai.configure(api_key=api_key)
+        client = gemini_client or _build_gemini_client()
+        if client is None:
+            raise RuntimeError("GEMINI_API_KEY is not set")
         # Pull a single page; we only care that the call is accepted.
-        next(iter(genai.list_models()), None)
+        next(iter(client.models.list()), None)
         return {
             "configured": True, "authenticated": True, "reachable": True,
             "role": "failover", "status": "ready", "reason": None,
@@ -1149,22 +1236,22 @@ def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = No
         )
         if messages is None:
             logger.warning("Caching failed, falling back to non-cached request")
-            messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+            messages = [{"role": "user", "parts": [{"text": text}]}]
             use_caching = False
     else:
-        messages = [genai.types.ContentDict(role="user", parts=[genai.types.PartDict(text=text)])]
+        messages = [{"role": "user", "parts": [{"text": text}]}]
 
     # ⚠️ IMPORTANT: When using cached messages, don't pass system_instruction again
     # The cache_manager already includes it in the message stream
     if use_caching:
-        response = gemini_model.generate_content(
+        response = gemini_generate(
             messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+            tools=[genai_types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
         )
     else:
-        response = gemini_model.generate_content(
+        response = gemini_generate(
             messages,
-            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+            tools=[genai_types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
             system_instruction=GEMINI_SYSTEM_INSTRUCTION,
         )
 
@@ -1207,22 +1294,12 @@ def _gemini_backup_reply(text: str, history: Optional[List[Dict[str, str]]] = No
 
     # Follow-up call with the *real* tool results (previously always sent
     # back an empty {} regardless of what the tool actually returned).
-    follow_up_kwargs = {"tools": [genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
+    follow_up_kwargs = {"tools": [genai_types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)]}
     if not use_caching:
         follow_up_kwargs["system_instruction"] = GEMINI_SYSTEM_INSTRUCTION
 
-    follow_up_response = gemini_model.generate_content(
-        [
-            *messages,
-            {"role": "model", "parts": parts},
-            {
-                "role": "function",
-                "parts": [
-                    {"function_response": {"name": name, "response": {"result": result}}}
-                    for name, result in tool_results
-                ],
-            },
-        ],
+    follow_up_response = gemini_generate(
+        _gemini_tool_turns(messages, parts, tool_results),
         **follow_up_kwargs,
     )
     if follow_up_response.candidates:
@@ -2264,9 +2341,9 @@ def voice_query(
                     system_instruction=GEMINI_SYSTEM_INSTRUCTION,
                     tool_declarations=GEMINI_TOOL_DECLARATIONS
                 )
-                response = gemini_model.generate_content(
+                response = gemini_generate(
                     messages,
-                    tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                    tools=[genai_types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
                 )
 
                 if ENABLE_CACHE_METRICS_LOGGING and CACHING_AVAILABLE:
@@ -2294,19 +2371,10 @@ def voice_query(
                                 tool_args["list_name"] = "Household"
                             tool_results.append((tool_name, _execute_tool_call(tool_name, tool_args)))
 
-                        follow_up_response = gemini_model.generate_content(
-                            [
-                                *messages,
-                                {"role": "model", "parts": parts},
-                                {
-                                    "role": "function",
-                                    "parts": [
-                                        {"function_response": {"name": name, "response": {"result": result}}}
-                                        for name, result in tool_results
-                                    ],
-                                },
-                            ],
-                            tools=[genai.types.Tool(function_declarations=GEMINI_TOOL_DECLARATIONS)],
+                        follow_up_response = gemini_generate(
+                            _gemini_tool_turns(messages, parts, tool_results),
+                            tools=[genai_types.Tool(
+                                function_declarations=GEMINI_TOOL_DECLARATIONS)],
                         )
                         if follow_up_response.candidates:
                             follow_up_parts = follow_up_response.candidates[0].content.parts

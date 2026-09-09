@@ -319,49 +319,46 @@ class TestVoicePrompt:
         va.VoiceProcessor(cache_manager=cache).create_voice_prompt("hi", session, "SYS", [])
         assert session.messages == []
 
-    def test_an_object_without_the_cache_method_is_ignored(self, monkeypatch):
-        # cache_manager is duck-typed in from main.py; an older/partial one must
-        # fall through rather than AttributeError.
-        monkeypatch.setattr(va, "genai", None)
+    def test_an_object_without_the_cache_method_is_ignored(self):
+        """cache_manager is duck-typed in from main.py; an older or partial one
+        must fall through to the plain builder rather than AttributeError."""
         p = va.VoiceProcessor(cache_manager=object())
-        assert p.create_voice_prompt("hi", va.VoiceSession("henry"), "SYS", []) is None
+        out = p.create_voice_prompt("hi", va.VoiceSession("henry"), "SYS", [])
+        assert isinstance(out, list) and len(out) == 1
+        assert out[0]["role"] == "user"
 
-    def test_falls_back_to_a_plain_genai_content_list(self, monkeypatch):
-        recorded = {}
-
-        class FakeTypes:
-            @staticmethod
-            def PartDict(text):
-                return {"text": text}
-
-            @staticmethod
-            def ContentDict(role, parts):
-                recorded["role"] = role
-                recorded["parts"] = parts
-                return {"role": role, "parts": parts}
-
-        monkeypatch.setattr(va, "genai", type("G", (), {"types": FakeTypes})())
+    def test_falls_back_to_a_plain_message_list(self):
         session = va.VoiceSession("henry")
         session.add_message("assistant", "earlier answer")
 
         out = va.VoiceProcessor().create_voice_prompt("hello", session, "SYS", [])
         assert len(out) == 1
-        assert recorded["role"] == "user"
-        text = recorded["parts"][0]["text"]
+        assert out[0]["role"] == "user"
+        text = out[0]["parts"][0]["text"]
         assert "SYS" in text
         assert "ASSISTANT: earlier answer" in text
         assert text.endswith("User: hello")
 
-    def test_returns_none_when_genai_is_unavailable(self, monkeypatch):
-        """Pins a silent failure rather than fixing it: with no cache manager and
-        no google.generativeai installed the builder returns None, and main.py
-        hands that straight to generate_content(). It is swallowed by that
-        endpoint's except-Exception, so the user gets the generic "I didn't
-        understand that" and the log shows an opaque AttributeError rather than
-        "google.generativeai is not installed".
+    def test_the_fallback_no_longer_depends_on_an_sdk_being_installed(self):
+        """This used to return None whenever `import google.generativeai`
+        failed, and main.py handed that straight to generate_content(). The
+        endpoint's except-Exception swallowed it, so the caller heard "I didn't
+        understand that" and the log showed an opaque AttributeError rather than
+        anything about a missing package. The previous test pinned that silent
+        failure rather than fixing it.
+
+        The builder only ever assembled dicts, which both Google SDKs accept,
+        so it no longer imports one and there is no longer a path that returns
+        None here.
         """
-        monkeypatch.setattr(va, "genai", None)
-        assert va.VoiceProcessor().create_voice_prompt("hi", va.VoiceSession("henry"), "SYS", []) is None
+        import voice_assistant
+
+        assert not hasattr(voice_assistant, "genai"), (
+            "voice_assistant must not depend on an SDK to build a dict"
+        )
+        out = va.VoiceProcessor().create_voice_prompt("hi", va.VoiceSession("henry"), "SYS", [])
+        assert out is not None
+        assert out[0]["parts"][0]["text"].endswith("User: hi")
 
 
 class TestQueryAccounting:

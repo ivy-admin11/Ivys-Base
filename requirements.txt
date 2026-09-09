@@ -13,7 +13,9 @@ google-api-python-client==2.198.0
 google-auth==2.55.1
 google-auth-httplib2==0.4.0
 google-genai==1.47.0
-google-generativeai==0.8.6
+# google-generativeai was removed 2026-09-09: Google ended support for it,
+# and nothing imports it any more. google-genai is the replacement and was
+# already here, already used by ivy_core/llm.py.
 
 # Exact pin, not a range: `pydantic>=2.7,<3` let CI resolve the 2.14.0b1 beta.
 pydantic==2.13.4

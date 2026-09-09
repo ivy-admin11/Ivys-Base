@@ -16,10 +16,8 @@ from datetime import datetime
 from typing import Optional, Dict, List, Any
 from enum import Enum
 
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+# See cache_manager.py: this module only builds message dicts, which both
+# Google SDKs accept, so it does not import one.
 
 logger = logging.getLogger("ivy.voice")
 
@@ -257,10 +255,10 @@ class VoiceProcessor:
             )
 
         # Fallback: return simple message list
-        return [genai.types.ContentDict(
-            role="user",
-            parts=[genai.types.PartDict(text=f"{enriched_system}\n\nUser: {user_query}")]
-        )] if genai else None
+        return [{
+            "role": "user",
+            "parts": [{"text": f"{enriched_system}\n\nUser: {user_query}"}],
+        }]
 
     def log_voice_query(self, session: VoiceSession, response_text: str, cached_tokens: int = 0) -> None:
         """Log voice query statistics for monitoring."""
