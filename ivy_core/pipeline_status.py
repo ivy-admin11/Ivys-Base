@@ -40,20 +40,37 @@ class PipelineStatus(str, Enum):
 
 
 class ProviderAuthenticationError(Exception):
-    """Raised when an API returns 401 or 403 (credentials rejected)."""
-    
+    """Raised when an API returns 401 or 403.
+
+    "Credentials rejected" is only half of what a 401 means. The Odds API also
+    answers 401 when the key is perfectly valid and the account has simply run
+    out of monthly credits, and the two need opposite fixes: rotate the key
+    versus top up the plan. ``error_code`` carries the provider's own machine
+    -readable reason so callers can tell them apart instead of guessing.
+    """
+
+    #: Provider error codes that mean "valid key, no quota left".
+    QUOTA_CODES = frozenset({"OUT_OF_USAGE_CREDITS", "QUOTA_EXCEEDED"})
+
     def __init__(
         self,
         provider: str,
         status_code: int,
         message: str,
         endpoint: Optional[str] = None,
+        error_code: Optional[str] = None,
     ):
         self.provider = provider
         self.status_code = status_code
         self.message = message
         self.endpoint = endpoint
+        self.error_code = error_code
         super().__init__(message)
+
+    @property
+    def is_quota_exhausted(self) -> bool:
+        """True when the key is fine and the allowance is what ran out."""
+        return (self.error_code or "").upper() in self.QUOTA_CODES
     
     def __str__(self) -> str:
         parts = [f"[{self.provider}] {self.message} (HTTP {self.status_code})"]

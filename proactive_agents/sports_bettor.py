@@ -318,21 +318,43 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     frm = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     to = (now + timedelta(hours=window_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"📊 Pulling live odds for the next {window_hours}h ({frm} → {to})...")
+    # Which endpoint depends on whether anyone actually needs the prices.
+    #
+    # /odds bills one credit per market per region — h2h+spreads+totals across
+    # ~18 leagues is 54 credits a run, 162 a day, against a 500/month free
+    # allowance. That is a month of quota in three days, which is exactly how
+    # this went dark: every run 401'd with OUT_OF_USAGE_CREDITS, taking matchup
+    # validation and score grading down with it for weeks.
+    #
+    # /events returns the same slate — teams and start times, which is all
+    # validation ever reads — and is not billed at all. So while pricing is off
+    # we take the free endpoint, and validation stops depending on a budget it
+    # was silently exhausting.
+    if ENABLE_PICK_PRICING:
+        endpoint = "odds"
+        params_extra = {
+            "regions":    "us",
+            "markets":    "h2h,spreads,totals",
+            "oddsFormat": "american",
+        }
+        print(f"📊 Pulling live odds for the next {window_hours}h ({frm} → {to})...")
+    else:
+        endpoint = "events"
+        params_extra = {}
+        print(f"📊 Pulling the {window_hours}h slate ({frm} → {to}) "
+              f"— free /events endpoint, pricing is off...")
 
     games = []
     for league, sport_key in discover_sport_keys():
         try:
             r = requests.get(
-                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/{endpoint}",
                 params={
                     "apiKey":           ODDS_API_KEY,
-                    "regions":          "us",
-                    "markets":          "h2h,spreads,totals",
-                    "oddsFormat":       "american",
                     "dateFormat":       "iso",
                     "commenceTimeFrom": frm,
                     "commenceTimeTo":   to,
+                    **params_extra,
                 },
                 timeout=12,
             )
@@ -350,14 +372,22 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
                     reason = _redact(r.text or "").strip()[:200]
                 except Exception:
                     reason = ""
+                try:
+                    code = (r.json() or {}).get("error_code")
+                except Exception:
+                    code = None
+                quota = str(code or "").upper() in ProviderAuthenticationError.QUOTA_CODES
+                headline = (
+                    f"Odds API monthly credits are used up (HTTP {r.status_code})"
+                    if quota else
+                    f"Odds API credentials were rejected (HTTP {r.status_code})"
+                )
                 raise ProviderAuthenticationError(
                     provider="odds_api",
                     status_code=r.status_code,
-                    message=(
-                        f"Odds API credentials were rejected (HTTP {r.status_code})"
-                        + (f" — {reason}" if reason else "")
-                    ),
+                    message=headline + (f" — {reason}" if reason else ""),
                     endpoint=_redact(r.url),
+                    error_code=code,
                 )
             
             # Handle rate limiting and server errors (retryable)
@@ -426,7 +456,8 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
                 "total": summary.get("total", ""),
             })
 
-    print(f"📊 Odds feed: {len(games)} scheduled game(s) across {len(ODDS_SPORT_KEYS)} leagues.")
+    print(f"📊 Slate: {len(games)} scheduled game(s) across "
+          f"{len(discover_sport_keys())} league(s) via /{endpoint}.")
     return games
 
 
@@ -1854,8 +1885,20 @@ def _run_pipeline(
         print(f"🔴 {e}")
         odds_source.mark_failure(e, status_code=e.status_code)
         result.status = PipelineStatus.DEGRADED
+        # The remediation is the whole point of the alert, and it is opposite
+        # for the two things a 401 can mean. Telling Henry to "verify the key"
+        # for a key that was current, authorized and merely used up is what
+        # sent him chasing a rotation that could not have helped.
+        if e.is_quota_exhausted:
+            headline = "Sharp Picks: Odds API monthly credits are used up."
+            remedy = ("Admin action required: top up the plan or wait for the "
+                      "monthly reset. The key itself is valid — rotating it "
+                      "will not help.")
+        else:
+            headline = "Sharp Picks: Odds API authentication failed."
+            remedy = "Admin action required: Verify ODDS_API_KEY is current and authorized."
         result.admin_message = (
-            f"Sharp Picks: Odds API authentication failed.\n"
+            f"{headline}\n"
             f"The X sweep continues, but three things stop: matchup validation "
             f"against the live slate (bad parses reach the database unchecked), "
             f"score-based grading, and consensus detection — two sharps on one "
@@ -1864,7 +1907,7 @@ def _run_pipeline(
             f"bar. Pricing is unaffected — it is off.\n"
             f"Status: HTTP {e.status_code}\n"
             f"Message: {e.message}\n"
-            f"Admin action required: Verify ODDS_API_KEY is current and authorized."
+            f"{remedy}"
         )
         print(result.admin_message)
         # Unlike the NO_QUALIFYING_PICKS alert below (force-only), this fires on

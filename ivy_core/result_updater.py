@@ -24,9 +24,21 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 
 def _get_odds_api_key():
-    """Get The Odds API key from environment."""
+    """Get The Odds API key, loading .env the way every other agent does.
+
+    This used to read os.environ alone, which meant the launchd job had no way
+    to see the key except by carrying it inline in its plist — a live
+    credential sitting world-readable in ~/Library/LaunchAgents. config.py owns
+    the load_dotenv call, so importing it here is what puts .env on the
+    environment. The import is lazy so ivy_core stays usable without the
+    project root on sys.path.
+    """
     import os
-    return os.environ.get("ODDS_API_KEY", "")
+    try:
+        import config  # noqa: F401  (imported for its load_dotenv side effect)
+    except ImportError:
+        pass
+    return os.environ.get("ODDS_API_KEY", "").strip().strip("*'\"")
 
 
 def parse_score(value: Any) -> Optional[Decimal]:
@@ -57,13 +69,21 @@ def parse_score(value: Any) -> Optional[Decimal]:
 ODDS_MAX_DAYS_FROM = 3
 
 
-def get_completed_games(sport_key: str = None, hours_back: int = 48) -> list:
+def get_completed_games(sport_key: str = None, hours_back: int = 48,
+                        sport_titles: set = None) -> list:
     """Fetch completed games from The Odds API.
-    
+
     Args:
         sport_key: Optional sport to filter (e.g., 'baseball_mlb'). If None, fetch all.
         hours_back: How many hours back to search for completed games.
-    
+        sport_titles: Optional set of short titles ("MLB", "NCAAF") to restrict
+            the sweep to. The /scores endpoint bills 2 credits per sport per
+            call, and this ran across every sport the API lists (~40) four
+            times a day — 320 credits daily against a 500/month allowance,
+            most of it grading sports Henry has never had a pick in. Passing
+            the sports that actually have pending picks is what keeps the
+            budget intact. An empty/None set means "everything", as before.
+
     Returns:
         List of completed game dicts with scores.
     """
@@ -98,6 +118,12 @@ def get_completed_games(sport_key: str = None, hours_back: int = 48) -> list:
         
         # Skip if user filtered to different sport
         if sport_key and sport_key_i != sport_key:
+            continue
+
+        # Skip sports nothing is waiting on. Matching the API's own title is
+        # enough — it already uses the same short labels the picks table stores
+        # ("MLB", "NCAAF"), so this needs no mapping table to drift out of date.
+        if sport_titles and (sport.get("title") or "").upper() not in sport_titles:
             continue
         
         try:
@@ -429,17 +455,14 @@ def auto_update_results():
         Dict with update summary.
     """
     logger.info("Starting auto-result update...")
-    
-    # Get completed games
-    games = get_completed_games()
-    if not games:
-        logger.info("No completed games found")
-        return {"updated": 0, "pending": 0}
-    
-    # Get all pending picks
+
+    # Read what is actually waiting to be graded BEFORE calling the API. This
+    # used to fetch every sport's scores first and only then discover there was
+    # nothing to grade — 80 credits a run, four runs a day, to do nothing at
+    # all. Nothing pending means no request belongs here.
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
-    
+
     cursor.execute("""
         SELECT p.id, p.sport, p.matchup, p.side, p.game_day, p.sharp_count, p.handicapper
         FROM picks p
@@ -447,11 +470,27 @@ def auto_update_results():
         WHERE r.result IS NULL
         ORDER BY p.created_at DESC
     """)
-    
+
     pending_picks = cursor.fetchall()
     conn.close()
-    
+
     logger.info(f"Found {len(pending_picks)} pending picks")
+
+    if not pending_picks:
+        logger.info("Nothing pending — skipping the scores API entirely")
+        return {"updated": 0, "pending": 0}
+
+    # Only ask about the sports those picks belong to.
+    sport_titles = {
+        (row[1] or "").upper() for row in pending_picks if row[1]
+    } or None
+    if sport_titles:
+        logger.info(f"Grading sweep scoped to: {', '.join(sorted(sport_titles))}")
+
+    games = get_completed_games(sport_titles=sport_titles)
+    if not games:
+        logger.info("No completed games found")
+        return {"updated": 0, "pending": len(pending_picks)}
     
     updated = 0
     for pick_id, sport, matchup, side, game_day, sharp_count, handicapper in pending_picks:
