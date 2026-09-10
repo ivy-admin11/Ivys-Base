@@ -1356,3 +1356,67 @@ class TestTheSweepAsksForThePostsPrice:
         assert "do not compute it" in prompt
         assert "do not carry a price across from another pick" in prompt
         assert "two-sided market" in prompt
+
+
+class TestEnrichmentAlwaysGrades:
+    """Confidence is a judgement, not a fact to look up.
+
+    The enrichment prompt said: if you have no real data, set take "AND every
+    other field" to null. That swept confidence in with the factual lookups,
+    and Grok obligingly returned every field null on a quiet news day.
+
+    Confidence is the ONLY route by which a single-sharp pick clears the
+    quality bar, so nulling it shut the board: only a 2-sharp consensus could
+    qualify, and with a seven-handle panel that is rare. Boards of one pick, or
+    of none, were the visible symptom. Measured on a live sweep: 1 of 4
+    qualifying before, 4 of 6 after.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+        return inspect.getsource(sports_bettor.enrich_picks)
+
+    def test_confidence_is_marked_always_required(self):
+        src = self._src()
+        assert "ALWAYS give one" in src
+        assert "never null" in src
+
+    def test_the_null_everything_rule_no_longer_catches_confidence(self):
+        """The exact phrasing that caused it. If "AND every other field" comes
+        back, so does the outage."""
+        src = self._src()
+        assert "AND every other field" not in src, \
+            "this phrasing nulls confidence and shuts the single-sharp route"
+        assert "always required" in src
+
+    def test_a_graded_pick_is_counted_separately_from_an_attached_one(self, capsys):
+        """"Enriched 4/4" was printed for four objects whose every field was
+        null, so the console reported success on a run about to drop the whole
+        board."""
+        merged = [{"side": "B -3.5"}, {"side": "D ML"}]
+        sports_bettor.apply_enrichment(
+            merged, '[{"i":0,"confidence":"Medium"},{"i":1,"confidence":null}]')
+        out = capsys.readouterr().out
+        assert "2/2" in out
+        assert "1 with a confidence grade" in out
+        assert merged[0]["enrichment"]["confidence"] == "Medium"
+
+    def test_it_says_so_loudly_when_nothing_is_graded(self, capsys):
+        merged = [{"side": "B -3.5"}]
+        sports_bettor.apply_enrichment(merged, '[{"i":0,"confidence":null,"take":null}]')
+        out = capsys.readouterr().out
+        assert "broken enrichment step, not a quiet slate" in out
+
+    def test_a_fully_graded_board_raises_no_alarm(self, capsys):
+        merged = [{"side": "B -3.5"}]
+        sports_bettor.apply_enrichment(merged, '[{"i":0,"confidence":"High"}]')
+        out = capsys.readouterr().out
+        assert "broken enrichment step" not in out
+        assert "1 with a confidence grade" in out
+
+    def test_non_json_leaves_the_picks_alone(self, capsys):
+        """A bad response must not cost the board."""
+        merged = [{"side": "B -3.5"}]
+        assert sports_bettor.apply_enrichment(merged, "not json") == merged
+        assert "enrichment" not in merged[0]

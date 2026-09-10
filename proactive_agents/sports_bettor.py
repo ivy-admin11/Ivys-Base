@@ -1185,15 +1185,20 @@ def enrich_picks(merged, games):
         "PICKS:\n" + json.dumps(payload, indent=2) + "\n\n"
         "Return a JSON array with one object per pick, in the SAME ORDER, each with: "
         "i (the integer index copied from the pick), "
-        "confidence ('Low'/'Medium'/'High'), "
+        "confidence ('Low'/'Medium'/'High' — ALWAYS give one; this is your "
+        "judgement of the pick, not a fact to look up, so it is never null even "
+        "when you find no news at all. Base it on the bet itself and how the "
+        "handicapper framed it), "
         "line_movement (short phrase, or null if unknown), "
         "injury (short phrase on relevant injury/lineup news, or null), "
         "sharp_public (short phrase on sharp-vs-public money, or null), "
-        "take (a one or two sentence analyst take). "
-        "Base everything on real information; use null when unknown. Do not invent. "
-        "CRITICAL: if you have no real data for a pick, set take AND every other "
-        "field to null — do NOT write placeholder text like 'no data available' or "
-        "'no real-time information'. Only include substantive, factual enrichment. "
+        "take (a one or two sentence analyst take, or null). "
+        "Base the factual fields on real information; use null when unknown. "
+        "Do not invent. "
+        "CRITICAL: if you have no real data for a pick, set take and the three "
+        "factual fields to null — do NOT write placeholder text like 'no data "
+        "available' or 'no real-time information'. This does NOT apply to "
+        "confidence, which is always required. "
         "Output JSON only — no preamble, no markdown fence."
     )
 
@@ -1219,6 +1224,16 @@ def enrich_picks(merged, games):
         print(f"⚠️ Grok enrichment failed: {_redact(e)}. Texting picks without enrichment.")
         return merged
 
+    return apply_enrichment(merged, raw)
+
+
+def apply_enrichment(merged, raw):
+    """Attach Grok's enrichment response to the picks, and report honestly.
+
+    Split out of enrich_picks so the counting is testable without standing up
+    an SDK client — which is what let "Enriched 4/4" go unnoticed while every
+    field in all four objects was null.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -1232,12 +1247,26 @@ def enrich_picks(merged, games):
                 by_i[obj["i"]] = obj
 
     enriched = 0
+    graded = 0
     for i, e in enumerate(merged):
         enr = by_i.get(i)
         if isinstance(enr, dict):
             e["enrichment"] = enr
             enriched += 1
-    print(f"✨ Enriched {enriched}/{len(merged)} pick(s) with live Grok context.")
+            if str(enr.get("confidence") or "").strip():
+                graded += 1
+
+    # Counting attached objects reported "Enriched 4/4" for four objects whose
+    # every field was null — including confidence, which is the ONLY route by
+    # which a single-sharp pick clears the quality bar. So the console showed
+    # full success on a run about to drop the entire board, and the shortfall
+    # read as a quiet slate rather than a broken step.
+    print(f"✨ Enriched {enriched}/{len(merged)} pick(s) with live Grok context "
+          f"({graded} with a confidence grade).")
+    if enriched and not graded:
+        print("⚠️  No confidence grade came back for ANY pick — every single-sharp "
+              "pick will be dropped and only a 2-sharp consensus can qualify. "
+              "That is a broken enrichment step, not a quiet slate.")
     return merged
 
 
