@@ -1223,3 +1223,44 @@ def test_a_below_threshold_board_still_texts_when_the_pdf_cannot_be_built(monkey
 
     assert result["sent"] is True, "a broken PDF must not silence the board"
     assert "Player 0 2+ Receptions" in joined, "the full board falls back to text"
+
+
+class TestTheHandlePanel:
+    """Dropped 2026-09-10 on the record of what each handle actually produced.
+
+    A dead handle is not just a wasted API call. A consensus play requires two
+    handles landing on the SAME bet, so handles that contribute nothing
+    suppress the only signal that clears the quality bar — which is why a
+    14-handle panel kept producing boards of one-sharp picks.
+    """
+
+    #: Pick counts across every stored pick since 2026-07-19, at the time of removal.
+    REMOVED = {
+        "MLBHR": 0, "parlay_bae": 0, "DanGambleAI": 0,
+        "Picks4Dayzzz": 0, "Vegasinsider": 0,
+        "FlamesPickz": 1, "NBAModel": 1,
+    }
+
+    @pytest.mark.parametrize("handle", sorted(REMOVED))
+    def test_a_removed_handle_does_not_creep_back(self, handle):
+        """The five zeros were re-tested through the real sweep on the day they
+        were dropped and returned nothing then too. Re-adding one needs
+        scripts/vet_x_handles.py to say otherwise first."""
+        assert handle not in sports_bettor.TARGET_X_ACCOUNTS
+
+    def test_the_producers_are_still_there(self):
+        for handle in ("MassMoneyline", "ItsCappersPicks", "cappersforfree", "billhpicks"):
+            assert handle in sports_bettor.TARGET_X_ACCOUNTS
+
+    def test_the_panel_is_not_silently_emptied(self):
+        """Trimming is good; trimming to nothing would take the whole job down,
+        since Grok X Search is the one required source."""
+        assert len(sports_bettor.TARGET_X_ACCOUNTS) >= 5
+
+    def test_no_duplicate_handles(self):
+        names = [h.lower() for h in sports_bettor.TARGET_X_ACCOUNTS]
+        assert len(names) == len(set(names))
+
+    def test_handles_carry_no_at_sign(self):
+        """x_search takes bare handles; a leading @ silently matches nothing."""
+        assert not [h for h in sports_bettor.TARGET_X_ACCOUNTS if h.startswith("@")]

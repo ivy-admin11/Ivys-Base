@@ -262,15 +262,33 @@ SPORT_QUERY = "any sport or league"
 # SPORT_QUERY those posts were swept up and then dropped on the floor, because
 # the prompt told Grok to focus on the other leagues. To see what each handle
 # is actually posting right now: scripts/vet_x_handles.py --current
+# Trimmed from 14 to 7 on 2026-09-10, on the record of what each handle has
+# actually produced since 19 July. Removed, with their stored pick counts:
+#
+#   MLBHR 0 · parlay_bae 0 · DanGambleAI 0 · Picks4Dayzzz 0 · Vegasinsider 0
+#   FlamesPickz 1 · NBAModel 1
+#
+# The five zeros were re-tested through scripts/vet_x_handles.py on the day
+# they were dropped and returned nothing then either, so this is a standing
+# state and not one quiet slate. All 14 had arrived in a single commit, so the
+# five were never individually vetted the way the nine above them were.
+#
+# Half a panel that contributes nothing is not merely wasted API calls: a
+# consensus play needs two handles on the SAME bet, so dead handles suppress
+# the only signal that clears the quality bar. The survivors below still lean
+# hard on four — MassMoneyline, ItsCappersPicks, cappersforfree, billhpicks —
+# and PropCaddie, HarryLockPicks and KimsPicks have not posted since Jul 19,
+# Jul 19 and Sep 1. They stay for now because they cleared the bar Henry set;
+# revisit with scripts/vet_x_handles.py --current before football gets busy.
 TARGET_X_ACCOUNTS = [
-    "MLBHR","KimsPicks", "parlay_bae", "FlamesPickz", "DanGambleAI", "ItsCappersPicks",
-    "Picks4Dayzzz", "billhpicks", "MassMoneyline", "PropCaddie", "NBAModel", "Vegasinsider",
-    "HarryLockPicks", "cappersforfree",
+    "MassMoneyline", "ItsCappersPicks", "PropCaddie", "cappersforfree",
+    "KimsPicks", "billhpicks", "HarryLockPicks",
 ]
 
 # Grok's x_search + prompt degrade past ~10 handles (truncated handle lists,
 # blown context), so the sweep runs in batches and the raw picks are merged.
-# 14 accounts → batches of 8 (8 + 6).
+# At 7 accounts that is a single batch; the chunking stays because the list
+# grows again every time a replacement is vetted in.
 X_ACCOUNT_CHUNK_SIZE = 8
 
 # Last-report state — used to suppress duplicate texts. Stores a content
