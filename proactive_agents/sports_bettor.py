@@ -478,6 +478,30 @@ def _chunk_accounts(accounts, size=X_ACCOUNT_CHUNK_SIZE):
     return [accounts[i:i + size] for i in range(0, len(accounts), size)]
 
 
+def _slate_clause(catalog):
+    """How the prompt introduces the slate.
+
+    This used to call the slate a PRICING REFERENCE and tell Grok to copy odds
+    out of it. That stopped being true on 2026-09-10, when the slate moved to
+    the free /events endpoint, which carries teams and start times and no
+    prices at all. The instruction survived the switch, so Grok was told to
+    read prices from a source that had none — and forbidden from reading the
+    post. It returned null for every pick, including ones where the
+    handicapper had stated the price plainly.
+    """
+    if not catalog:
+        return ("No slate is available; surface any concrete picks for games "
+                "scheduled within the next 48 hours.\n\n")
+    return (
+        "Below is the LIVE slate of games scheduled in the next 48 hours. It "
+        "is a SCHEDULE, not a price list: use it to identify the correct teams "
+        "and start time for a pick. It carries no odds. Do NOT discard a pick "
+        "just because its game is absent from this slate (the slate omits some "
+        "leagues, e.g. KBO and tennis):\n\n"
+        f"{catalog}\n\n"
+    )
+
+
 def _build_sweep_prompt(accounts, slate_clause, query):
     """Assemble the Grok x_search prompt for one batch of handles."""
     return (
@@ -504,8 +528,13 @@ def _build_sweep_prompt(accounts, slate_clause, query):
         "the pick entirely), "
         "side (the exact side/total/prop the handicapper is taking, naming the "
         "team or player it is on \u2014 'ML' or '-1.5' alone is not a side), "
-        "odds (the American odds for that side copied verbatim from the slate "
-        "above, or null if not listed), "
+        "odds (the American price the HANDICAPPER gave for that side, copied "
+        "verbatim from their post — e.g. '-112', '+230'. Handicappers state "
+        "it in the post text ('Phillies ML at -170'), and often only inside an "
+        "attached image such as a bet slip or a research graphic, so read the "
+        "images too. Take it from the post and nowhere else: do not compute it, "
+        "do not carry a price across from another pick, and do not use a "
+        "two-sided market. Null if the post does not state one), "
         "handicapper (the X handle of the account that POSTED the pick — one of "
         "the target accounts above, no @; never a tipster name merely quoted "
         "inside the post), "
@@ -580,20 +609,9 @@ def fetch_x_picks(games):
     """
     catalog = build_odds_catalog(games)
     if catalog:
-        slate_clause = (
-            "Below is the LIVE slate of games scheduled in the next 48 hours with "
-            "current Vegas odds, provided as a PRICING REFERENCE only. When a pick "
-            "matches one of these games, copy the matching American odds verbatim; "
-            "otherwise leave odds null. Do NOT discard a pick just because its game "
-            "is absent from this slate (the slate omits some leagues, e.g. KBO and "
-            "tennis):\n\n"
-            f"{catalog}\n\n"
-        )
+        slate_clause = _slate_clause(catalog)
     else:
-        slate_clause = (
-            "No live odds slate is available; surface any concrete picks for games "
-            "scheduled within the next 48 hours and leave odds null.\n\n"
-        )
+        slate_clause = _slate_clause("")
 
     batches = _chunk_accounts(TARGET_X_ACCOUNTS)
     print(

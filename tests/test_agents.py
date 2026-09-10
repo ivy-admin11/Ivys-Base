@@ -1301,3 +1301,58 @@ class TestTheHandlePanel:
     def test_handles_carry_no_at_sign(self):
         """x_search takes bare handles; a leading @ silently matches nothing."""
         assert not [h for h in sports_bettor.TARGET_X_ACCOUNTS if h.startswith("@")]
+
+
+class TestTheSweepAsksForThePostsPrice:
+    """The slate stopped carrying prices; the prompt did not notice.
+
+    Until 2026-09-10 the slate came from the Odds API's paid /odds endpoint and
+    the prompt described it as a PRICING REFERENCE, telling Grok to copy odds
+    out of it and take them from nowhere else. Moving to the free /events
+    endpoint removed every price from that slate but left the instruction
+    intact, so Grok was told to read prices from a source that had none and
+    forbidden from reading the post. It returned null for every pick — 26 of
+    them — including ones where the handicapper had stated the price plainly.
+    """
+
+    def _prompt(self):
+        return sports_bettor._build_sweep_prompt(
+            ["HarryLockPicks"], "SLATE\n\n", sports_bettor.SPORT_HINTS)
+
+    def test_the_price_is_taken_from_the_post(self):
+        prompt = self._prompt()
+        assert "HANDICAPPER gave for that side" in prompt
+        assert "from their post" in prompt
+
+    def test_it_no_longer_claims_the_slate_carries_odds(self):
+        prompt = self._prompt()
+        assert "PRICING REFERENCE" not in prompt
+        assert "copy the matching American odds" not in prompt
+
+    def test_the_slate_is_described_as_a_schedule(self):
+        """Its job now is naming the right teams and start time, which is what
+        matchup repair validates against."""
+        clause = sports_bettor._slate_clause("MLB: A @ B")
+        assert "SCHEDULE, not a price list" in clause
+        assert "carries no odds" in clause
+        assert "PRICING REFERENCE" not in clause
+
+    def test_an_absent_slate_still_asks_for_picks(self):
+        clause = sports_bettor._slate_clause("")
+        assert "No slate is available" in clause
+        assert "leave odds null" not in clause, \
+            "a missing slate says nothing about whether the POST has a price"
+
+    def test_images_are_in_scope_for_the_price(self):
+        """HarryLockPicks' 2026-09-10 pick of the day put "Over 105.5 · -112"
+        only inside an attached bet-slip graphic. A text-only read finds
+        nothing there."""
+        prompt = self._prompt()
+        assert "attached image" in prompt
+        assert "read the images too" in prompt
+
+    def test_a_price_may_not_be_invented_or_borrowed(self):
+        prompt = self._prompt()
+        assert "do not compute it" in prompt
+        assert "do not carry a price across from another pick" in prompt
+        assert "two-sided market" in prompt
