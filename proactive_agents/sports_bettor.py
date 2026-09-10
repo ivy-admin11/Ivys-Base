@@ -2026,8 +2026,14 @@ def _run_pipeline(
     # is a smaller loss than no board.
     if ENABLE_PICK_PRICING:
         try:
-            priced = espn_odds.attach_odds(merged)
-            print(f"\U0001F4B0 ESPN priced {priced}/{len(merged)} pick(s).")
+            filled = espn_odds.attach_odds(merged)
+            # "ESPN priced 0/3" read as a total failure on a board that went
+            # out priced: the one priceable pick already carried a line from
+            # the handicapper's own post, so ESPN had no gap to fill. Report
+            # how many picks END UP priced, and what ESPN contributed.
+            priced = sum(1 for e in merged if str(e.get("odds") or "").strip())
+            print(f"\U0001F4B0 {priced}/{len(merged)} pick(s) priced "
+                  f"(ESPN filled {filled}).")
         except Exception as _oe:
             print(f"\u26A0\uFE0F  ESPN pricing skipped: {_oe}")
 
