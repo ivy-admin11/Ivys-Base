@@ -1560,16 +1560,63 @@ def _rank_picks(merged):
     )
 
 
+# Henry's staking ladder (2026-09-10). The range on two sharps is deliberate
+# and stays a range: _confidence derives the grade FROM the sharp count, so
+# MEDIUM and "2 sharps" are the same fact said twice and there is no second
+# signal in the data to split 2U from 3U. Inventing one would be a number
+# Ivy cannot justify, so the sizing call is handed back.
+_UNIT_LADDER = {1: "1U", 2: "2-3U"}
+_UNIT_MAX = "MAX"
+
+
+def _unit_size(count):
+    """Stake size for a pick, by how many sharps back it."""
+    return _UNIT_MAX if count >= 3 else _UNIT_LADDER.get(count, "1U")
+
+
+# Dropping the matchup is only safe when the side names its own game.
+# "Kyren Williams 2+ Receptions" and "Seattle Mariners ML" do. Two kinds do
+# not, and both reach this code:
+#
+#   a bare total  — "UNDER 44.5" could be any game on the slate
+#   a bare market — "ML" or "A", what a thin parse leaves behind
+#
+# The second is the reason this is not just a totals check. A one-word side is
+# never self-identifying, so the rule errs toward keeping the matchup: a line
+# with redundant context is merely wordy, one without it is unplaceable.
+_BARE_TOTAL_RE = re.compile(r"^\s*(o|u|over|under|total)\b", re.IGNORECASE)
+
+
+def _side_identifies_the_game(side):
+    text = str(side or "").strip()
+    if _BARE_TOTAL_RE.match(text):
+        return False
+    return len(text.split()) >= 2
+
+
 def _pick_headline(e, n):
-    """One numbered line for a pick — the unit both the digest and MORE send."""
+    """One numbered line for a pick — the unit both the digest and MORE send.
+
+    The matchup used to lead every line, which pushed the actual bet onto a
+    second row and made a board of player props read as a wall of repeated team
+    names. The bet leads now, and the stake is stated rather than left to be
+    inferred from the sharp count.
+    """
     emoji = _SPORT_EMOJI.get(e.get("sport") or "", "\U0001F4CA")
     matchup = e.get("matchup") or "TBD"
     side = e.get("side") or ""
     odds = f" ({e['odds']})" if e.get("odds") else ""
     grade, count = _confidence(e)
     when = _pick_when(e)
-    line = f"{n}. {emoji} {matchup} \u2014 {side}{odds}".rstrip()
-    meta = [f"{grade} \u00b7 {count} sharp{'' if count == 1 else 's'}"]
+
+    head = side if _side_identifies_the_game(side) else f"{matchup} \u2014 {side}"
+    line = f"{n}. {emoji} {head}{odds}".rstrip()
+
+    meta = [
+        grade.title(),
+        f"{count} Sharp{'' if count == 1 else 's'}",
+        f"{_unit_size(count)} Play",
+    ]
     if when:
         meta.append(when)
     line += "\n   " + " \u00b7 ".join(meta)
@@ -2059,18 +2106,63 @@ def _run_pipeline(
                 "nothing can reach the 2-sharp bar \u2014 that's a coverage gap, "
                 "not a quiet slate."
             )
+        # A PDF here too (Henry, 2026-09-10). This path used to be text-only,
+        # so a board of eleven near-misses arrived as a wall of numbered lines
+        # while a qualifying board of three got a clean attachment — backwards,
+        # since the long board is the one nobody wants to read in a message
+        # bubble. The same guard applies: the attachment counts as delivered
+        # only on a chat.db confirmation, and the full text follows on any
+        # other outcome.
+        near_pdf = None
+        try:
+            near_pdf = format_picks_pdf(merged)
+            print(f"\U0001F4C4 PDF built (below-threshold board): {near_pdf}")
+        except Exception as _pe:
+            # A broken PDF must never cost Henry the board itself.
+            print(f"\u26A0\uFE0F  PDF generation skipped: {_pe}")
+
+        # The caveats explain why nothing qualified, which is the entire point
+        # of this message — they ride in the covering text, not the attachment,
+        # so they are read even if the PDF is never opened.
+        if near_pdf:
+            caveats = body.split("\n\nNone of these cleared the bar", 1)
+            explanation = ("\n\nNone of these cleared the bar" + caveats[1]) if len(caveats) > 1 else ""
+            covering = format_picks_summary(merged).replace(
+                "\U0001F512 Ivy's Sharp Picks",
+                "\U0001F440 Ivy's Sharp Picks \u2014 nothing bettable", 1
+            ) + explanation
+            send_body, attach, fallback = covering, True, body
+        else:
+            send_body, attach, fallback = body, False, None
+
         delivery = deliver_report(
             HENRY_PHONE,
             job_name="sharp_picks",
-            body=body,
+            body=send_body,
             detail=detail,
+            pdf_path=near_pdf,
             content_summary=f"{len(merged)} below-threshold pick(s) — {datetime.now():%b %-d}",
-            commands=("MORE", "WHY <n>"),
+            commands=("MORE", "WHY <n>", "PDF"),
+            attach_pdf=attach,
+            fallback_body=fallback,
         )
+        if delivery.attachment_status == ATTACH_VERIFIED:
+            print("\U0001F4CE PDF confirmed delivered in chat.db.")
+        elif delivery.fallback_sent:
+            print(
+                f"\u26A0\uFE0F  Attachment {delivery.attachment_status} \u2014 "
+                "full board sent as text instead."
+            )
         if delivery.delivered:
             save_last_report(near_signature, body)
             result.report_id = delivery.report_id
             result.sent = True
+            # Record the attachment outcome here too. This path never set it,
+            # so /executions showed attached=null for a run that had in fact
+            # pushed a PDF — a receipt that understates what happened is the
+            # same class of problem as one that overstates it.
+            if near_pdf:
+                result.attached = delivery.attachment_status == ATTACH_VERIFIED
             print(f"📨 Sent below-threshold summary to Henry ({len(merged)} pick(s)).")
         return result.to_dict()
     

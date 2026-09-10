@@ -928,12 +928,22 @@ class TestAllSportsCoverage:
         assert "apiKey=***" in out
 
     def test_unknown_leagues_still_render(self):
+        """A sport with no emoji in the map must still produce a full line.
+
+        This used to assert on the matchup, which the line no longer carries:
+        since 2026-09-10 a side that names its own game replaces it, so the
+        bet leads instead of the teams. The point of the test is that an
+        unlisted league renders at all, so it asserts the parts that carry
+        the bet.
+        """
         body, _ = sports_bettor.format_picks_digest([{
             "sport": "Cricket", "matchup": "India @ Australia", "side": "India ML",
             "odds": "-120", "is_consensus": False, "consensus_count": 1,
             "handicappers": ["someone"], "enrichment": {"confidence": "medium"},
         }])
-        assert "India @ Australia" in body
+        assert "India ML" in body
+        assert "-120" in body
+        assert "1 Sharp" in body and "1U Play" in body
 
 
 class TestMatchupRepair:
@@ -1043,3 +1053,173 @@ class TestPricingIsOffByDefault:
         src = inspect.getsource(sports_bettor._run_pipeline)
         assert "fetch_live_odds()" in src
         assert "repair_matchups(" in src
+
+
+class TestStakeSizingAndHeadline:
+    """Henry's staking ladder and the line format, 2026-09-10.
+
+    The board arrived as repeated team names with the actual bet pushed onto a
+    second row, and the stake had to be inferred from a sharp count. Now the
+    bet leads and the stake is stated.
+    """
+
+    @pytest.mark.parametrize("sharps,expected", [
+        (1, "1U"), (2, "2-3U"), (3, "MAX"), (4, "MAX"), (9, "MAX"),
+    ])
+    def test_the_ladder(self, sharps, expected):
+        assert sports_bettor._unit_size(sharps) == expected
+
+    def test_two_sharps_stays_a_range(self):
+        """_confidence derives the grade FROM the sharp count, so MEDIUM and
+        "2 sharps" are one fact stated twice and there is no second signal to
+        split 2U from 3U. Printing a single number would be a stake Ivy cannot
+        justify, so the call is handed back."""
+        assert sports_bettor._unit_size(2) == "2-3U"
+        grade, _ = sports_bettor._confidence({"consensus_count": 2})
+        assert grade == "MEDIUM", "if this ever varies independently, revisit the range"
+
+    @pytest.mark.parametrize("side", [
+        "Kyren Williams 2+ Receptions",
+        "Puka Nacua 60+ Receiving Yards",
+        "Seattle Mariners ML",
+        "India ML",
+    ])
+    def test_a_self_identifying_side_drops_the_matchup(self, side):
+        line = sports_bettor._pick_headline(
+            {"sport": "NFL", "matchup": "Away Team @ Home Team", "side": side,
+             "consensus_count": 1}, 1)
+        assert side in line
+        assert "Away Team @ Home Team" not in line
+
+    @pytest.mark.parametrize("side", ["UNDER 44.5", "Over 9.5", "Total Over 210.5", "ML", "A"])
+    def test_a_side_that_names_no_game_keeps_the_matchup(self, side):
+        """A bare total could be any game on the slate, and a bare market is
+        what a thin parse leaves behind. Either one alone is unplaceable."""
+        line = sports_bettor._pick_headline(
+            {"sport": "NFL", "matchup": "Away Team @ Home Team", "side": side,
+             "consensus_count": 3}, 1)
+        assert "Away Team @ Home Team" in line
+
+    def test_the_meta_row_carries_grade_sharps_and_stake(self):
+        line = sports_bettor._pick_headline(
+            {"sport": "NFL", "matchup": "A @ B", "side": "Kyren Williams 2+ Receptions",
+             "consensus_count": 1}, 6)
+        assert line.startswith("6. ")
+        assert "Kyren Williams 2+ Receptions" in line
+        assert "Low" in line and "1 Sharp" in line and "1U Play" in line
+
+    def test_sharps_pluralise(self):
+        one = sports_bettor._pick_headline(
+            {"sport": "NFL", "matchup": "A @ B", "side": "Player X 2+ Rec",
+             "consensus_count": 1}, 1)
+        two = sports_bettor._pick_headline(
+            {"sport": "NFL", "matchup": "A @ B", "side": "Player X 2+ Rec",
+             "consensus_count": 2}, 1)
+        assert "1 Sharp ·" in one
+        assert "2 Sharps ·" in two
+
+
+def test_a_below_threshold_board_is_pushed_as_a_pdf(monkeypatch, tmp_path):
+    """The long board is the one nobody wants in a message bubble.
+
+    A qualifying board of three got a clean attachment while an eleven-pick
+    near-miss board arrived as a wall of numbered lines, because this path
+    never built a PDF at all. That was backwards, and it is what Henry
+    actually saw on 2026-09-09.
+    """
+    fake_pdf = tmp_path / "near_miss.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real"}])
+    monkeypatch.setattr(
+        sports_bettor, "merge_picks",
+        lambda picks: [{
+            "is_consensus": False, "consensus_count": 1,
+            "enrichment": {"confidence": "low"},
+            "sport": "NFL", "matchup": "SF @ LAR",
+            "side": f"Player {i} 2+ Receptions", "odds": "-110",
+        } for i in range(11)],
+    )
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, report_date=None: None)
+    monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
+    monkeypatch.setattr(sports_bettor, "format_picks_pdf", lambda merged: str(fake_pdf))
+
+    class _R:
+        status = "verified_delivered"
+        def __bool__(self):
+            return True
+
+    sent, attached = [], []
+    monkeypatch.setattr(text_delivery, "send_imessage",
+                        lambda phone, body: sent.append(body) or True)
+    monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
+    monkeypatch.setattr(
+        text_delivery, "send_imessage_attachment",
+        lambda *a, **k: attached.append(a) or _R(),
+    )
+
+    result = sports_bettor.run(force=True, send=True)
+    joined = "\n".join(sent)
+
+    assert attached, "the near-miss board must be pushed as a PDF"
+    assert result["sent"] is True
+
+    # The covering text still has to explain WHY nothing qualified — that is
+    # the whole point of this message, and it must survive even if the PDF is
+    # never opened.
+    assert "nothing bettable" in joined
+    assert "cleared the bar" in joined
+
+    # And it must be a cover, not the wall of lines it replaces: one leading
+    # play, with the other ten in the attachment.
+    assert result["attached"] is True
+    assert "in the PDF attached" in joined
+    assert "\n2. " not in joined, "the second pick belongs in the PDF, not the bubble"
+
+
+def test_a_below_threshold_board_still_texts_when_the_pdf_cannot_be_built(monkeypatch, tmp_path):
+    """A broken PDF must never cost Henry the board itself."""
+    monkeypatch.setattr(sports_bettor._outbox, "OUTBOX_DIR", tmp_path / "outbox")
+    monkeypatch.setattr(sports_bettor, "fetch_live_odds",
+                        lambda: [{"away": "A", "home": "B", "sport": "MLB",
+                                  "spread": "", "moneyline": "", "total": "",
+                                  "commence": ""}])
+    monkeypatch.setattr(sports_bettor, "sweep_with_retry", lambda games: [{"account": "@real"}])
+    monkeypatch.setattr(
+        sports_bettor, "merge_picks",
+        lambda picks: [{
+            "is_consensus": False, "consensus_count": 1,
+            "enrichment": {"confidence": "low"},
+            "sport": "NFL", "matchup": "SF @ LAR",
+            "side": f"Player {i} 2+ Receptions", "odds": "-110",
+        } for i in range(4)],
+    )
+    monkeypatch.setattr(sports_bettor, "save_picks", lambda picks, report_date=None: None)
+    monkeypatch.setattr(sports_bettor, "attach_odds", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "enrich_picks", lambda merged, games: None)
+    monkeypatch.setattr(sports_bettor, "load_last_report", lambda: {})
+    monkeypatch.setattr(sports_bettor, "save_last_report", lambda sig, msg: None)
+
+    def boom(_merged):
+        raise RuntimeError("reportlab exploded")
+
+    monkeypatch.setattr(sports_bettor, "format_picks_pdf", boom)
+
+    sent = []
+    monkeypatch.setattr(text_delivery, "send_imessage",
+                        lambda phone, body: sent.append(body) or True)
+    monkeypatch.setattr(sports_bettor, "send_imessage", lambda *a, **k: True)
+
+    result = sports_bettor.run(force=True, send=True)
+    joined = "\n".join(sent)
+
+    assert result["sent"] is True, "a broken PDF must not silence the board"
+    assert "Player 0 2+ Receptions" in joined, "the full board falls back to text"
