@@ -51,6 +51,7 @@ from filelock import FileLock, Timeout
 from ivy_core import require_env, send_imessage
 from ivy_core import outbox as _outbox
 from ivy_core.picks_tracker import save_picks
+from ivy_core import espn_odds
 from ivy_core.text_delivery import ATTACH_VERIFIED, build_detail, deliver_report
 from picks_dashboard import build_dashboard
 from ivy_core.pipeline_status import (
@@ -299,25 +300,10 @@ X_ACCOUNT_CHUNK_SIZE = 8
 LAST_REPORT_PATH = os.path.join(PROJECT_ROOT, "proactive_agents", "sports_last_report.json")
 
 # ===================== LIVE ODDS (The Odds API) =====================
-def _summarize_book(bookmaker):
-    """Condense one bookmaker's markets into Moneyline/Spread/Total strings."""
-    out = {}
-    for m in (bookmaker or {}).get("markets", []):
-        key = m["key"]
-        outcomes = m.get("outcomes", [])
-        if key == "h2h":
-            out["moneyline"] = " / ".join(
-                f"{o['name']} {o['price']:+d}" for o in outcomes
-            )
-        elif key == "spreads":
-            out["spread"] = " / ".join(
-                f"{o['name']} {o.get('point', 0):+g} ({o['price']:+d})" for o in outcomes
-            )
-        elif key == "totals":
-            out["total"] = " / ".join(
-                f"{o['name']} {o.get('point', 0):g} ({o['price']:+d})" for o in outcomes
-            )
-    return out
+# _summarize_book was removed on 2026-09-10. It condensed a bookmaker's
+# markets into Moneyline/Spread/Total strings, and nothing has a bookmaker to
+# hand any more: the slate comes from /events, which returns none, and prices
+# come from ivy_core.espn_odds. Git has it if the paid feed ever comes back.
 
 
 def fetch_live_odds(window_hours=WINDOW_HOURS):
@@ -348,19 +334,14 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
     # validation ever reads — and is not billed at all. So while pricing is off
     # we take the free endpoint, and validation stops depending on a budget it
     # was silently exhausting.
-    if ENABLE_PICK_PRICING:
-        endpoint = "odds"
-        params_extra = {
-            "regions":    "us",
-            "markets":    "h2h,spreads,totals",
-            "oddsFormat": "american",
-        }
-        print(f"📊 Pulling live odds for the next {window_hours}h ({frm} → {to})...")
-    else:
-        endpoint = "events"
-        params_extra = {}
-        print(f"📊 Pulling the {window_hours}h slate ({frm} → {to}) "
-              f"— free /events endpoint, pricing is off...")
+    # Always /events. This used to follow ENABLE_PICK_PRICING, because the
+    # Odds API was also the price source and turning pricing on meant paying
+    # for it. Prices come from ESPN now, so the only thing wanted here is the
+    # schedule — which /events gives away — and flipping the pricing flag can
+    # no longer quietly restart a 54-credit-per-run burn.
+    endpoint = "events"
+    params_extra = {}
+    print(f"📊 Pulling the {window_hours}h slate ({frm} → {to}) via free /events...")
 
     games = []
     for league, sport_key in discover_sport_keys():
@@ -455,23 +436,18 @@ def fetch_live_odds(window_hours=WINDOW_HOURS):
             continue
 
         for g in data:
-            books = g.get("bookmakers", [])
-            # Prefer the first US book carrying all three markets, else the first.
-            book = books[0] if books else None
-            for b in books:
-                keys = {m["key"] for m in b.get("markets", [])}
-                if {"h2h", "spreads", "totals"}.issubset(keys):
-                    book = b
-                    break
-            summary = _summarize_book(book)
+            # /events returns no bookmakers, so there is nothing to summarise.
+            # The price keys stay in the dict — build_odds_catalog and the
+            # matchup repair both read this shape — but they are empty by
+            # construction now, and prices arrive later from ivy_core.espn_odds.
             games.append({
                 "sport": league,
                 "home": g.get("home_team"),
                 "away": g.get("away_team"),
                 "commence": g.get("commence_time", ""),
-                "moneyline": summary.get("moneyline", ""),
-                "spread": summary.get("spread", ""),
-                "total": summary.get("total", ""),
+                "moneyline": "",
+                "spread": "",
+                "total": "",
             })
 
     print(f"📊 Slate: {len(games)} scheduled game(s) across "
@@ -1115,10 +1091,9 @@ def attach_odds(merged, games):
             # Player props and team totals are deliberately left blank: the feed
             # only carries full-game markets, and a wrong price is worse than
             # no price.
-            if (ENABLE_PICK_PRICING and not e.get("odds")
-                    and not _is_player_prop(e.get("side"))):
-                market = _odds_for_side(e.get("side"), best)
-                e["odds"] = _price_for_side(e.get("side"), market, e.get("matchup"))
+            # No price fill from this feed any more: /events carries teams and
+            # start times only. ESPN supplies prices, after this loop has
+            # canonicalised the matchups it matches on.
             # The odds feed is authoritative for the scheduled start time.
             if best.get("commence"):
                 e["start"] = best["commence"]
@@ -1143,21 +1118,23 @@ def attach_odds(merged, games):
     return merged
 
 
-# Pricing at flag time is OFF.
+# Pricing is ON again as of 2026-09-10, from ESPN rather than the Odds API.
 #
-# The Odds API attached a line to each pick on the way in ("Guardians -136").
-# That is being dropped: a shared W/L ledger does not need the market price,
-# and it was the dependency that kept breaking. Prices come back from ESPN's
-# scoreboard, which carries odds in the same payload as the score — so this is
-# a switch rather than a deletion, and _price_for_side and its tests stay
-# intact for that.
+# It was switched off on 2026-09-08 because the paid dependency kept breaking,
+# with a note saying prices would come back from ESPN "in the same payload as
+# the score". That replacement was never built, so boards shipped with no
+# prices at all for two days. ivy_core.espn_odds is it.
 #
-# The odds feed is NOT removed here. fetch_live_odds also supplies the slate
-# that repair_matchups validates picks against, which is the only check
-# between a handicapper's post and the database — the thing that catches
-# "LAD @ ?" and would catch "Kia @ Doosan" on a day Kia played KT. Removing
-# pricing must not remove validation.
-ENABLE_PICK_PRICING = False
+# One correction to that note, found while building it: ESPN carries odds only
+# while a game is STATUS_SCHEDULED and drops them once it is final. So this is
+# not a backfill run at grading time — the price has to be captured while the
+# game is still ahead of us, which is exactly when the sweep runs.
+#
+# The flag stays because it still means something: it is the switch for
+# whether a board carries prices at all. What it no longer controls is which
+# Odds API endpoint gets called, so turning it on cannot restart the credit
+# burn that took validation down for seven weeks.
+ENABLE_PICK_PRICING = True
 
 
 # ===================== GROK ENRICHMENT =====================
@@ -2043,6 +2020,16 @@ def _run_pipeline(
     merged = merge_picks(picks)
 
     attach_odds(merged, games)
+
+    # Prices last, after attach_odds has canonicalised the matchups ESPN is
+    # matched against. Free, keyless, and never fatal: a board with no prices
+    # is a smaller loss than no board.
+    if ENABLE_PICK_PRICING:
+        try:
+            priced = espn_odds.attach_odds(merged)
+            print(f"\U0001F4B0 ESPN priced {priced}/{len(merged)} pick(s).")
+        except Exception as _oe:
+            print(f"\u26A0\uFE0F  ESPN pricing skipped: {_oe}")
 
     # A board carrying both sides of one game is a guaranteed loss after vig;
     # presenting them as two plays is worse than presenting neither.

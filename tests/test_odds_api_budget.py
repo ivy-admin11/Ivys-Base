@@ -130,10 +130,20 @@ class TestTheSlateIsNotBought:
         assert seen["params"].get("commenceTimeFrom")
         assert seen["params"].get("commenceTimeTo")
 
-    def test_turning_pricing_back_on_restores_the_paid_endpoint(self, monkeypatch):
-        seen = self._capture(monkeypatch, pricing=True)
-        assert seen["url"].endswith("/odds")
-        assert seen["params"].get("markets") == "h2h,spreads,totals"
+    def test_the_pricing_flag_can_no_longer_reach_the_paid_endpoint(self, monkeypatch):
+        """Written on 2026-09-09, inverted on 2026-09-10.
+
+        For one day the endpoint followed ENABLE_PICK_PRICING, so turning
+        pricing on would silently restore a 54-credit-per-run call and walk
+        back into the exhaustion that took validation down for seven weeks.
+        Prices come from ESPN now — free, and a different feed entirely — so
+        this feed is only ever the free schedule, whatever the flag says.
+        """
+        for pricing in (True, False):
+            seen = self._capture(monkeypatch, pricing=pricing)
+            assert seen["url"].endswith("/events"), f"pricing={pricing} reached a paid endpoint"
+            assert "markets" not in seen["params"]
+            assert "regions" not in seen["params"]
 
 
 class TestGradingOnlyPaysForWhatItNeeds:

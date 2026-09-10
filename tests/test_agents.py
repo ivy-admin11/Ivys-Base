@@ -11,7 +11,7 @@ import inspect
 
 import pytest
 
-from ivy_core import text_delivery
+from ivy_core import espn_odds, text_delivery
 from proactive_agents import Familia_meal_planner, happy_hour_scout, sports_bettor
 
 AGENT_MODULES = [sports_bettor, happy_hour_scout, Familia_meal_planner]
@@ -314,13 +314,11 @@ def test_sports_bettor_stays_quiet_on_an_unchanged_below_bar_board(monkeypatch, 
 
 @pytest.fixture
 def pricing_on(monkeypatch):
-    """Turn pricing at flag time back on for tests that exercise it.
+    """Pin ENABLE_PICK_PRICING on for tests that exercise pricing.
 
-    ENABLE_PICK_PRICING now defaults to False: a shared W/L ledger does not
-    need the market price, and the Odds API was the dependency that kept
-    breaking. The pricing machinery is staying — prices return from ESPN's
-    scoreboard, which carries odds alongside the score — so these tests keep
-    protecting it rather than being deleted for the length of the switchover.
+    A no-op since 2026-09-10, when pricing came back on by default from ESPN.
+    It stays so a test that needs pricing says so explicitly rather than
+    depending on whatever the flag happens to be that week.
     """
     monkeypatch.setattr(sports_bettor, "ENABLE_PICK_PRICING", True)
 
@@ -338,36 +336,56 @@ def test_player_props_do_not_borrow_the_game_market_price(pricing_on):
     picks = [
         {"matchup": "Milwaukee Brewers @ Chicago Cubs",
          "side": "David Peterson Under 4.5 Strikeouts"},
-        {"matchup": "Milwaukee Brewers @ Chicago Cubs", "side": "Under 8.5"},
+        {"matchup": "Milwaukee Brewers @ Chicago Cubs", "side": "Under 8"},
     ]
+    # attach_odds still backfills sport and start time from the slate; it no
+    # longer prices, because /events carries no prices to fill from.
     sports_bettor.attach_odds(picks, games)
-
-    assert not picks[0].get("odds"), "a prop must not inherit the game total"
     assert picks[0]["sport"] == "MLB", "sport and start time still backfill"
     assert picks[0]["start"] == "2026-09-03T23:15:00Z"
-    # "Under 8.5" takes the under half, not the whole market.
-    assert picks[1]["odds"] == "Under 8 (-103)", "real game totals still fill, narrowed to the side"
+
+    # Pricing is ESPN's job now, and the invariant is unchanged: the game's run
+    # total is not the price of a strikeout prop.
+    markets = [_espn_market("Milwaukee Brewers", "Chicago Cubs",
+                            total={"over": ("o8", "-117"), "under": ("u8", "-103")})]
+    matchup = "Milwaukee Brewers @ Chicago Cubs"
+    assert espn_odds.price_for_side(
+        "mlb", matchup, "David Peterson Under 4.5 Strikeouts", markets) == "", \
+        "a prop must not inherit the game total"
+    assert espn_odds.price_for_side("mlb", matchup, "Under 8", markets) == "-103", \
+        "a real game total prices, on the side taken"
 
 
-def test_home_run_props_do_not_borrow_the_game_moneyline(pricing_on):
+def _espn_market(away, home, *, ml=("+108", "-126"), spread=None, total=None):
+    """One normalised ESPN market, the shape ivy_core.espn_odds produces.
+
+    ml is (away, home) — the away price first, matching how a matchup reads.
+    """
+    return {
+        "provider": "DraftKings",
+        "away_team": away, "home_team": home,
+        "moneyline": {"away": ml[0], "home": ml[1]},
+        "spread": spread or {"home": ("", ""), "away": ("", "")},
+        "total": total or {"over": ("", ""), "under": ("", "")},
+    }
+
+
+def test_home_run_props_do_not_borrow_the_game_moneyline():
     """Sep 3 9am report: 'Coby Mayo HR (Baltimore Orioles +108 / Boston Red Sox
     -126)' — the game moneyline beside a home-run prop. 'HR' matched none of the
-    long-form stat words, so the prop guard let it through."""
-    games = [{
-        "away": "Boston Red Sox", "home": "Baltimore Orioles", "sport": "MLB",
-        "moneyline": "Baltimore Orioles +108 / Boston Red Sox -126",
-        "total": "Over 9 (-110)", "spread": "BAL +1.5",
-        "commence": "2026-09-03T23:15:00Z",
-    }]
-    picks = [
-        {"matchup": "Boston Red Sox @ Baltimore Orioles", "side": "Coby Mayo HR"},
-        {"matchup": "Boston Red Sox @ Baltimore Orioles", "side": "Baltimore Orioles ML"},
-    ]
-    sports_bettor.attach_odds(picks, games)
+    long-form stat words, so the prop guard let it through.
 
-    assert not picks[0].get("odds"), "an HR prop must not inherit the game moneyline"
-    # Narrowed to the side taken — the full two-sided market is the old bug.
-    assert picks[1]["odds"] == "Baltimore Orioles +108"
+    Prices come from ESPN since 2026-09-10, so the invariant is enforced there
+    now. The rule is unchanged: the game moneyline is not the price of a
+    home-run prop, and a number that contradicts the bet is worse than none.
+    """
+    markets = [_espn_market("Boston Red Sox", "Baltimore Orioles")]
+    matchup = "Boston Red Sox @ Baltimore Orioles"
+
+    assert espn_odds.price_for_side("mlb", matchup, "Coby Mayo HR", markets) == "", \
+        "an HR prop must not inherit the game moneyline"
+    assert espn_odds.price_for_side("mlb", matchup, "Baltimore Orioles ML", markets) == "-126", \
+        "the side actually taken, not the two-sided market"
 
 
 def test_prop_guard_does_not_fire_on_team_names():
@@ -409,16 +427,16 @@ class TestNCAAFCoverage:
         assert "\U0001F3C8" in body
         assert "Texas +7" in body
 
-    def test_ncaaf_odds_attach_by_team_name(self, pricing_on):
-        games = [{
-            "away": "Ohio State Buckeyes", "home": "Texas Longhorns", "sport": "NCAAF",
-            "spread": "Texas +7 (-110)", "moneyline": "OSU -280 / TEX +230",
-            "total": "Over 54.5", "commence": "2026-09-05T23:30:00Z",
-        }]
-        picks = [{"matchup": "Ohio State Buckeyes @ Texas Longhorns", "side": "Texas +7"}]
-        sports_bettor.attach_odds(picks, games)
-        assert picks[0]["sport"] == "NCAAF"
-        assert picks[0]["odds"] == "Texas +7 (-110)"
+    def test_ncaaf_odds_attach_by_team_name(self):
+        """Matching is on team-name tokens, so a college side prices the same
+        way a pro one does."""
+        markets = [_espn_market(
+            "Ohio State Buckeyes", "Texas Longhorns",
+            spread={"home": ("+7", "-110"), "away": ("-7", "-110")},
+        )]
+        price = espn_odds.price_for_side(
+            "ncaaf", "Ohio State Buckeyes @ Texas Longhorns", "Texas +7", markets)
+        assert price == "-110"
 
 
 class TestHandleVetting:
@@ -546,23 +564,25 @@ class TestCardAnalysis:
         assert "consensus play" in captured["signal_note"]
 
 
-def test_team_totals_do_not_borrow_the_game_total(pricing_on):
+def test_team_totals_do_not_borrow_the_game_total():
     """Real board 2026-09-05 09:49: "Auburn Tigers TT Over 34.5" was printed
     with "(Over 58.5 (-115) / Under 58.5 (-105))" — the game total. A team
-    total and a game total are different numbers for different bets."""
-    games = [{
-        "away": "Baylor Bears", "home": "Auburn Tigers", "sport": "NCAAF",
-        "total": "Over 58.5 (-115) / Under 58.5 (-105)",
-        "spread": "Auburn -7.5 (-105)", "moneyline": "AUB -280",
-        "commence": "2026-09-05T19:30:00Z",
-    }]
-    picks = [
-        {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Auburn Tigers TT Over 34.5"},
-        {"matchup": "Baylor Bears @ Auburn Tigers", "side": "Over 58.5"},
-    ]
-    sports_bettor.attach_odds(picks, games)
-    assert not picks[0].get("odds"), "a team total must not inherit the game total"
-    assert picks[1]["odds"] == "Over 58.5 (-115)", "real game totals still fill, narrowed to the side"
+    total and a game total are different numbers for different bets.
+
+    ESPN enforces this twice over: the prop guard catches the team total, and
+    the line-agreement check would reject 34.5 against a book line of 58.5
+    even if it did not.
+    """
+    markets = [_espn_market(
+        "Baylor Bears", "Auburn Tigers",
+        total={"over": ("o58.5", "-115"), "under": ("u58.5", "-105")},
+    )]
+    matchup = "Baylor Bears @ Auburn Tigers"
+
+    assert espn_odds.price_for_side("ncaaf", matchup, "Auburn Tigers TT Over 34.5", markets) == "", \
+        "a team total must not inherit the game total"
+    assert espn_odds.price_for_side("ncaaf", matchup, "Over 58.5", markets) == "-115", \
+        "a real game total still prices, on the side taken"
 
 
 def test_prop_guard_leaves_ordinary_spreads_alone():
@@ -1006,15 +1026,28 @@ class TestMatchupRepair:
         pick, _ = self._one("Some Unlisted Team @ Another Team", "Another Team -3")
         assert pick["matchup"] == "Some Unlisted Team @ Another Team"
 
-    def test_repair_runs_before_odds_so_repaired_games_get_priced(self, pricing_on):
+    def test_repair_runs_before_odds_so_repaired_games_get_priced(self):
+        """Ordering still matters, and now matters more.
+
+        ESPN is matched on team-name tokens, so an abbreviation like "MIA @ KC"
+        prices nothing. Repair has to canonicalise the matchup first — which is
+        why the ESPN call sits after attach_odds in run(), not before it.
+        """
         games = [{"away": "Miami Marlins", "home": "Kansas City Royals",
-                  "moneyline": "Miami Marlins +120 / Kansas City Royals -140",
-                  "spread": "", "total": "", "sport": "MLB", "commence": "2026-09-05T23:40:00Z"}]
+                  "moneyline": "", "spread": "", "total": "", "sport": "MLB",
+                  "commence": "2026-09-05T23:40:00Z"}]
         picks = [{"matchup": "MIA @ KC", "side": "Kansas City Royals ML"}]
         picks, _ = sports_bettor.repair_matchups(picks, games)
-        sports_bettor.attach_odds(picks, games)
-        assert picks[0]["odds"] == "Kansas City Royals -140"
+        sports_bettor.attach_odds(picks, games)   # backfills sport and start
         assert picks[0]["sport"] == "MLB"
+
+        markets = [_espn_market("Miami Marlins", "Kansas City Royals",
+                                ml=("+120", "-140"))]
+        assert espn_odds.price_for_side("mlb", "MIA @ KC", "Kansas City Royals ML",
+                                        markets) == "", "the abbreviation alone cannot match"
+        assert espn_odds.price_for_side("mlb", picks[0]["matchup"],
+                                        "Kansas City Royals ML", markets) == "-140", \
+            "the repaired matchup prices"
 
     def test_the_prompt_forbids_placeholder_opponents(self):
         prompt = sports_bettor._build_sweep_prompt(["h"], "", sports_bettor.SPORT_HINTS)
@@ -1022,27 +1055,31 @@ class TestMatchupRepair:
         assert "'ML' or '-1.5' alone is not a side" in prompt
 
 
-class TestPricingIsOffByDefault:
-    """Pricing at flag time is switched off, not deleted.
+class TestPricingIsOnFromESPN:
+    """Pricing came back on 2026-09-10, from ESPN rather than the Odds API.
 
-    A shared win/loss ledger does not need the market price, and the Odds API
-    was the dependency that kept breaking — a 401 on Sep 6 locked it out
-    entirely. Prices return from ESPN's scoreboard, which carries odds in the
-    same payload as the score, so the machinery and its tests stay.
+    It was switched off on 2026-09-08 because the paid dependency kept
+    breaking, with a note saying prices would return from ESPN's scoreboard.
+    That replacement was never built, so two days of boards shipped with no
+    prices at all. ivy_core.espn_odds is it, and it costs nothing.
     """
 
-    def test_no_price_is_attached_by_default(self):
-        assert sports_bettor.ENABLE_PICK_PRICING is False
+    def test_pricing_is_on(self):
+        assert sports_bettor.ENABLE_PICK_PRICING is True
 
-    def test_a_price_copied_from_a_post_is_dropped(self):
-        """Otherwise the board is half-priced: some picks carry a line
-        because a handicapper happened to type one, others do not."""
-        merged = [{
-            "sport": "MLB", "matchup": "A @ B", "side": "A ML",
-            "odds": "-136", "handicappers": ["@x"],
-        }]
-        out = sports_bettor.attach_odds(merged, [])
-        assert out[0]["odds"] == ""
+    def test_turning_it_on_cannot_restart_the_credit_burn(self):
+        """The flag used to pick the Odds API endpoint as well, so enabling
+        pricing silently restored a 54-credit-per-run call. Prices come from
+        ESPN now, so the flag no longer touches that feed at all."""
+        import inspect
+        import re as _re
+        src = inspect.getsource(sports_bettor.fetch_live_odds)
+        # The name still appears, in the comment explaining why it no longer
+        # decides anything here. What must not exist is a branch on it.
+        assert not _re.search(r"\bif\s+ENABLE_PICK_PRICING\b", src), \
+            "the slate endpoint must not branch on the pricing flag"
+        assert 'endpoint = "events"' in src
+        assert '"markets"' not in src, "markets is what the credit is billed for"
 
     def test_the_slate_is_still_fetched_for_validation(self):
         """Pricing and validation share a source but not a purpose. Removing
