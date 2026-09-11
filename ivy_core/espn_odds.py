@@ -29,11 +29,20 @@ moneyline standing in for it. That rule predates this module and is the right
 one: a number that contradicts the bet is worse than no number.
 
 Nothing here raises. A pricing failure must never cost Henry the picks.
+
+What it answers as of 2026-09-11
+--------------------------------
+Whether a game has been played. On the morning the Odds API answered 502 the
+sweep ran with no slate, and two games that had gone final the night before
+were texted as "Today". The same scoreboard that prices a game says what state
+it is in — "pre", "in" or "post" — for every sport it has a route for, and
+fetch_schedule/find_game expose that so the sweep can ask.
 """
 from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -61,12 +70,13 @@ def _tokens(text: str) -> set:
     return {w for w in _WORD_RE.findall(str(text or "").lower()) if w not in _STOPWORDS}
 
 
-def _fetch(sport: str, league: str) -> Optional[dict]:
+def _fetch(sport: str, league: str, params: Optional[dict] = None) -> Optional[dict]:
     """Scoreboard JSON, trying each host in turn. None on total failure."""
     path = f"{sport}/{league}/scoreboard"
     for host in ESPN_HOSTS:
         try:
-            r = requests.get(f"{host}/{path}", headers=ESPN_HEADERS, timeout=HTTP_TIMEOUT_S)
+            r = requests.get(f"{host}/{path}", headers=ESPN_HEADERS, params=params or None,
+                             timeout=HTTP_TIMEOUT_S)
             if r.status_code == 200:
                 return r.json()
             logger.debug("ESPN %s/%s returned HTTP %s", host, path, r.status_code)
@@ -85,19 +95,26 @@ def _close(node: Any, key: str = "odds") -> str:
     return str(value).strip() if value not in (None, "") else ""
 
 
+def _team_name(competitor: dict) -> str:
+    team = competitor.get("team") or {}
+    return team.get("displayName") or team.get("name") or ""
+
+
+def _sides(competition: dict):
+    """(home, away) competitor blocks of one competition; {} for a missing one."""
+    competitors = competition.get("competitors") or []
+    home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+    away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+    return home, away
+
+
 def _markets_from(competition: dict) -> Dict[str, Any]:
     """Normalise one competition's odds block into flat, side-addressable prices."""
     books = competition.get("odds") or []
     if not books:
         return {}
     book = books[0]
-    competitors = competition.get("competitors") or []
-    home = next((c for c in competitors if c.get("homeAway") == "home"), {})
-    away = next((c for c in competitors if c.get("homeAway") == "away"), {})
-
-    def team_name(c):
-        t = c.get("team") or {}
-        return t.get("displayName") or t.get("name") or ""
+    home, away = _sides(competition)
 
     ml = book.get("moneyline") or {}
     ps = book.get("pointSpread") or {}
@@ -105,8 +122,8 @@ def _markets_from(competition: dict) -> Dict[str, Any]:
 
     return {
         "provider": ((book.get("provider") or {}).get("displayName") or "").strip(),
-        "home_team": team_name(home),
-        "away_team": team_name(away),
+        "home_team": _team_name(home),
+        "away_team": _team_name(away),
         "moneyline": {"home": _close(ml.get("home")), "away": _close(ml.get("away"))},
         "spread": {
             "home": (_close(ps.get("home"), "line"), _close(ps.get("home"))),
@@ -144,6 +161,88 @@ def fetch_markets(sport_label: str) -> List[Dict[str, Any]]:
             if markets:
                 out.append(markets)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Schedule: has this game been played?
+# ---------------------------------------------------------------------------
+# The slate only ever lists games ahead, so on a healthy day the question never
+# comes up. The day the slate is missing it is the only question that matters,
+# and the scoreboard answers it for every routed sport: "pre", "in", "post".
+
+_SCHEDULE_LIMIT = 300
+# The college-football scoreboard shows the Top 25 unless asked for all of FBS,
+# and a pick on an unranked game would otherwise look like it had no game.
+_LEAGUE_PARAMS = {"college-football": {"groups": 80}}
+
+
+def _window(now: datetime, days_back: int = 1, days_ahead: int = 2) -> str:
+    """``dates=`` range from yesterday through the day after tomorrow.
+
+    Yesterday is in it on purpose. The point is to notice that a game already
+    happened, and a game that finished last night is filed under last night's
+    date. Two days ahead covers the sweep's 48-hour horizon.
+    """
+    start = (now - timedelta(days=days_back)).strftime("%Y%m%d")
+    end = (now + timedelta(days=days_ahead)).strftime("%Y%m%d")
+    return f"{start}-{end}"
+
+
+def fetch_schedule(sport_label: str, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Every game ESPN lists for one Ivy sport label, yesterday through the day
+    after tomorrow, whatever state it is in.
+
+    Each entry carries away_team, home_team, start (ISO 8601, UTC), state
+    ("pre", "in" or "post") and ESPN's own status name. An unmapped sport
+    returns nothing, the same rule fetch_markets follows.
+    """
+    route = SPORT_ROUTES.get(str(sport_label or "").lower())
+    if not route:
+        return []
+    now = now or datetime.now(timezone.utc)
+    params = {"dates": _window(now), "limit": _SCHEDULE_LIMIT, **_LEAGUE_PARAMS.get(route[1], {})}
+    payload = _fetch(route[0], route[1], params=params)
+    if not payload:
+        return []
+
+    out = []
+    for event in payload.get("events") or []:
+        status_type = (event.get("status") or {}).get("type") or {}
+        for competition in event.get("competitions") or []:
+            home, away = _sides(competition)
+            start = competition.get("date") or event.get("date") or ""
+            if not (home and away and start):
+                continue
+            out.append({
+                "away_team": _team_name(away),
+                "home_team": _team_name(home),
+                "start": start,
+                "state": str(status_type.get("state") or "").lower(),
+                "status": status_type.get("name") or "",
+            })
+    return out
+
+
+def find_game(matchup: str, schedule: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The listed game a matchup names, or None.
+
+    The same two-token rule price_for_side uses, so "SF 49ers @ LA Rams" finds
+    "San Francisco 49ers at Los Angeles Rams". When the same two teams meet
+    more than once in the window (a series), a game still ahead beats one
+    already played, and the earlier of two ahead beats the later.
+    """
+    want = _tokens(matchup)
+    if not want:
+        return None
+    best, best_key = None, None
+    for game in schedule:
+        score = len(want & _tokens(f"{game['away_team']} {game['home_team']}"))
+        if score < 2:
+            continue
+        key = (-score, 0 if game.get("state") == "pre" else 1, str(game.get("start") or ""))
+        if best_key is None or key < best_key:
+            best, best_key = game, key
+    return best
 
 
 def _is_player_prop(side: str) -> bool:

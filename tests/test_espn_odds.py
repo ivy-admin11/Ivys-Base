@@ -12,6 +12,7 @@ Nothing here touches the network.
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,83 @@ class TestAttachingToABoard:
 
     def test_an_empty_board(self):
         assert espn_odds.attach_odds([]) == 0
+
+
+class TestTheScheduleKnowsWhatHasBeenPlayed:
+    """2026-09-11: with the slate down, two games that had gone final the
+    night before were texted as "Today". The scoreboard knew; nothing asked."""
+
+    @staticmethod
+    def _payload():
+        def event(away, home, date, name, state):
+            return {"date": date, "status": {"type": {"name": name, "state": state}},
+                    "competitions": [{"date": date, "competitors": [
+                        {"homeAway": "home", "team": {"displayName": home}},
+                        {"homeAway": "away", "team": {"displayName": away}}]}]}
+        return {"events": [
+            event("San Francisco 49ers", "Los Angeles Rams", "2026-09-11T00:35Z",
+                  "STATUS_FINAL", "post"),
+            event("Las Vegas Raiders", "Miami Dolphins", "2026-09-13T20:25Z",
+                  "STATUS_SCHEDULED", "pre"),
+        ]}
+
+    def test_every_game_is_listed_with_its_state(self, monkeypatch):
+        monkeypatch.setattr(espn_odds, "_fetch", lambda sport, league, params=None: self._payload())
+        games = espn_odds.fetch_schedule("nfl")
+        assert [(g["away_team"], g["home_team"], g["state"], g["start"]) for g in games] == [
+            ("San Francisco 49ers", "Los Angeles Rams", "post", "2026-09-11T00:35Z"),
+            ("Las Vegas Raiders", "Miami Dolphins", "pre", "2026-09-13T20:25Z"),
+        ]
+
+    def test_the_window_reaches_back_to_yesterday(self, monkeypatch):
+        """A game that finished last night is filed under last night's date."""
+        seen = {}
+        monkeypatch.setattr(espn_odds, "_fetch",
+                            lambda sport, league, params=None: seen.update(params or {}) or {"events": []})
+        espn_odds.fetch_schedule("nfl", now=datetime(2026, 9, 11, 14, 0, tzinfo=timezone.utc))
+        assert seen["dates"] == "20260910-20260913"
+        assert seen["limit"] >= 100
+
+    def test_college_football_asks_for_all_of_fbs(self, monkeypatch):
+        """The default scoreboard is the Top 25; an unranked game would look unplayed."""
+        seen = {}
+        monkeypatch.setattr(espn_odds, "_fetch",
+                            lambda sport, league, params=None: seen.update(params or {}) or {"events": []})
+        espn_odds.fetch_schedule("ncaaf")
+        assert seen["groups"] == 80
+
+    def test_an_unmapped_sport_asks_nothing(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(espn_odds, "_fetch", lambda *a, **k: called.append(1) or {})
+        assert espn_odds.fetch_schedule("kbo") == []
+        assert called == []
+
+    def test_an_unreachable_scoreboard_lists_nothing(self, monkeypatch):
+        monkeypatch.setattr(espn_odds, "_fetch", lambda *a, **k: None)
+        assert espn_odds.fetch_schedule("nfl") == []
+
+
+class TestFindingTheGame:
+    RAMS = {"away_team": "San Francisco 49ers", "home_team": "Los Angeles Rams",
+            "start": "2026-09-11T00:35Z", "state": "post"}
+    G1 = {"away_team": "Texas Rangers", "home_team": "Seattle Mariners",
+          "start": "2026-09-10T20:10Z", "state": "post"}
+    G2 = {"away_team": "Texas Rangers", "home_team": "Seattle Mariners",
+          "start": "2026-09-12T02:10Z", "state": "pre"}
+    G3 = {"away_team": "Texas Rangers", "home_team": "Seattle Mariners",
+          "start": "2026-09-13T02:10Z", "state": "pre"}
+
+    def test_abbreviations_find_the_game(self):
+        assert espn_odds.find_game("SF 49ers @ LA Rams", [self.RAMS]) is self.RAMS
+
+    def test_one_shared_token_is_not_a_match(self):
+        assert espn_odds.find_game("Dallas Cowboys @ Rams", [self.RAMS]) is None
+
+    def test_a_series_prefers_the_game_still_ahead_and_the_sooner_of_those(self):
+        assert espn_odds.find_game("Rangers @ Mariners", [self.G3, self.G1, self.G2]) is self.G2
+
+    def test_when_every_meeting_is_over_the_played_one_is_returned(self):
+        assert espn_odds.find_game("Rangers @ Mariners", [self.G1]) is self.G1
+
+    def test_an_empty_matchup_finds_nothing(self):
+        assert espn_odds.find_game("", [self.RAMS]) is None

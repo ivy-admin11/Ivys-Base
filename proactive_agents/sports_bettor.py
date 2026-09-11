@@ -502,12 +502,28 @@ def _slate_clause(catalog):
     )
 
 
-def _build_sweep_prompt(accounts, slate_clause, query):
-    """Assemble the Grok x_search prompt for one batch of handles."""
+def _build_sweep_prompt(accounts, slate_clause, query, now=None):
+    """Assemble the Grok x_search prompt for one batch of handles.
+
+    The prompt states the current date and time. It never did, and on the
+    morning the slate was missing (Odds API 502, 2026-09-11) "the next 48
+    hours" had no anchor: Grok read Thursday night's posts as today's picks and
+    tagged them game_day "today". A model reading posts cannot know which day
+    it is unless told.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(_CENTRAL_TZ)
+    window_end = now + timedelta(hours=WINDOW_HOURS)
+    example_start = (now + timedelta(hours=8)).replace(minute=0, second=0, microsecond=0)
     return (
         "Review the most recent posts from the listed X accounts and surface every "
         "concrete sports betting pick they have made for games SCHEDULED WITHIN THE "
         "NEXT 48 HOURS.\n\n"
+        f"It is now {now:%A, %b %-d, %Y, %-I:%M %p} Central time "
+        f"({now.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}). 'The next 48 hours' "
+        f"means games that START between now and {window_end:%A, %b %-d, %-I:%M %p} "
+        "Central. A game that has already started, including one played earlier "
+        "today or last night, is out of the window no matter how recent the post "
+        "about it is: a handicapper's recap of a game that is over is not a pick.\n\n"
         "COVER EVERY SPORT AND LEAGUE. Do not restrict yourself to any list: "
         "American and college football, basketball at every level including the "
         "WNBA, baseball including KBO and NPB, hockey, soccer in any competition, "
@@ -539,9 +555,12 @@ def _build_sweep_prompt(accounts, slate_clause, query):
         "the target accounts above, no @; never a tipster name merely quoted "
         "inside the post), "
         "confidence (low/medium/high if stated, otherwise null), "
-        "game_day (exactly 'today' or 'tomorrow', based on when the game is played), "
-        "start_time (ISO 8601 date-time of the scheduled first pitch/tip-off/kickoff "
-        "if known, otherwise null), "
+        "game_day (exactly 'today' or 'tomorrow', relative to the Central date given "
+        "above), "
+        "start_time (ISO 8601 date-time WITH a UTC offset for the scheduled first "
+        f"pitch/tip-off/kickoff, e.g. '{example_start.isoformat(timespec='seconds')}'. "
+        "A pick whose start cannot be placed ahead of now is discarded, so give the "
+        "best time the post or the slate supports; null only when neither says), "
         "and reasoning (one short sentence paraphrasing the post). "
         "Only include picks for games happening in the next 48 hours. "
         "Do not invent matchups, picks, or odds that aren't in the posts/slate. "
@@ -1112,9 +1131,13 @@ def attach_odds(merged, games):
             # No price fill from this feed any more: /events carries teams and
             # start times only. ESPN supplies prices, after this loop has
             # canonicalised the matchups it matches on.
-            # The odds feed is authoritative for the scheduled start time.
+            # The odds feed is authoritative for the scheduled start time, and
+            # the one source that vouches for it: the slate is fetched minutes
+            # earlier with a commence-from of now, so a game it lists is ahead
+            # by construction. drop_stale_picks reads the stamp.
             if best.get("commence"):
                 e["start"] = best["commence"]
+                e["start_source"] = "slate"
 
         # Grok is asked to copy the price "for that side" out of the slate, but
         # routinely copies the whole two-sided line. Narrow whatever we ended up
@@ -1134,6 +1157,160 @@ def attach_odds(merged, games):
             else:
                 e["odds"] = _price_for_side(e.get("side"), e["odds"], e.get("matchup"))
     return merged
+
+
+# ===================== IS THE GAME STILL AHEAD? =====================
+# 2026-09-11, 9:00 AM CT: the Odds API answered 502, so the sweep ran with no
+# slate. Grok read Thursday night's posts as "today", and Henry was texted
+# "LA Rams -3.5" and "Florida A&M @ Miami OVER 62.5" as today's plays, twelve
+# hours after both games had gone final (27-7 and 77-7). Nothing in the
+# pipeline had ever asked whether a game had been played. The slate made the
+# question moot on healthy days by listing only games ahead, and the one day
+# it was missing, so was the check. This is the check.
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _parse_start(value):
+    """Aware datetime for a start value; None when there is nothing to parse.
+
+    A bare date ("2026-09-11") is read as the end of that day in Central time.
+    The most a bare date can promise is that the game is not over before the
+    day is. Read as midnight UTC, the way an ISO parse would, it lands every
+    evening game the night before.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if _DATE_ONLY_RE.match(text):
+            day = datetime.strptime(text, "%Y-%m-%d")
+            return day.replace(hour=23, minute=59, second=59, tzinfo=_CENTRAL_TZ)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def drop_stale_picks(merged, *, now=None):
+    """Split a board into ``(still ahead, not)``. Only the first half is bettable.
+
+    Evidence, in order of authority:
+
+    1. The slate. attach_odds stamps start_source="slate" on a pick whose game
+       it found, and a slate game is ahead by construction.
+    2. ESPN's scoreboard, for every sport it has a route for. The game's state
+       is the verdict: "pre" keeps the pick and supplies the real start, "in"
+       and "post" drop it. Delays make a "pre" game's clock time unreliable,
+       so the state decides rather than the time.
+    3. The handicapper's own start_time, for the sports nobody else lists
+       (KBO, tennis, UFC...). Ahead keeps; past drops.
+    4. Nothing. A pick nobody can place on a calendar is not texted as "Today"
+       on the strength of a tag Grok produced from the age of a post.
+
+    Every dropped pick carries a ``stale_reason`` for the log and the notice.
+    Never raises: ESPN being unreachable is the same as ESPN not listing the
+    game, and the pick falls through to whatever the post said.
+    """
+    now = now or datetime.now(timezone.utc)
+    kept, dropped = [], []
+    schedules = {}
+    for e in merged:
+        if e.get("start_source") == "slate":
+            kept.append(e)
+            continue
+
+        sport = _norm(e.get("sport"))
+        if sport not in schedules:
+            try:
+                schedules[sport] = espn_odds.fetch_schedule(sport, now=now) or []
+            except Exception as exc:
+                print(f"\u26A0\uFE0F  ESPN schedule unavailable for {sport or '?'}: {_redact(exc)}")
+                schedules[sport] = []
+        game = espn_odds.find_game(e.get("matchup"), schedules[sport]) if schedules[sport] else None
+        if game:
+            e["start"] = game["start"]
+            e["start_source"] = "espn"
+            if game.get("state") == "pre":
+                kept.append(e)
+                continue
+            when = _fmt_start(game["start"])
+            if game.get("state") == "in":
+                e["stale_reason"] = "in progress"
+            else:
+                e["stale_reason"] = f"already played ({when})" if when else "already played"
+            dropped.append(e)
+            continue
+
+        start = _parse_start(e.get("start"))
+        if start is None:
+            e["stale_reason"] = "no start time from the slate, ESPN or the post"
+            dropped.append(e)
+            continue
+        if start <= now:
+            e["stale_reason"] = f"started {_fmt_start(e['start']) or e['start']}"
+            dropped.append(e)
+            continue
+        e.setdefault("start_source", "post")
+        kept.append(e)
+    return kept, dropped
+
+
+def format_stale_notice(dropped, slate_down=False):
+    """The text for a sweep whose every pick was for a game already played, or
+    for one nobody could place on a calendar. A notice, not a report: there is
+    no play in it, so nothing rides behind MORE or PDF."""
+    n = len(dropped)
+    lines = [
+        f"\U0001F440 Ivy's Sharp Picks \u2014 nothing bettable ({datetime.now():%b %-d, %-I:%M %p})",
+        f"The sweep found {n} pick{'' if n == 1 else 's'}, none for a game still ahead:",
+    ]
+    for e in dropped[:NEAR_MISS_TOP_N]:
+        emoji = _SPORT_EMOJI.get(e.get("sport") or "", "\U0001F4CA")
+        lines.append(
+            f"\u2022 {emoji} {e.get('matchup') or 'TBD'} \u2014 {e.get('side') or ''}: "
+            f"{e.get('stale_reason') or 'already played'}"
+        )
+    if n > NEAR_MISS_TOP_N:
+        lines.append(f"+{n - NEAR_MISS_TOP_N} more, same story.")
+    if slate_down:
+        lines.append(
+            "The schedule feed was down, so the sweep ran without a slate and read "
+            "the sharps' recaps as plays. Each one was checked against ESPN before "
+            "this went out."
+        )
+    lines.append("I'll send the board the moment there's a play still ahead.")
+    return "\n".join(lines)
+
+
+def _report_stale_board(result, stale, *, slate_down, force, send):
+    """Say so when every pick was for a game already played.
+
+    Silence here would look like the job not running; texting the picks is the
+    bug this replaces. Deduped by the same fingerprint as the below-the-bar
+    digest, so the 3 PM and 9 PM runs do not repeat the 9 AM notice for the
+    same posts.
+    """
+    print(f"\u26A0\uFE0F  {len(stale)} pick(s) found, every one for a game already played "
+          "or with no start anyone could confirm \u2014 nothing goes out as a play.")
+    result.picks_count = 0
+    result.consensus_count = 0
+    result.status = PipelineStatus.NO_QUALIFYING_PICKS
+    signature = _report_signature(stale)
+    if not send:
+        return result.to_dict()
+    if not force and load_last_report().get("signature") == signature:
+        print("\U0001F501 Same already-played board as last report \u2014 staying quiet.")
+        return result.to_dict()
+    body = format_stale_notice(stale, slate_down=slate_down)
+    if send_imessage(HENRY_PHONE, body):
+        save_last_report(signature, body)
+        result.sent = True
+        result.message = f"Already-played notice sent ({len(stale)} pick(s), no plays)."
+        print(f"\U0001F4E8 Sent already-played notice to Henry ({len(stale)} pick(s)).")
+    else:
+        print("\u26A0\uFE0F  Already-played notice failed to send.")
+    return result.to_dict()
 
 
 # Pricing is ON again as of 2026-09-10, from ESPN rather than the Odds API.
@@ -1371,11 +1548,18 @@ def _is_placeholder(text):
 
 
 def _fmt_start(value):
-    """Format an ISO-8601 start time as Central local time; '' if unparseable."""
+    """Format an ISO-8601 start time as Central local time; '' if unparseable.
+
+    A bare date renders as a date. Parsed as midnight UTC it printed the
+    evening before: "2026-09-11" came out as "Thu Sep 10, 7:00 PM CT".
+    """
     if not value:
         return ""
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        text = str(value).strip()
+        if _DATE_ONLY_RE.match(text):
+            return datetime.strptime(text, "%Y-%m-%d").strftime("%a %b %-d")
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(_CENTRAL_TZ).strftime("%a %b %-d, %-I:%M %p CT")
@@ -2067,6 +2251,16 @@ def _run_pipeline(
     merged = merge_picks(picks)
 
     attach_odds(merged, games)
+
+    # Nothing goes out unless its game is verifiably still ahead of us. Before
+    # pricing, so ESPN is not asked to price a game it has already scored.
+    merged, stale = drop_stale_picks(merged)
+    for e in stale:
+        print(f"\U0001F570\uFE0F  Dropped {e.get('sport')} {e.get('matchup')} \u2014 "
+              f"{e.get('side')}: {e.get('stale_reason')}")
+    if stale and not merged:
+        return _report_stale_board(result, stale, slate_down=not odds_source.healthy,
+                                   force=force, send=send)
 
     # Prices last, after attach_odds has canonicalised the matchups ESPN is
     # matched against. Free, keyless, and never fatal: a board with no prices

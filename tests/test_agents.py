@@ -17,6 +17,17 @@ from proactive_agents import Familia_meal_planner, happy_hour_scout, sports_bett
 AGENT_MODULES = [sports_bettor, happy_hour_scout, Familia_meal_planner]
 
 
+@pytest.fixture(autouse=True)
+def _abstract_games_are_always_ahead(monkeypatch):
+    """The runs in this file board abstract games ("A vs B", "E0 vs F0") that
+    no slate or scoreboard lists, so the recency gate would drop every one of
+    them and the delivery paths under test would never be reached. The gate
+    has its own tests (test_stale_picks.py); here it waves everything through,
+    and ESPN is unreachable so nothing in this file touches the network."""
+    monkeypatch.setattr(sports_bettor, "drop_stale_picks", lambda merged, **kw: (merged, []))
+    monkeypatch.setattr(espn_odds, "_fetch", lambda *a, **k: None)
+
+
 @pytest.mark.parametrize("module", AGENT_MODULES, ids=[m.__name__ for m in AGENT_MODULES])
 def test_run_has_standardized_keyword_only_signature(module):
     sig = inspect.signature(module.run)
