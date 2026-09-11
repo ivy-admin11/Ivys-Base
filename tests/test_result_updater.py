@@ -163,3 +163,108 @@ def test_normalize_team_is_stable():
     assert _normalize_team("St. Louis") == _normalize_team("st. louis")
     assert _normalize_team("") == ""
     assert _normalize_team(None) == ""
+
+
+class TestGradingFallsBackToESPN:
+    """Grading had one source, and it was the one that had run out.
+
+    The Odds API /scores endpoint bills 2 credits per sport per call and the
+    account has sat at its monthly ceiling since July, so auto_update_results
+    fetched 0 completed games on every run and graded nothing. Ivy noticed the
+    consequence and warned that "4 picks are about to become ungradeable",
+    offering repair_dashboard.py --apply — which marks them unverifiable. That
+    would have thrown away results that were still there to be had, because
+    ESPN carries the same finals for free.
+
+    The window is what makes this permanent rather than late: the Odds API
+    scores window caps at 3 days, so a pick that goes ungraded long enough can
+    never be graded at all.
+    """
+
+    def _pending_row(self, pid=1, sport="MLB", matchup="Texas Rangers @ Seattle Mariners",
+                     side="Seattle Mariners ML", game_day=None, report_date="2026-09-09"):
+        return (pid, sport, matchup, side, game_day, 1, "@someone", report_date)
+
+    def test_espn_is_tried_when_the_paid_feed_returns_nothing(self, monkeypatch, tmp_path):
+        import ivy_core.result_updater as ru
+
+        db = tmp_path / "picks.db"
+        self._seed(db, ru, monkeypatch)
+        monkeypatch.setattr(ru, "get_completed_games", lambda **k: [])
+
+        called = {}
+
+        def fake_backfill(pick, cache):
+            called["pick"] = pick
+            return "W", "rangers 2 vs mariners 3"
+
+        monkeypatch.setattr(ru, "backfill_pick", fake_backfill)
+        monkeypatch.setattr(ru, "update_pick_result", lambda *a, **k: True)
+        out = ru.auto_update_results()
+
+        assert called, "an empty paid feed must not end the run"
+        assert out["updated"] == 1
+
+    def test_the_report_date_reaches_the_espn_lookup(self, monkeypatch, tmp_path):
+        """game_day is routinely not a date — "today" in 79 of the first 88
+        picks — so it is stored null and the day comes from report_date. Without
+        it the lookup has no day to ask about and grades nothing, silently."""
+        import ivy_core.result_updater as ru
+
+        db = tmp_path / "picks.db"
+        self._seed(db, ru, monkeypatch)
+        monkeypatch.setattr(ru, "get_completed_games", lambda **k: [])
+
+        seen = {}
+        monkeypatch.setattr(ru, "backfill_pick",
+                            lambda pick, cache: seen.update(pick) or (None, None))
+        ru.auto_update_results()
+        assert seen.get("report_date") == "2026-09-09"
+
+    def test_an_espn_failure_never_crashes_the_run(self, monkeypatch, tmp_path):
+        import ivy_core.result_updater as ru
+
+        db = tmp_path / "picks.db"
+        self._seed(db, ru, monkeypatch)
+        monkeypatch.setattr(ru, "get_completed_games", lambda **k: [])
+
+        def boom(pick, cache):
+            raise RuntimeError("ESPN is down")
+
+        monkeypatch.setattr(ru, "backfill_pick", boom)
+        out = ru.auto_update_results()
+        assert out["updated"] == 0, "a dead fallback leaves picks pending, not crashed"
+
+    def test_the_scoreboard_cache_is_shared_across_picks(self, monkeypatch, tmp_path):
+        """One scoreboard fetch per sport-day, not one per pick."""
+        import ivy_core.result_updater as ru
+
+        db = tmp_path / "picks.db"
+        self._seed(db, ru, monkeypatch, count=4)
+        monkeypatch.setattr(ru, "get_completed_games", lambda **k: [])
+
+        caches = []
+        monkeypatch.setattr(ru, "backfill_pick",
+                            lambda pick, cache: caches.append(id(cache)) or (None, None))
+        ru.auto_update_results()
+        assert len(set(caches)) == 1, "every pick must share one cache"
+
+    @staticmethod
+    def _seed(db, ru, monkeypatch, count=1):
+        import sqlite3
+        con = sqlite3.connect(db)
+        con.executescript(
+            "CREATE TABLE picks (id INTEGER PRIMARY KEY, sport TEXT, matchup TEXT,"
+            " side TEXT, game_day TEXT, sharp_count INT, handicapper TEXT,"
+            " report_date TEXT, created_at TEXT);"
+            "CREATE TABLE results (pick_id INT, result TEXT);"
+        )
+        for i in range(count):
+            con.execute(
+                "INSERT INTO picks (sport, matchup, side, game_day, sharp_count,"
+                " handicapper, report_date, created_at) VALUES"
+                " ('MLB','Texas Rangers @ Seattle Mariners','Seattle Mariners ML',"
+                " NULL, 1, '@someone', '2026-09-09', '2026-09-09')")
+        con.commit()
+        con.close()
+        monkeypatch.setattr(ru, "PICKS_DB", db)

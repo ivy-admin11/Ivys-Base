@@ -154,7 +154,7 @@ class TestGradingOnlyPaysForWhatItNeeds:
         con.executescript(
             "CREATE TABLE picks (id INTEGER PRIMARY KEY, sport TEXT, matchup TEXT,"
             " side TEXT, game_day TEXT, sharp_count INT, handicapper TEXT,"
-            " created_at TEXT);"
+            " report_date TEXT, created_at TEXT);"
             "CREATE TABLE results (pick_id INT, result TEXT);"
         )
         con.commit()
@@ -177,8 +177,8 @@ class TestGradingOnlyPaysForWhatItNeeds:
         import ivy_core.result_updater as ru
         con = sqlite3.connect(picks_db)
         con.execute("INSERT INTO picks (sport, matchup, side, game_day, sharp_count,"
-                    " handicapper, created_at) VALUES ('MLB','A @ B','B ML','2026-09-08',"
-                    " 2,'x','2026-09-08')")
+                    " handicapper, report_date, created_at) VALUES"
+                    " ('MLB','A @ B','B ML','2026-09-08',2,'x','2026-09-08','2026-09-08')")
         con.commit()
         con.close()
 

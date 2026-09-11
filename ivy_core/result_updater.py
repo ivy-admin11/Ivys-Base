@@ -463,8 +463,14 @@ def auto_update_results():
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
 
+    # report_date is selected because it is usually the ONLY usable date.
+    # game_day comes from a model reading free-form posts and is routinely not
+    # a date at all — "today" in 79 of the first 88 picks — so it is stored as
+    # null and resolve_pick_date falls back to report_date. Without it here,
+    # ESPN grading has no day to ask about and silently grades nothing.
     cursor.execute("""
-        SELECT p.id, p.sport, p.matchup, p.side, p.game_day, p.sharp_count, p.handicapper
+        SELECT p.id, p.sport, p.matchup, p.side, p.game_day, p.sharp_count,
+               p.handicapper, p.report_date
         FROM picks p
         LEFT JOIN results r ON p.id = r.pick_id
         WHERE r.result IS NULL
@@ -489,22 +495,41 @@ def auto_update_results():
 
     games = get_completed_games(sport_titles=sport_titles)
     if not games:
-        logger.info("No completed games found")
-        return {"updated": 0, "pending": len(pending_picks)}
-    
+        # Not the end of the road. The Odds API /scores endpoint is the only
+        # thing that ran out — it bills 2 credits per sport per call, and the
+        # account has been at its monthly ceiling since July. ESPN's scoreboard
+        # carries the same finals for free, and backfill_pick already grades
+        # against it with identical matching logic; it was simply unreachable
+        # from the scheduled path.
+        #
+        # Falling back matters more than it looks: the Odds API scores window
+        # caps at 3 days, so a pick that goes ungraded here is not merely late,
+        # it becomes permanently ungradeable. That is what "4 picks about to
+        # become ungradeable" was warning about, and marking them unverifiable
+        # would have thrown away results that were still there to be had.
+        logger.info("Odds API returned no completed games — falling back to ESPN")
+
     updated = 0
-    for pick_id, sport, matchup, side, game_day, sharp_count, handicapper in pending_picks:
+    games_by_key: Dict[tuple, list] = {}
+    for (pick_id, sport, matchup, side, game_day, sharp_count,
+         handicapper, report_date) in pending_picks:
         pick = {
             "sport": sport,
             "matchup": matchup,
             "side": side,
             "game_day": game_day,
+            "report_date": report_date,
             "sharp_count": sharp_count or 1,
             "handicapper": handicapper
         }
-        
-        result, final_score = match_pick_to_game(pick, games)
-        
+
+        result, final_score = match_pick_to_game(pick, games) if games else (None, None)
+        if not result:
+            try:
+                result, final_score = backfill_pick(pick, games_by_key)
+            except Exception as exc:
+                logger.debug("ESPN grading failed for pick %s: %s", pick_id, exc)
+
         if result:
             if update_pick_result(pick_id, result, final_score):
                 # Log with sharp count
