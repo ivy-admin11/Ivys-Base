@@ -261,12 +261,22 @@ def test_deepseek_tool_dispatch_passes_the_inbound_message(monkeypatch):
     class Resp:
         status_code = 200
 
-        def json(self):
-            return {"choices": [{"message": {"tool_calls": [
-                {"function": {"name": "fetch_apple_reminders", "arguments": "{}"}}]}}]}
+        def __init__(self, payload):
+            self._payload = payload
 
+        def json(self):
+            return self._payload
+
+    # Two-round mock: the model asks for the tool, then — once the observation
+    # is handed back — answers in prose. Since 2026-09-10 DeepSeek runs the
+    # same observe -> reason round trip Gemini always did.
+    responses = [
+        Resp({"choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "fetch_apple_reminders", "arguments": "{}"}}]}}]}),
+        Resp({"choices": [{"message": {"content": "You have milk and eggs on your list."}}]}),
+    ]
     import requests
-    monkeypatch.setattr(requests, "post", lambda *a, **k: Resp())
+    monkeypatch.setattr(requests, "post", lambda *a, **k: responses.pop(0))
     monkeypatch.setattr(main, "DEEPSEEK_API_KEY", "fake", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
     monkeypatch.setattr(
@@ -284,7 +294,7 @@ def test_deepseek_tool_dispatch_passes_the_inbound_message(monkeypatch):
 
     out = main.execute_deepseek_call("what's on my list?", "sys")
     assert "not defined" not in out
-    assert out == "Milk, Eggs"
+    assert out == "You have milk and eggs on your list."
     # The inbound message must reach the re-run guard, not an undefined name.
     assert seen["inbound_text"] == "what's on my list?"
 

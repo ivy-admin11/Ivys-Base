@@ -83,6 +83,11 @@ from ivy_core import attachment_verify
 from ivy_core import agent_watchdog, proactive
 from ivy_core.messaging import send_imessage_attachment
 from ivy_core.report_fallback import split_imessage_content
+from ivy_core.pipeline_status import (
+    ProviderAuthenticationError,
+    ProviderUnavailableError,
+    RetryableProviderError,
+)
 from utils.applescript import AppleScriptRunner
 
 # Import prompt caching manager
@@ -134,6 +139,19 @@ logger = logging.getLogger("ivy.gateway")
 GEMINI_MODEL = "gemini-2.5-flash"
 
 
+# Gemini's leg of the failover, in milliseconds (google-genai takes ms).
+# Budgeted against DeepSeek's EXTERNAL_API_TIMEOUT so a texter's worst case
+# stays bounded: DeepSeek's timeout, then this, then the reply.
+GEMINI_TIMEOUT_MS = int(os.environ.get("GEMINI_TIMEOUT_MS", "15000"))
+
+# DeepSeek's observe->reason follow-up (seconds). Capped below the first
+# round's EXTERNAL_API_TIMEOUT because the facts are already in hand — this
+# pass only rewrites them — and a hang here holds every queued sender.
+DEEPSEEK_FOLLOW_UP_TIMEOUT = min(
+    int(os.environ.get("DEEPSEEK_FOLLOW_UP_TIMEOUT", "10")), EXTERNAL_API_TIMEOUT
+)
+
+
 def _build_gemini_client() -> Optional["genai.Client"]:
     """Construct the Gemini client, or None when no key is configured.
 
@@ -157,7 +175,16 @@ def _build_gemini_client() -> Optional["genai.Client"]:
         if k in os.environ
     }
     try:
-        return genai.Client(api_key=api_key)
+        # google-genai defaults to http_options.timeout=None, which httpx reads
+        # as "disable connect, read, write and pool timeouts". The poller is a
+        # single thread, so one hung Gemini call would block every queued
+        # sender forever with no recovery. That leg now carries more traffic
+        # than it used to, because DeepSeek provider faults genuinely fail over
+        # here instead of being returned as a reply string.
+        return genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+        )
     finally:
         os.environ.update(saved)
 
@@ -1096,13 +1123,21 @@ def _execute_tool_call(
     ``inbound_text`` is the message that produced the tool call; it is used
     only to refuse a job re-run that is really a question about the last one.
     """
-    guard = _rerun_would_be_wrong(tool_name, tool_args, inbound_text)
-    if guard is not None:
-        return guard
-
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Function {tool_name} is undefined."
+    # The guard reads the outbox, which can raise (e.g. OSError on mkdir).
+    # It only ever suppresses a job re-run, so if it cannot decide, fail to a
+    # sentence rather than either running the job or escaping an exception —
+    # an escape here reaches the callers' failover after earlier tools in the
+    # same response may already have run.
+    try:
+        guard = _rerun_would_be_wrong(tool_name, tool_args, inbound_text)
+    except Exception as guard_err:
+        logger.warning("Re-run guard failed for %s: %s", tool_name, guard_err)
+        return "I couldn't check the last report, so I didn't start that job. Try again in a moment."
+    if guard is not None:
+        return guard
     try:
         return handler(**tool_args)
     except Exception as exec_err:
@@ -1148,8 +1183,8 @@ def execute_deepseek_call(
     active_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if not active_key:
         logger.warning("DeepSeek call attempted with no DEEPSEEK_API_KEY configured.")
-        return (
-            "DeepSeek is not configured. Please set the DEEPSEEK_API_KEY environment variable."
+        raise ProviderUnavailableError(
+            "deepseek", "DEEPSEEK_API_KEY is not set"
         )
 
     url = "https://api.deepseek.com/v1/chat/completions"
@@ -1168,38 +1203,186 @@ def execute_deepseek_call(
         "temperature": 0.1,
     }
 
+    # Provider failures RAISE. They must not be returned as a reply string:
+    # every caller does `reply = execute_deepseek_call(...)` then falls over to
+    # Gemini on `if not reply`, so a returned error message is truthy, defeats
+    # the failover entirely, and gets texted to the user verbatim. That is how
+    # "❌ DeepSeek Execution Layer Exception: ... Read timed out." reached
+    # Henry instead of a Gemini answer (2026-09-10). CLAUDE.md: fall back to
+    # Gemini on provider failure, timeout, or empty response.
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=EXTERNAL_API_TIMEOUT)
-        if response.status_code != 200:
-            return f"❌ DeepSeek Engine Communication Fault. Status: {response.status_code}"
+    except requests.exceptions.Timeout as exc:
+        raise ProviderUnavailableError(
+            "deepseek", f"read timed out after {EXTERNAL_API_TIMEOUT}s", cause=exc
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise ProviderUnavailableError("deepseek", str(exc)[:200], cause=exc) from exc
 
+    if response.status_code in (401, 403):
+        raise ProviderAuthenticationError(
+            "deepseek", response.status_code, "DeepSeek rejected the credentials"
+        )
+    if response.status_code == 429 or response.status_code >= 500:
+        raise RetryableProviderError(
+            "deepseek", response.status_code, f"DeepSeek returned HTTP {response.status_code}"
+        )
+    if response.status_code != 200:
+        raise ProviderUnavailableError(
+            "deepseek", f"unexpected HTTP {response.status_code}"
+        )
+
+    try:
         res_data = response.json()
         message_node = res_data["choices"][0]["message"]
+    except (ValueError, KeyError, IndexError) as exc:
+        raise ProviderUnavailableError(
+            "deepseek", f"malformed response body: {exc}", cause=exc
+        ) from exc
 
-        # Check if DeepSeek triggered tool execution — dispatched through the
-        # same TOOL_HANDLERS registry Gemini uses, so DeepSeek can execute
-        # every registered tool (including run_job, which it previously
-        # could request via its schema but never actually got dispatched).
-        if "tool_calls" in message_node and message_node["tool_calls"]:
-            call = message_node["tool_calls"][0]
-            func_name = call["function"]["name"]
-            args = (
-                json.loads(call["function"].get("arguments", "{}"))
-                if call["function"].get("arguments")
-                else {}
+    # Tool dispatch and content extraction are deliberately OUTSIDE the
+    # provider-error handling above: a tool that fails is a real answer about a
+    # real attempt, not a provider outage, and must not trigger a Gemini retry
+    # that would run the tool a second time.
+    tool_calls = message_node.get("tool_calls") or []
+    if not tool_calls:
+        # An empty body is a non-answer; returning "" lets the caller's
+        # `if not reply` failover pick it up, which is the documented rule.
+        # (`or ""` because the API may send content: null, not "".)
+        return (message_node.get("content") or "").strip()
+
+    # ---- Validate EVERY call before running ANY -------------------------
+    # This is the line between "provider fault, fail over" and "tools have run,
+    # never fail over". Once one tool executes, an exception here reaches the
+    # callers' `except Exception` and Gemini re-runs the whole set — a reminder
+    # added twice, a job dispatched twice. So every defect in the model's
+    # response must be found while nothing has happened yet. (Interleaving
+    # validation with execution had exactly that hole: [valid, hallucinated]
+    # ran the first and then raised.)
+    plan: List[Tuple[str, str, Dict[str, Any]]] = []
+    for call in tool_calls:
+        func = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(func, dict):
+            raise ProviderUnavailableError("deepseek", "malformed tool_call entry")
+        call_id, func_name = call.get("id"), func.get("name")
+        if not call_id:
+            # The transcript we hand back is keyed by this id; without it the
+            # follow-up is unbuildable, and that is knowable before anything runs.
+            raise ProviderUnavailableError("deepseek", "tool_call carried no id")
+        # A tool name the model invented means nothing ran, so there is no
+        # double-execution risk in failing over — and returning
+        # "Error: Function X is undefined." would text the user another raw
+        # internal string, the class of bug this whole change removes.
+        if not func_name or func_name not in TOOL_HANDLERS:
+            raise ProviderUnavailableError(
+                "deepseek", f"model named a tool that does not exist: {func_name!r}"
             )
+        try:
+            args = json.loads(func.get("arguments") or "{}")
+        except (ValueError, TypeError) as exc:
+            raise ProviderUnavailableError(
+                "deepseek", f"unparseable tool arguments: {exc}", cause=exc
+            ) from exc
+        if not isinstance(args, dict):
+            raise ProviderUnavailableError("deepseek", "tool arguments were not an object")
+        plan.append((call_id, func_name, args))
 
-            logger.info(
-                "DeepSeek Core triggered native tool: %s with arguments: %s",
-                func_name,
-                args,
+    # ---- Act: run every tool (Gemini's path already runs all of them) ----
+    # Each is dispatched through the same TOOL_HANDLERS registry Gemini uses.
+    tool_results: List[Tuple[str, str, str]] = []
+    for call_id, func_name, args in plan:
+        logger.info(
+            "DeepSeek Core triggered native tool: %s with arguments: %s",
+            func_name,
+            args,
+        )
+        result = _execute_tool_call(func_name, args, inbound_text=text_content)
+        tool_results.append((call_id, func_name, str(result or "")))
+
+    # ---- Observe -> Reason: hand the results back for the actual answer ----
+    # Until 2026-09-10 this path returned the raw tool output as Ivy's reply,
+    # so "what's on my list?" came back as "Milk, Eggs" while the Gemini
+    # backup — which has always done this second pass — would say a sentence.
+    # The primary brain gave worse answers than the fallback for every
+    # tool-using question. This is the same one-round ReAct loop Gemini runs.
+    assistant_turn = {
+        "role": "assistant",
+        "content": message_node.get("content"),
+        "tool_calls": tool_calls,
+    }
+    # The fallback must be truthy: tools have run, and every caller treats a
+    # falsy reply as "fail over to Gemini", which would run them again.
+    raw_answer = "\n\n".join(r for _, _, r in tool_results if r) or "Done."
+    return _deepseek_observe_and_answer(
+        url, headers, payload, assistant_turn, tool_results, fallback=raw_answer
+    )
+
+
+def _deepseek_observe_and_answer(
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    assistant_turn: Dict[str, Any],
+    tool_results: List[Tuple[str, str, str]],
+    *,
+    fallback: str,
+) -> str:
+    """Second DeepSeek round trip: observations in, prose answer out.
+
+    The tools have ALREADY RUN by the time this is called, which changes the
+    rules completely. Nothing in here may raise: the callers fail over to
+    Gemini on an exception, and Gemini would then run the same tools a second
+    time — a reminder added twice, a job dispatched twice. So the entire body
+    sits under one ``except Exception`` and every failure degrades to
+    ``fallback``, the raw tool output, which is exactly what this path
+    returned before it had a second pass.
+
+    One round only. The tool schema stays attached so the transcript is
+    valid, but ``tool_choice: none`` makes the model answer in prose — a
+    further tool call here would be an unbounded loop, and Gemini's follow-up
+    is a single round too.
+
+    The budget is deliberately shorter than the first round's: the answer is
+    already in hand, this pass only rewrites it, and the poller is one thread
+    that every other sender waits behind.
+    """
+    try:
+        tool_turns = [
+            {"role": "tool", "tool_call_id": call_id, "content": result}
+            for call_id, _, result in tool_results
+        ]
+        follow_up = {
+            **payload,
+            "messages": [*payload["messages"], assistant_turn, *tool_turns],
+            "tool_choice": "none",
+        }
+        resp = requests.post(
+            url, json=follow_up, headers=headers, timeout=DEEPSEEK_FOLLOW_UP_TIMEOUT
+        )
+        if resp.status_code != 200:
+            # Log the body: a systematic rejection of the echoed transcript
+            # would otherwise be indistinguishable from the pre-change
+            # behaviour (raw output every time) — a silent degradation.
+            logger.warning(
+                "DeepSeek follow-up returned HTTP %s (%s); replying with raw tool output",
+                resp.status_code, (resp.text or "")[:300],
             )
-
-            return _execute_tool_call(func_name, args, inbound_text=text_content)
-
-        return message_node.get("content", "").strip()
-    except Exception as e:
-        return f"❌ DeepSeek Execution Layer Exception: {str(e)}"
+            return fallback
+        message = resp.json()["choices"][0]["message"]
+        if message.get("tool_calls"):
+            logger.info("DeepSeek ignored tool_choice=none and asked for another tool; using raw output")
+        content = message.get("content")
+        content = content.strip() if isinstance(content, str) else ""
+    except Exception as exc:
+        logger.warning(
+            "DeepSeek follow-up failed (%s: %s); replying with raw tool output",
+            type(exc).__name__, exc,
+        )
+        return fallback
+    if not content:
+        logger.info("DeepSeek follow-up returned no text; replying with raw tool output")
+        return fallback
+    return content
 
 
 # ============================================================================
@@ -2014,8 +2197,11 @@ def background_imessage_worker() -> None:
                 reply = execute_deepseek_call(text, deepseek_sys_instruction, history=history)
             except Exception as deepseek_err:
                 logger.error(
-                    "❌ DeepSeek Primary Layer Fault: %s. Switching to Backup Protocol...",
-                    str(deepseek_err),
+                    "❌ DeepSeek Primary Layer Fault: %s: %s (cause: %r). "
+                    "Switching to Backup Protocol...",
+                    type(deepseek_err).__name__,
+                    deepseek_err,
+                    getattr(deepseek_err, "cause", None),
                 )
                 reply = None
 
@@ -2040,7 +2226,15 @@ def background_imessage_worker() -> None:
                     logger.info("📤 Reply delivered to Messages for %s (%d chars).", sender, len(str(reply)))
                 remember_turn(sender, text, str(reply))
             else:
+                # Never leave the sender with nothing. Silence is
+                # indistinguishable from Ivy not running (CLAUDE.md), and this
+                # branch became more reachable once provider faults started
+                # failing over instead of being returned as a reply.
                 logger.warning("❌ Both Primary and Backup layers produced no usable reply.")
+                run_local_applescript_send(
+                    sender,
+                    "I couldn't come up with an answer to that. Try me again in a minute.",
+                )
                 remember_turn(sender, text, None)
 
             _mark_poll_success()
