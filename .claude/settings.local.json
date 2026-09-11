@@ -107,7 +107,8 @@
       "Bash(.venv/bin/python -m ruff check scripts/monitor_gateway.py ivy_core/attachment_verify.py tests/test_delivery_and_context.py)",
       "Bash(bash -n deploy/install_launchd.sh)",
       "Bash(command -v uvx)",
-      "Bash(uvx ruff@0.15.22 check .)"
+      "Bash(uvx ruff@0.15.22 check .)",
+      "Bash(claude remote-control *)"
     ]
   }
 }
