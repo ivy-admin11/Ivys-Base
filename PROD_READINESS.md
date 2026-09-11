@@ -28,6 +28,111 @@
 
 ---
 
+## How Ivy answers — architecture as of 2026-09-10
+
+One agent on an iMac, two brains in failover, a fixed tool belt, and a fleet of scheduled jobs that never talk to each other. Three figures, one claim each; every number is read from the code at that date.
+
+### A text becomes a reply
+
+*Single system: one agent, one memory, one tool belt.*
+
+```mermaid
+flowchart LR
+    henry(("Henry"))
+    chatdb["chat.db<br/>read-only SQLite"]
+    poller["iMessage poller<br/>one thread · every 1 s<br/>sender in favorites.json"]
+    reports["Report replies<br/>MORE · WHY n · PDF<br/>no model call"]
+    memory["Conversation memory<br/>8 turns · 45 min · per sender"]
+    deepseek["DeepSeek<br/>deepseek-v4-flash<br/>primary · 20 s"]
+    gemini["Gemini<br/>gemini-2.5-flash<br/>failover · 15 s"]
+    tools["Tools · registry.py<br/>Calendar · Reminders · Readwise · run_job<br/>one schema, both brains"]
+    applescript["AppleScript<br/>osascript, on run argv<br/>text as an argument, never in source"]
+    messages["Messages.app<br/>delivery verified in chat.db"]
+
+    henry -->|texts| chatdb -->|polls| poller -->|message| reports
+    reports -->|otherwise| memory -->|message + history| deepseek
+    reports -->|answered from data/outbox| applescript
+    deepseek -.->|on provider fault: timeout, 5xx, 401, malformed body| gemini
+    deepseek <-->|tool_calls, results back| tools
+    gemini <-->|tool_calls, results back| tools
+    deepseek -->|prose answer| applescript
+    gemini -->|prose answer, or one honest line if both fail| applescript
+    applescript -->|sends| messages -->|reply| henry
+
+    classDef primary stroke:#4A96FF,stroke-width:2px
+    classDef failover stroke:#E3A93E,stroke-width:2px
+    class deepseek primary
+    class gemini failover
+```
+
+A report reply — `MORE`, `WHY n`, `PDF` — never reaches a model; it is answered from the outbox in code. Everything else gets the sender's recent turns and goes to DeepSeek. A provider fault raises a typed error and the same message goes to Gemini. Both brains call the same registry, and the reply leaves through AppleScript with the text passed as an argument, never interpolated into script source. `com.ivy.gateway_monitor` probes `/ready` every 5 minutes and texts on down / up.
+
+### One round of ReAct, now on both brains
+
+*Reason → act → observe → reason. The primary used to stop after act.*
+
+```mermaid
+flowchart LR
+    msg["Message + memory<br/>from the poller"]
+    reason["Reason<br/>the brain decides"]
+    act["Act<br/>tool_calls<br/>validate all, then run all"]
+    observe["Observe<br/>results back as tool turns"]
+    reason2["Reason again<br/>tool_choice none · 10 s<br/>one round only"]
+    reply["Reply<br/>prose, to Henry"]
+
+    msg --> reason -->|calls| act -->|runs| observe -->|back| reason2 -->|answer| reply
+    act -.->|before 2026-09-10 DeepSeek stopped here and texted the raw tool output| reply
+
+    classDef loop stroke:#4A96FF,stroke-width:2px
+    class reason,act,observe,reason2 loop
+```
+
+Gemini has always run this loop; since 2026-09-10 DeepSeek does too. The line that matters is between **act** and **observe**: once anything has run, nothing on that path may raise, because the callers fail over on an exception and Gemini would run the tools again. So every defect in the model's response is caught before the first tool executes, and every failure of the second pass degrades to the raw output rather than a re-run.
+
+### The job fleet is scheduled, not multi-agent
+
+*Four processes share a library, not a conversation.*
+
+```mermaid
+flowchart LR
+    launchd["launchd<br/>on a schedule"]
+    runjob["run_job tool<br/>on request · force"]
+    runner["job_runner<br/>detached subprocess<br/>receipt in executions.db"]
+    sb["sports_bettor<br/>Sharp Picks · 9am · 3pm · 9pm"]
+    hh["happy_hour_scout<br/>Happy Hour Scout · daily 12pm"]
+    mp["Familia_meal_planner<br/>Familia Meal Planner · daily 8am"]
+    bs["bravo_scout<br/>Bravo Scout · on request"]
+    core["ivy_core<br/>query_llm · deliver_report<br/>one shared library"]
+    outbox["data/outbox<br/>answers MORE · WHY · PDF<br/>PDF only when asked<br/>newest per job kept"]
+    henry(("Henry"))
+
+    launchd -->|fires| runner
+    runjob -->|dispatches| runner
+    runner --> sb & hh & mp & bs
+    sb & hh & mp & bs --> core
+    core -->|saves| outbox
+    core -->|texts the report| henry
+    outbox -.->|PDF if asked| henry
+
+    classDef primary stroke:#4A96FF,stroke-width:2px
+    class runjob primary
+```
+
+This is the part that looks multi-agent on a whiteboard and isn't. No job imports another, none shares memory with another, none delegates. Each is a cron-style process that borrows the same library the gateway does, writes its receipt, and texts its report. The one hand-off to the agent runs the other way: `run_job` is a tool, so "run picks" from a text dispatches the same subprocess launchd would.
+
+### Where Ivy sits
+
+| Pattern | Ivy | Why |
+|---|---|---|
+| Single system | ✓ | One agent, one memory, one tool belt. The second brain is failover, not a colleague; the jobs are processes, not peers. |
+| ReAct | ✓ both brains, since 2026-09-10 | Reason → act → observe → reason, one round. Native tool calls rather than verbal traces, and the primary finally does the observe step. |
+| CodeAct | ✗ by design | A fixed registry. Model output never becomes code — even AppleScript gets its arguments as argv, never as script source. |
+| Agentic RAG | ✗ | No vector store, no retrieval planning. Readwise is a plain API call the model can make, not a pipeline it orchestrates. |
+
+Runtime: `com.ivy.gateway` on `.venv/bin/python` 3.12.13, Full Disk Access pinned to that exact binary. `/ready` checks chat.db, interpreter identity, poller heartbeat, receipts DB, provider auth. Timeouts: DeepSeek 20 s, follow-up 10 s, Gemini 15 s.
+
+---
+
 # 🔴 BLOCKERS
 
 Things that are actively broken, actively leaking, or would break on first real deploy.
