@@ -85,6 +85,12 @@ def check(fn: CheckFn) -> CheckFn:
     return fn
 
 
+def _plural(n: int, noun: str, plural: Optional[str] = None) -> str:
+    """"1 pick" / "7 picks". "pick(s)" is the kind of thing that makes a text
+    from Ivy read like a log line."""
+    return f"{n} {noun if n == 1 else (plural or noun + 's')}"
+
+
 @check
 def sheet_behind_database() -> List[Finding]:
     """Grades recorded locally that never reached the dashboard."""
@@ -96,7 +102,7 @@ def sheet_behind_database() -> List[Finding]:
     return [Finding(
         key="sheet_behind",
         severity=NORMAL,
-        title=f"⚠️ {len(missing)} graded pick(s) missing from the dashboard",
+        title=f"⚠️ {_plural(len(missing), 'graded pick')} missing from the dashboard",
         detail=(
             "The results are recorded here but never reached the sheet, so the "
             "dashboard is understating the record."
@@ -113,38 +119,67 @@ def sheet_behind_database() -> List[Finding]:
 
 @check
 def picks_aging_out() -> List[Finding]:
-    """Ungraded picks about to pass the point where they can ever be graded.
+    """Ungraded picks in a league with no historical-scores source.
 
-    The scores endpoint serves roughly two days. A pick that goes ungraded
-    past that is unverifiable forever, which is how 80 of 88 picks ended up
-    with no result. This is the one finding that is worth acting on the same
-    day, because tomorrow it is too late.
+    For every league in historical_scores.SPORT_ROUTES nothing ages out: ESPN
+    serves scores for any date and the repair script backfills them whenever
+    it runs. The first version of this check predated that backfill and
+    treated the odds provider's window as the last word for every pick -- on
+    2026-09-11 it texted Henry that seven NFL and NCAAF picks were about to
+    become ungradeable, and not one of them could.
+
+    What still ages out is a pick in a league ESPN does not carry -- KBO --
+    once it is past the odds provider's window. Nothing can grade those after
+    the fact, so the only useful warning is the one that lands while the
+    window is still open.
     """
-    from ivy_core.picks_tracker import PICKS_DB
     import sqlite3
+
+    from ivy_core.historical_scores import SPORT_ROUTES
+    from ivy_core.pick_stats import resolve_pick_date
+    from ivy_core.picks_tracker import PICKS_DB
+    from ivy_core.result_updater import ODDS_MAX_DAYS_FROM
 
     if not Path(PICKS_DB).exists():
         return []
     conn = sqlite3.connect(PICKS_DB)
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
-        n = conn.execute("""
-            SELECT COUNT(*) FROM picks p
+        rows = conn.execute("""
+            SELECT p.sport, p.game_day, p.report_date FROM picks p
             LEFT JOIN results r ON r.pick_id = p.id
             WHERE r.result IS NULL
-              AND COALESCE(NULLIF(p.game_day,''), p.report_date) <= ?
-        """, (cutoff,)).fetchone()[0]
+        """).fetchall()
     finally:
         conn.close()
-    if not n:
+
+    today = datetime.now(timezone.utc).date()
+    at_risk: Dict[str, int] = {}
+    for sport, game_day, report_date in rows:
+        if (sport or "").strip().lower() in SPORT_ROUTES:
+            continue  # ESPN will grade it whenever the repair next runs
+        when = resolve_pick_date(game_day, report_date)
+        if not when:
+            continue
+        age = (today - datetime.strptime(when, "%Y-%m-%d").date()).days
+        # Say so while there is still a day to act: the window is
+        # ODDS_MAX_DAYS_FROM days wide, and the last useful warning is the
+        # one before it shuts, not the one after.
+        if age >= ODDS_MAX_DAYS_FROM - 1:
+            label = sport or "unknown league"
+            at_risk[label] = at_risk.get(label, 0) + 1
+
+    if not at_risk:
         return []
+    n = sum(at_risk.values())
+    leagues = ", ".join(sorted(at_risk))
     return [Finding(
         key="picks_aging_out",
         severity=NORMAL,
-        title=f"⏳ {n} pick(s) about to become ungradeable",
+        title=f"⏳ {_plural(n, 'pick')} about to become ungradeable",
         detail=(
-            "Their games are at the edge of the two-day scores window. Once past "
-            "it no result can ever be established for them."
+            f"{leagues}: ESPN carries no scores for this league, so once the "
+            f"odds provider's {ODDS_MAX_DAYS_FROM}-day window closes no result "
+            "can ever be established. Grade now or they stay unverifiable."
         ),
         fix="scripts/repair_dashboard.py --apply",
     )]
@@ -184,9 +219,9 @@ def commits_not_pushed() -> List[Finding]:
     return [Finding(
         key="commits_unpushed",
         severity=NORMAL,
-        title=f"⬆️ {count} commit(s) have not left this Mac",
+        title=f"⬆️ {_plural(count, 'commit')} {'has' if count == 1 else 'have'} not left this Mac",
         detail=(
-            f"The oldest is {age_h / 24:.0f} day(s) old. autopush runs every 15 "
+            f"The oldest is {_plural(round(age_h / 24), 'day')} old. autopush runs every 15 "
             "minutes, so it is failing — usually an SSH key that needs a "
             "passphrase, which launchd cannot supply."
         ),

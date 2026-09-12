@@ -207,7 +207,7 @@ class TestOverallStats:
         assert s["hit_rate"] is None
 
     def test_pushes_are_excluded_from_hit_rate(self, isolated_db):
-        pt.save_picks([pick(), pick()], "2026-09-05")
+        pt.save_picks([pick(), pick(side="Bills +2.5")], "2026-09-05")
         ids = pick_ids(isolated_db)
         pt.update_pick_result(ids[0], "W")
         pt.update_pick_result(ids[1], "P")
@@ -215,7 +215,7 @@ class TestOverallStats:
         assert pt.get_stats_overall()["decided"] == 1
 
     def test_ungraded_picks_are_pending_not_losses(self, isolated_db):
-        pt.save_picks([pick(), pick()], "2026-09-05")
+        pt.save_picks([pick(), pick(side="Bills +2.5")], "2026-09-05")
         s = pt.get_stats_overall()
         assert s["pending"] == 2 and s["losses"] == 0
         assert s["hit_rate"] is None, "no decided picks is not a 0% record"
@@ -300,7 +300,7 @@ class TestSplitHandicappers:
 
 class TestSportStats:
     def test_grouped_by_sport(self, isolated_db):
-        pt.save_picks([pick(sport="NFL"), pick(sport="NFL"), pick(sport="MLB")], "2026-09-05")
+        pt.save_picks([pick(sport="NFL"), pick(sport="NFL", side="Bills +2.5"), pick(sport="MLB")], "2026-09-05")
         for pid in pick_ids(isolated_db):
             pt.update_pick_result(pid, "W")
         stats = pt.get_stats_by_sport()
@@ -314,7 +314,7 @@ class TestPdfSummary:
         assert "Sharp Picks Record" in out
 
     def test_reports_the_record(self, isolated_db):
-        pt.save_picks([pick(), pick()], "2026-09-05")
+        pt.save_picks([pick(), pick(side="Bills +2.5")], "2026-09-05")
         ids = pick_ids(isolated_db)
         pt.update_pick_result(ids[0], "W")
         pt.update_pick_result(ids[1], "L")
@@ -334,3 +334,59 @@ class TestPdfSummary:
         out = pt.format_stats_for_pdf()
         assert "@alice" in out and "@bob" in out
         assert "@alice, @bob" not in out
+
+
+class TestOneBetOneRow:
+    """save_picks used to be a blind INSERT. Three scheduled runs a day, and
+    a board differing from the last by one pick fails duplicate suppression
+    and is saved whole -- so by 2026-09-11 "Los Angeles Rams -3.5" from
+    @MassMoneyline sat in the table three times (ids 96, 97, 102) and
+    McCaffrey Over 4.5 Receptions twice (95, 100)."""
+
+    RAMS = dict(sport="NFL", matchup="San Francisco 49ers @ Los Angeles Rams",
+                side="Los Angeles Rams -3.5", handicapper="MassMoneyline",
+                start_time="2026-09-11T00:35:00Z", game_day=None)
+
+    def test_same_bet_same_game_is_not_saved_twice(self, isolated_db):
+        pt.save_picks([pick(**self.RAMS)], "2026-09-10")   # 09:00 run
+        pt.save_picks([pick(**self.RAMS)], "2026-09-10")   # 15:00 run, same board
+        pt.save_picks([pick(**self.RAMS)], "2026-09-11")   # next morning, re-posted
+        assert len(pick_ids(isolated_db)) == 1
+
+    def test_a_new_handicapper_joins_the_existing_row(self, isolated_db):
+        pt.save_picks([pick(**self.RAMS)], "2026-09-10")
+        pt.save_picks([pick(**{**self.RAMS, "handicapper": "HarryLockPicks"})], "2026-09-10")
+        (pid,) = pick_ids(isolated_db)
+        import sqlite3
+        row = sqlite3.connect(isolated_db).execute(
+            "SELECT handicapper, sharp_count FROM picks WHERE id = ?", (pid,)
+        ).fetchone()
+        assert set(h.strip() for h in row[0].split(",")) == {"MassMoneyline", "HarryLockPicks"}
+        assert row[1] == 2
+
+    def test_same_teams_different_game_is_a_second_pick(self, isolated_db):
+        """Game one of an MLB series and game two are two bets."""
+        g1 = dict(sport="MLB", matchup="Toronto Blue Jays @ Athletics",
+                  side="Toronto Blue Jays ML", start_time="2026-09-11T23:08:00Z")
+        g2 = {**g1, "start_time": "2026-09-12T20:07:00Z"}
+        pt.save_picks([pick(**g1)], "2026-09-11")
+        pt.save_picks([pick(**g2)], "2026-09-12")
+        assert len(pick_ids(isolated_db)) == 2
+
+    def test_without_a_start_time_a_cross_day_repeat_is_kept(self, isolated_db):
+        """No slate, no start time: same-day repeats collapse, a next-day one
+        does not -- dropping it could drop a real second pick on the same
+        teams, and that is the worse error."""
+        base = dict(sport="NFL", matchup="LA Rams @ SF 49ers", side="LA Rams -3.5",
+                    start_time=None)
+        pt.save_picks([pick(**base)], "2026-09-10")
+        pt.save_picks([pick(**base)], "2026-09-10")
+        pt.save_picks([pick(**base)], "2026-09-11")
+        assert len(pick_ids(isolated_db)) == 2
+
+    def test_only_new_rows_go_to_the_sheet(self, isolated_db, monkeypatch):
+        sent = []
+        monkeypatch.setattr(pt, "log_picks_to_sheet", lambda picks, d: sent.append(len(picks)))
+        pt.save_picks([pick(**self.RAMS)], "2026-09-10")
+        pt.save_picks([pick(**self.RAMS), pick(**{**self.RAMS, "side": "OVER 47.5"})], "2026-09-10")
+        assert sent == [1, 1], "the sheet received the duplicate the table refused"

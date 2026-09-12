@@ -98,13 +98,36 @@ def _is_placeholder_matchup(matchup) -> bool:
     return " ".join(str(matchup).split()).strip().lower() in _PLACEHOLDER_MATCHUPS
 
 
+def _existing_pick(cursor, sport, matchup, side, start_time, report_date):
+    """The row already holding this bet for this game, or None.
+
+    One bet, one game, one row. The game is identified by its start time when
+    the slate supplied one -- that is what separates a Thursday pick from the
+    same pick re-posted Friday, and game one of a series from game two. With
+    no start time the report date stands in, which catches the same-day repeat
+    and deliberately lets a cross-day repeat through rather than risk dropping
+    a real second pick on the same teams.
+    """
+    key = "start_time = ?" if start_time else "(start_time IS NULL AND report_date = ?)"
+    return cursor.execute(f"""
+        SELECT id, handicapper FROM picks
+        WHERE lower(trim(COALESCE(sport,''))) = lower(trim(?))
+          AND lower(trim(matchup)) = lower(trim(?))
+          AND lower(trim(side)) = lower(trim(?))
+          AND {key}
+        LIMIT 1
+    """, (sport or "", matchup or "", side or "", start_time or report_date)).fetchone()
+
+
 def save_picks(picks: List[Dict], report_date: str):
     """Save a batch of picks from a report to SQLite and Google Sheets."""
     _init_db()
     conn = sqlite3.connect(PICKS_DB)
     cursor = conn.cursor()
     skipped = 0
-    
+    merged = 0
+    new_picks: List[Dict] = []
+
     for pick in picks:
         # Normalize field names: merged picks use "start"/"handicappers", raw picks use "start_time"/"handicapper"
         start_time = pick.get("start_time") or pick.get("start")
@@ -143,6 +166,35 @@ def save_picks(picks: List[Dict], report_date: str):
             )
             continue
 
+        # Three scheduled runs a day, and a board that differs from the last
+        # one by a single pick fails duplicate suppression and is saved whole.
+        # So a pick that survived from the 09:00 report to the 15:00 one was
+        # stored twice, and by 2026-09-11 "Rams -3.5" from @MassMoneyline sat
+        # in the table three times. A bet already on file for this game is not
+        # inserted again; a handicapper newly on it is added to the row.
+        existing = _existing_pick(
+            cursor, pick.get("sport"), pick.get("matchup"), pick.get("side"),
+            start_time, report_date,
+        )
+        if existing:
+            existing_id, existing_handles = existing
+            have = _split_handicappers(existing_handles)
+            incoming = handicappers if isinstance(handicappers, list) else (
+                [handicappers] if handicappers else []
+            )
+            union = have + [h for h in incoming if h not in have]
+            if len(union) > len(have):
+                cursor.execute(
+                    "UPDATE picks SET handicapper = ?, sharp_count = ? WHERE id = ?",
+                    (", ".join(union), len(union), existing_id),
+                )
+                logger.info(
+                    "Pick already on file (id %d); %d new handicapper(s) joined it",
+                    existing_id, len(union) - len(have),
+                )
+            merged += 1
+            continue
+
         try:
             cursor.execute("""
                 INSERT INTO picks (
@@ -171,20 +223,29 @@ def save_picks(picks: List[Dict], report_date: str):
             continue
         pick_id = cursor.lastrowid
         cursor.execute("INSERT INTO results (pick_id) VALUES (?)", (pick_id,))
-    
+        new_picks.append(pick)
+
     conn.commit()
     conn.close()
-    saved = len(picks) - skipped
+    saved = len(new_picks)
     if skipped:
-        logger.warning("Saved %d of %d picks; %d could not be stored", saved, len(picks), skipped)
+        logger.warning(
+            "Saved %d of %d picks; %d already on file, %d could not be stored",
+            saved, len(picks), merged, skipped,
+        )
+    elif merged:
+        logger.info("Saved %d new picks; %d already on file", saved, merged)
     else:
         logger.info("Saved %d picks to database", saved)
-    
-    # Also log to Google Sheets for shared visibility
-    try:
-        log_picks_to_sheet(picks, report_date)
-    except Exception as e:
-        logger.warning(f"Could not log picks to Google Sheets: {e}")
+
+    # The sheet mirrors the table: only rows that were actually inserted go
+    # across, or the sheet fills with the same duplicates the table just
+    # refused.
+    if new_picks:
+        try:
+            log_picks_to_sheet(new_picks, report_date)
+        except Exception as e:
+            logger.warning(f"Could not log picks to Google Sheets: {e}")
     
     # Auto-sync to export sheet
     try:

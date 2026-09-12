@@ -302,3 +302,58 @@ class TestUnpushedCommitsAreNoticed:
     def test_it_points_at_the_log(self, monkeypatch):
         self._git(monkeypatch)
         assert "autopush.log" in pro.commits_not_pushed()[0].fix
+
+
+class TestPicksAgingOutKnowsWhatEspnCanGrade:
+    """On 2026-09-11 this check texted Henry that seven NFL and NCAAF picks
+    were about to become ungradeable. None could: ESPN carries both leagues
+    for any date, and the repair script backfills them. The check predated
+    the backfill and never learned about it. Meanwhile the two KBO picks --
+    the only ones that genuinely age out -- were not what it was counting."""
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        from ivy_core import picks_tracker as pt
+        path = tmp_path / "picks.db"
+        monkeypatch.setattr(pt, "PICKS_DB", path)
+        pt._init_db()
+        return path
+
+    def _add(self, db, sport, report_date, result=None):
+        import sqlite3
+        con = sqlite3.connect(db)
+        cur = con.execute(
+            "INSERT INTO picks (sport, matchup, side, report_date) VALUES (?, 'A @ B', 'A ML', ?)",
+            (sport, report_date),
+        )
+        con.execute("INSERT INTO results (pick_id, result) VALUES (?, ?)", (cur.lastrowid, result))
+        con.commit()
+        con.close()
+
+    def _days_ago(self, n):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
+
+    def test_leagues_espn_carries_never_age_out(self, db):
+        for sport in ("NFL", "NCAAF", "MLB"):
+            self._add(db, sport, self._days_ago(10))
+        assert pro.picks_aging_out() == []
+
+    def test_a_league_espn_does_not_carry_is_warned_before_the_window_shuts(self, db):
+        from ivy_core.result_updater import ODDS_MAX_DAYS_FROM
+        self._add(db, "KBO", self._days_ago(ODDS_MAX_DAYS_FROM - 1))
+        (f,) = pro.picks_aging_out()
+        assert f.title == "⏳ 1 pick about to become ungradeable"
+        assert "KBO" in f.detail and "ESPN carries no scores" in f.detail
+
+    def test_a_fresh_kbo_pick_is_not_warned_yet(self, db):
+        self._add(db, "KBO", self._days_ago(0))
+        assert pro.picks_aging_out() == []
+
+    def test_already_graded_picks_are_ignored(self, db):
+        self._add(db, "KBO", self._days_ago(10), result="U")
+        assert pro.picks_aging_out() == []
+
+    def test_plural_is_a_word_not_a_suffix(self):
+        assert pro._plural(1, "pick") == "1 pick"
+        assert pro._plural(7, "pick") == "7 picks"

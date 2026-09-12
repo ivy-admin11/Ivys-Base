@@ -104,7 +104,7 @@ class TestUnverifiableState:
         assert pt.get_stats_overall()["total"] == 1
 
     def test_it_does_not_move_a_hit_rate(self, isolated_db):
-        picks = [pick() for _ in range(21)]
+        picks = [pick(matchup=f"A{i} @ B{i}") for i in range(21)]
         pt.save_picks(picks, "2026-09-05")
         all_ids = ids(isolated_db)
         for pid in all_ids[:15]:
@@ -529,7 +529,29 @@ class TestTheRecordCountsBetsNotMentions:
     """
 
     def _seed(self, db, picks):
-        pt.save_picks(picks, "2026-09-05")
+        """Insert rows directly, bypassing save_picks.
+
+        save_picks now refuses to store the same bet for the same game twice
+        (one row, handicappers accumulate on it), so it can no longer produce
+        the duplicate rows this class exists to handle. But the live database
+        still holds them -- ids 95/100 and 96/97/102 as of 2026-09-11 -- and
+        every row saved before that change. The read-side guard has to keep
+        counting bets rather than mentions for as long as those rows exist,
+        so the fixture writes them the way the old code did.
+        """
+        import sqlite3
+        pt._init_db()
+        con = sqlite3.connect(db)
+        for p in picks:
+            cur = con.execute(
+                "INSERT INTO picks (sport, matchup, side, odds, handicapper, "
+                "game_day, report_date, sharp_count) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                (p.get("sport"), p.get("matchup"), p.get("side"), p.get("odds"), p.get("handicapper"),
+                 p.get("game_day"), "2026-09-05"),
+            )
+            con.execute("INSERT INTO results (pick_id) VALUES (?)", (cur.lastrowid,))
+        con.commit()
+        con.close()
         return ids(db)
 
     def test_the_same_bet_from_four_sources_counts_once(self, isolated_db):
