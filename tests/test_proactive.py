@@ -223,7 +223,7 @@ class TestTheDigest:
         assert pro.maybe_send_digest(working, at(19, "2026-09-06"))
 
     def test_it_carries_suggestions(self, monkeypatch):
-        monkeypatch.setattr(pro, "pending_suggestions",
+        monkeypatch.setattr(pro, "collect",
                             lambda now=None: [finding(key="i", severity=SUGGESTION,
                                                       title="Roster is thin", fix="vet handles")])
         s = Sender()
@@ -232,10 +232,50 @@ class TestTheDigest:
         assert "vet handles" in s.sent[0]
 
     def test_a_quiet_week_still_says_so(self, monkeypatch):
-        monkeypatch.setattr(pro, "pending_suggestions", lambda now=None: [])
+        monkeypatch.setattr(pro, "collect", lambda now=None: [])
         s = Sender()
         pro.maybe_send_digest(s, at(18, "2026-09-06"))
-        assert "Nothing outstanding" in s.sent[0]
+        assert "No alerts this week. Nothing open right now." in s.sent[0]
+
+    def test_it_never_claims_every_check_passed(self, monkeypatch):
+        """2026-09-13: the digest said "Every check passed this week" from
+        the module that had texted a warning on each of the three days
+        before. That sentence is gone for good."""
+        monkeypatch.setattr(pro, "collect", lambda now=None: [])
+        s = Sender()
+        pro.maybe_send_digest(s, at(18, "2026-09-06"))
+        assert "Every check passed" not in s.sent[0]
+        assert "Nothing outstanding" not in s.sent[0]
+
+    def test_open_alerts_are_listed_not_hidden(self, monkeypatch):
+        monkeypatch.setattr(pro, "collect", lambda now=None: [
+            finding(key="picks_aging_out", severity=NORMAL,
+                    title="\u23f3 2 picks about to become ungradeable",
+                    fix="scripts/repair_dashboard.py --apply"),
+        ])
+        s = Sender()
+        pro.maybe_send_digest(s, at(18, "2026-09-06"))
+        body = s.sent[0]
+        assert "Still open:" in body
+        assert "2 picks about to become ungradeable" in body
+        assert "repair_dashboard" in body
+        assert "Nothing open" not in body
+
+    def test_alerts_sent_this_week_come_from_the_state_it_wrote(self, monkeypatch):
+        """The week of 2026-09-06 (Mon 08-31 .. Sun 09-06): three alerts
+        inside it, one outside."""
+        monkeypatch.setattr(pro, "collect", lambda now=None: [])
+        monkeypatch.setattr(pro, "_load_state", lambda: {
+            "sent_on": {"2026-09-04": 1, "2026-09-05": 1, "2026-09-06": 1, "2026-09-07": 1},
+        })
+        monkeypatch.setattr(pro, "_save_state", lambda state: None)
+        s = Sender()
+        pro.maybe_send_digest(s, at(18, "2026-09-06"))
+        assert "3 alerts sent this week." in s.sent[0]
+
+    def test_one_alert_is_singular(self):
+        out = pro.format_digest([], None, open_alerts=[], alerts_sent=1)
+        assert "1 alert sent this week." in out
 
 
 class TestRendering:

@@ -510,6 +510,8 @@ def auto_update_results():
         logger.info("Odds API returned no completed games — falling back to ESPN")
 
     updated = 0
+    espn_attempted = 0
+    espn_errors = 0
     games_by_key: Dict[tuple, list] = {}
     for (pick_id, sport, matchup, side, game_day, sharp_count,
          handicapper, report_date) in pending_picks:
@@ -525,10 +527,16 @@ def auto_update_results():
 
         result, final_score = match_pick_to_game(pick, games) if games else (None, None)
         if not result:
+            espn_attempted += 1
             try:
                 result, final_score = backfill_pick(pick, games_by_key)
             except Exception as exc:
-                logger.debug("ESPN grading failed for pick %s: %s", pick_id, exc)
+                # WARNING, not DEBUG. A fallback that fails for every pick is
+                # the difference between a graded ledger and a permanently
+                # pending one, and at DEBUG it failed for 35 picks a run
+                # without a line in the log.
+                espn_errors += 1
+                logger.warning("ESPN grading failed for pick %s: %s", pick_id, exc)
 
         if result:
             if update_pick_result(pick_id, result, final_score):
@@ -537,8 +545,19 @@ def auto_update_results():
                 logger.info(f"Pick {pick_id} {result}{sharp_info}: {matchup} {side}")
                 updated += 1
     
+    if espn_attempted:
+        fetched = sum(1 for g in games_by_key.values() if g)
+        logger.info(
+            "ESPN fallback: %d pick(s) tried, %d sport-day(s) fetched, %d error(s)",
+            espn_attempted, fetched, espn_errors,
+        )
+        if espn_errors == espn_attempted:
+            logger.error(
+                "ESPN fallback failed for every pick it was tried on -- nothing "
+                "will be graded until this is fixed"
+            )
     logger.info(f"Updated {updated} pick results")
-    
+
     # Sync all results back to the export sheet
     if updated > 0:
         try:
@@ -554,18 +573,6 @@ def auto_update_results():
         "pending": len(pending_picks) - updated,
         "total_games_checked": len(games)
     }
-
-
-if __name__ == "__main__":
-    import sys
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    )
-    
-    result = auto_update_results()
-    print(f"\n✅ Result update complete: {result['updated']} updated, {result['pending']} still pending")
-    sys.exit(0 if result["updated"] > 0 or result["pending"] == 0 else 1)
 
 
 def backfill_pick(pick: Dict, games_by_key: Dict) -> Tuple[Optional[str], Optional[str]]:
@@ -592,3 +599,27 @@ def backfill_pick(pick: Dict, games_by_key: Dict) -> Tuple[Optional[str], Option
     if not games:
         return None, None
     return match_pick_to_game(pick, games)
+
+
+# The __main__ guard is the LAST statement in this module, on purpose.
+#
+# backfill_pick used to be defined below it. Under `python -m
+# ivy_core.result_updater` -- which is how launchd runs the scheduled grader --
+# the module executes top to bottom, so the guard ran auto_update_results()
+# before that def had executed, every call to backfill_pick raised NameError,
+# and the except around it logged the failure at DEBUG. The job reported
+# "falling back to ESPN" and then "0 updated" one millisecond later, four times
+# a day, from the day the fallback was written. The manual repair script
+# imports this module instead, so the guard is skipped, the whole file loads
+# and the same function works -- which is why grading only ever happened by
+# hand. Nothing may be defined below this line.
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    
+    result = auto_update_results()
+    print(f"\n✅ Result update complete: {result['updated']} updated, {result['pending']} still pending")
+    sys.exit(0 if result["updated"] > 0 or result["pending"] == 0 else 1)

@@ -312,3 +312,10 @@ class TestGarbageIsNotStored:
             assert conn.execute("SELECT game_day FROM picks").fetchone()[0] == "2026-07-20"
         finally:
             conn.close()
+
+
+def test_cfb_is_the_same_scoreboard_as_ncaaf():
+    """A 2026-09-12 pick labelled CFB sat in the ungradeable column next to
+    ten NCAAF picks for the same Saturday."""
+    from ivy_core.historical_scores import SPORT_ROUTES
+    assert SPORT_ROUTES["cfb"] == SPORT_ROUTES["ncaaf"]

@@ -414,12 +414,36 @@ def _week_key(now: datetime) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def format_digest(suggestions: List[Finding], record: Optional[dict] = None) -> str:
-    lines = ["📋 Ivy — week in review", ""]
+def _alerts_sent_this_week(state: dict, now: datetime) -> int:
+    """How many unprompted texts went out in the ISO week containing ``now``."""
+    local = now.astimezone()
+    monday = local.date() - timedelta(days=local.weekday())
+    days = {(monday + timedelta(days=i)).isoformat() for i in range(7)}
+    sent_on = state.get("sent_on") or {}
+    return sum(int(n) for d, n in sent_on.items() if d in days)
+
+
+def format_digest(
+    suggestions: List[Finding],
+    record: Optional[dict] = None,
+    open_alerts: Optional[List[Finding]] = None,
+    alerts_sent: Optional[int] = None,
+) -> str:
+    """The Sunday text.
+
+    "Nothing outstanding. Every check passed this week." went out on
+    2026-09-13 from the same module that had texted a warning on each of the
+    three preceding days. It was computed from the suggestions open at that
+    instant, which is not what the sentence says. The digest now reports what
+    is open right now at every severity, and how many alerts it actually sent
+    this week -- read from the state it wrote when it sent them.
+    """
+    open_alerts = open_alerts or []
+    lines = ["\U0001F4CB Ivy \u2014 week in review", ""]
     if record:
         lines.append(
             f"Record: {record['wins']}W-{record['losses']}L-{record['pushes']}P"
-            f" · {record['decided']} decided"
+            f" \u00b7 {record['decided']} decided"
         )
         tail = []
         if record.get("pending"):
@@ -427,18 +451,34 @@ def format_digest(suggestions: List[Finding], record: Optional[dict] = None) -> 
         if record.get("unverifiable"):
             tail.append(f"{record['unverifiable']} ungradeable")
         if tail:
-            lines.append("  " + " · ".join(tail))
+            lines.append("  " + " \u00b7 ".join(tail))
         lines.append("")
+
+    if open_alerts:
+        lines.append("Still open:")
+        for f in open_alerts:
+            lines.append(f"\u2022 {f.title}")
+            if f.fix:
+                lines.append(f"  \u2192 {f.fix}")
+        lines.append("")
+
     if suggestions:
         lines.append("Worth a look:")
-        for s in suggestions:
-            lines.append(f"• {s.title}")
-            lines.append(f"  {s.detail}")
-            if s.fix:
-                lines.append(f"  → {s.fix}")
+        for f in suggestions:
+            lines.append(f"\u2022 {f.title}")
+            lines.append(f"  {f.detail}")
+            if f.fix:
+                lines.append(f"  \u2192 {f.fix}")
+        lines.append("")
+
+    if alerts_sent:
+        summary = f"{_plural(alerts_sent, 'alert')} sent this week."
     else:
-        lines.append("Nothing outstanding. Every check passed this week.")
-    return "\n".join(lines)
+        summary = "No alerts this week."
+    if not open_alerts and not suggestions:
+        summary += " Nothing open right now."
+    lines.append(summary)
+    return "\n".join(lines).rstrip()
 
 
 def maybe_send_digest(send: Callable[[str], bool], now: Optional[datetime] = None) -> bool:
@@ -460,8 +500,15 @@ def maybe_send_digest(send: Callable[[str], bool], now: Optional[datetime] = Non
     except Exception as exc:
         logger.warning("Digest could not read the record: %s", exc)
 
+    findings = collect(now)
+    suggestions = [f for f in findings if f.severity == SUGGESTION]
+    open_alerts = [f for f in findings if f.severity != SUGGESTION]
     try:
-        ok = bool(send(format_digest(pending_suggestions(now), record)))
+        ok = bool(send(format_digest(
+            suggestions, record,
+            open_alerts=open_alerts,
+            alerts_sent=_alerts_sent_this_week(state, now),
+        )))
     except Exception as exc:
         logger.warning("Digest send failed: %s", exc)
         return False

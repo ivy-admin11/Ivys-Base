@@ -58,6 +58,10 @@ SPORT_ROUTES: Dict[str, tuple] = {
     "nfl": ("football", "nfl", "americanfootball_nfl"),
     "nhl": ("hockey", "nhl", "icehockey_nhl"),
     "ncaaf": ("football", "college-football", "americanfootball_ncaaf"),
+    # The sweep labels college football "CFB" about as often as "NCAAF"; a
+    # pick under the other name was reading as ungradeable when it was the
+    # same scoreboard.
+    "cfb": ("football", "college-football", "americanfootball_ncaaf"),
     "epl": ("soccer", "eng.1", "soccer_epl"),
     "world cup": ("soccer", "fifa.world", "soccer_fifa_wc"),
     # KBO is deliberately absent: no route was verified for it, and an
