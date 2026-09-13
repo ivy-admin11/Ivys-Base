@@ -688,6 +688,64 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ivy Local Admin API Gateway v2.2 — Voice Assistant", lifespan=lifespan)
 
 PROCESS_STARTED_AT = datetime.now()
+
+
+def _git_head_sha() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=PROJECT_ROOT_DIR, timeout=5,
+        ).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+# The commit that was on disk when this process imported its modules. /version
+# used to run `git rev-parse HEAD` at request time and call the answer "which
+# commit is this gateway actually running" -- but that is which commit is on
+# DISK, and the two part company the moment anyone commits. On 2026-09-11 a fix
+# to ivy_core/proactive.py landed on disk and the gateway kept texting the
+# old wording for three days, because it had loaded the module once at startup
+# and nothing anywhere could see the difference.
+LOADED_GIT_SHA = _git_head_sha()
+
+# Everything the gateway process imports and would need a restart to pick up.
+# Job scripts under proactive_agents/ and scripts/ start fresh each run and are
+# deliberately not listed.
+_GATEWAY_SOURCE = (
+    "main.py", "registry.py", "config.py", "job_runner.py", "cache_manager.py",
+    "picks_formatter.py", "voice_assistant.py", "mcp_bridge.py",
+    "ivy_core", "utils", "middleware",
+)
+
+
+def _source_changed_since_start() -> List[str]:
+    """Source files newer than this process. Non-empty means the running code
+    is not the code on disk, and only a restart fixes that."""
+    since = PROCESS_STARTED_AT.timestamp()
+    changed: List[str] = []
+    for entry in _GATEWAY_SOURCE:
+        path = os.path.join(PROJECT_ROOT_DIR, entry)
+        if os.path.isfile(path):
+            candidates = [path]
+        elif os.path.isdir(path):
+            candidates = [
+                os.path.join(root, f)
+                for root, _dirs, files in os.walk(path)
+                for f in files if f.endswith(".py")
+            ]
+        else:
+            continue
+        for c in candidates:
+            try:
+                if os.path.getmtime(c) > since:
+                    changed.append(os.path.relpath(c, PROJECT_ROOT_DIR))
+            except OSError:
+                continue
+    return sorted(changed)
+
+
+GATEWAY_RESTART_HINT = "launchctl kickstart -k gui/$(id -u)/com.ivy.gateway"
 PROJECT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============================================================================
@@ -2392,6 +2450,17 @@ def ready_endpoint(authenticated: bool = Depends(verify_api_key)):
             f"receipt is indistinguishable from one that never ran"
         )
 
+    # Deliberately not a count and not a filename: gateway_monitor alerts on
+    # each NEW warning string once, so a string that changed as more files
+    # changed would re-page for every commit. One stable line, one text,
+    # cleared by the restart it asks for. /version has the specifics.
+    if _source_changed_since_start():
+        warnings.append(
+            "stale_code: source has changed since this process started, so the "
+            "gateway is running old code and every fix since is not live -- "
+            f"restart it: {GATEWAY_RESTART_HINT}"
+        )
+
     ready = all(checks.values())
     payload: Dict[str, Any] = {"ready": ready, "checks": checks}
     if warnings:
@@ -2428,16 +2497,15 @@ def imessage_attachments_endpoint(
 
 @app.get("/version")
 def version_endpoint(authenticated: bool = Depends(verify_api_key)):
-    """Git SHA, project root, Python executable, PID, start time, hostname,
-    dirty-tree state — so "which commit is this gateway actually running"
-    is never a guessing game."""
-    try:
-        git_sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, cwd=PROJECT_ROOT_DIR, timeout=5,
-        ).stdout.strip() or "unknown"
-    except Exception:
-        git_sha = "unknown"
+    """What this process loaded, what is on disk now, and whether they differ.
+
+    ``loaded_git_sha`` is the commit at import time -- the code actually
+    running. ``git_sha`` is HEAD on disk right now. ``stale_source_files``
+    lists anything newer than the process, committed or not. When that list
+    is non-empty nothing about this gateway's behaviour can be reasoned about
+    from the repo until it is restarted."""
+    git_sha = _git_head_sha()
+    stale = _source_changed_since_start()
     try:
         dirty_output = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -2448,6 +2516,10 @@ def version_endpoint(authenticated: bool = Depends(verify_api_key)):
         dirty = None
     return {
         "git_sha": git_sha,
+        "loaded_git_sha": LOADED_GIT_SHA,
+        "stale": bool(stale) or (git_sha != LOADED_GIT_SHA),
+        "stale_source_files": stale,
+        "restart": GATEWAY_RESTART_HINT if stale else None,
         "dirty_working_tree": dirty,
         "project_root": PROJECT_ROOT_DIR,
         "python_executable": sys.executable,
