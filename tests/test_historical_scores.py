@@ -319,3 +319,20 @@ def test_cfb_is_the_same_scoreboard_as_ncaaf():
     ten NCAAF picks for the same Saturday."""
     from ivy_core.historical_scores import SPORT_ROUTES
     assert SPORT_ROUTES["cfb"] == SPORT_ROUTES["ncaaf"]
+
+
+class TestSoccerRoutes:
+    """LegitSoccerBets joined the panel on 2026-09-14. Before this, only EPL
+    and the World Cup had a scoreboard; a La Liga or UCL pick was ungradeable
+    on arrival."""
+
+    @pytest.mark.parametrize("label", ["La Liga", "Bundesliga", "Serie A", "Ligue 1", "UCL", "MLS"])
+    def test_every_league_label_the_sweep_emits_has_a_route(self, label):
+        from ivy_core.historical_scores import SPORT_ROUTES
+        route = SPORT_ROUTES[label.lower()]
+        assert route[0] == "soccer"
+        assert route[2].startswith("soccer_")
+
+    def test_bare_soccer_has_no_route_on_purpose(self):
+        from ivy_core.historical_scores import SPORT_ROUTES
+        assert "soccer" not in SPORT_ROUTES

@@ -284,13 +284,18 @@ SPORT_QUERY = "any sport or league"
 TARGET_X_ACCOUNTS = [
     "MassMoneyline", "ItsCappersPicks", "PropCaddie", "cappersforfree",
     "KimsPicks", "billhpicks", "HarryLockPicks",
+    # Added 2026-09-14 (Henry). Not yet vetted through scripts/vet_x_handles.py
+    # -- run it on these three before trusting a quiet board to mean a quiet
+    # slate. LegitSoccerBets is soccer-first, which is why the soccer routes
+    # in historical_scores and the draw rule in result_updater arrived with it.
+    "TheSharpestsyndicate", "LegitSoccerBets", "Influencedbets",
 ]
 
 # Grok's x_search + prompt degrade past ~10 handles (truncated handle lists,
 # blown context), so the sweep runs in batches and the raw picks are merged.
-# At 7 accounts that is a single batch; the chunking stays because the list
-# grows again every time a replacement is vetted in.
-X_ACCOUNT_CHUNK_SIZE = 8
+# At 10 accounts that is two batches of 5. Eight would give 8 + 2, and a
+# two-handle batch spends a whole x_search call on almost nothing.
+X_ACCOUNT_CHUNK_SIZE = 5
 
 # Last-report state — used to suppress duplicate texts. Stores a content
 # fingerprint of the picks (see _report_signature) plus the exact message body

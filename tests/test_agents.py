@@ -1431,3 +1431,18 @@ class TestEnrichmentAlwaysGrades:
         merged = [{"side": "B -3.5"}]
         assert sports_bettor.apply_enrichment(merged, "not json") == merged
         assert "enrichment" not in merged[0]
+
+
+class TestHandlesAdded20260914:
+    ADDED = ("TheSharpestsyndicate", "LegitSoccerBets", "Influencedbets")
+
+    @pytest.mark.parametrize("handle", ADDED)
+    def test_present(self, handle):
+        assert handle in sports_bettor.TARGET_X_ACCOUNTS
+
+    def test_ten_handles_sweep_as_two_even_batches(self):
+        """Eight-wide chunking would leave a two-handle batch, a whole
+        x_search call for almost nothing."""
+        sizes = [len(b) for b in sports_bettor._chunk_accounts(sports_bettor.TARGET_X_ACCOUNTS)]
+        assert sizes == [5, 5], sizes
+        assert max(sizes) < 10, "Grok degrades past ~10 handles per call"

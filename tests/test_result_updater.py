@@ -268,3 +268,33 @@ class TestGradingFallsBackToESPN:
         con.commit()
         con.close()
         monkeypatch.setattr(ru, "PICKS_DB", db)
+
+
+class TestDrawOnASoccerMoneyline:
+    """Soccer's moneyline is three-way. A draw is a loss for whichever team
+    was taken, not a push -- and a push is excluded from the hit rate, so the
+    old behaviour would have made every drawn soccer ML vanish."""
+
+    def _game(self, sport_key, home=1, away=1):
+        return {"sport_key": sport_key, "home_team": "Real Madrid", "away_team": "Inter Milan",
+                "scores": [{"name": "Real Madrid", "score": home}, {"name": "Inter Milan", "score": away}]}
+
+    def test_a_drawn_soccer_match_loses_the_team_moneyline(self):
+        from ivy_core.result_updater import _extract_moneyline_result
+        assert _extract_moneyline_result(self._game("soccer_uefa_champs_league"), "Real Madrid ML") == "L"
+        assert _extract_moneyline_result(self._game("soccer_uefa_champs_league"), "Inter Milan ML") == "L"
+
+    def test_a_tied_nfl_game_still_pushes(self):
+        from ivy_core.result_updater import _extract_moneyline_result
+        g = {"sport_key": "americanfootball_nfl", "home_team": "Rams", "away_team": "49ers",
+             "scores": [{"name": "Rams", "score": 20}, {"name": "49ers", "score": 20}]}
+        assert _extract_moneyline_result(g, "Rams ML") == "P"
+
+    def test_a_soccer_win_still_grades_normally(self):
+        from ivy_core.result_updater import _extract_moneyline_result
+        assert _extract_moneyline_result(self._game("soccer_epl", 2, 0), "Real Madrid ML") == "W"
+        assert _extract_moneyline_result(self._game("soccer_epl", 2, 0), "Inter Milan ML") == "L"
+
+    def test_draw_as_a_side_is_left_ungraded_rather_than_guessed(self):
+        from ivy_core.result_updater import _extract_moneyline_result
+        assert _extract_moneyline_result(self._game("soccer_epl"), "Draw") is None

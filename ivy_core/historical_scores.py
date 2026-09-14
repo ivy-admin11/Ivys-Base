@@ -64,6 +64,16 @@ SPORT_ROUTES: Dict[str, tuple] = {
     "cfb": ("football", "college-football", "americanfootball_ncaaf"),
     "epl": ("soccer", "eng.1", "soccer_epl"),
     "world cup": ("soccer", "fifa.world", "soccer_fifa_wc"),
+    # The rest of the leagues the sweep labels. Keyed to match _SPORT_EMOJI in
+    # sports_bettor so a pick's own sport string finds its scoreboard. The
+    # bare label "Soccer" has no route on purpose: without a league there is
+    # no scoreboard to ask, and guessing one grades the wrong match.
+    "la liga": ("soccer", "esp.1", "soccer_spain_la_liga"),
+    "bundesliga": ("soccer", "ger.1", "soccer_germany_bundesliga"),
+    "serie a": ("soccer", "ita.1", "soccer_italy_serie_a"),
+    "ligue 1": ("soccer", "fra.1", "soccer_france_ligue_one"),
+    "ucl": ("soccer", "uefa.champions", "soccer_uefa_champs_league"),
+    "mls": ("soccer", "usa.1", "soccer_usa_mls"),
     # KBO is deliberately absent: no route was verified for it, and an
     # unverified route would produce either nothing or the wrong league.
 }

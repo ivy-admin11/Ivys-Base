@@ -206,6 +206,11 @@ def _score_for(scores: list, team: str, fallback_index: int) -> Optional[Decimal
     return parse_score(entry.get("score")) if isinstance(entry, dict) else None
 
 
+def _is_three_way(game: dict) -> bool:
+    """Soccer moneylines have a third outcome. Everything else here is two-way."""
+    return str(game.get("sport_key") or "").lower().startswith("soccer")
+
+
 def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
     """Determine W/L/P from a moneyline game and pick side."""
     home_team = game.get("home_team", "")
@@ -227,12 +232,22 @@ def _extract_moneyline_result(game: dict, pick_side: str) -> Optional[str]:
     elif away_score > home_score:
         winner = "away"
     else:
-        return "P"  # Push/tie
-    
-    # Check if pick won
+        winner = None
+
     pick_norm = _normalize_team(pick_side)
     home_norm = _normalize_team(home_team)
     away_norm = _normalize_team(away_team)
+
+    if winner is None:
+        # A tie pushes a two-way moneyline (NFL). Soccer's is three-way: a
+        # draw is its own outcome, and a team taken on the moneyline has
+        # simply lost. Grading that as a push would drop it from the hit
+        # rate instead of counting the loss.
+        if _is_three_way(game):
+            if any(t and t in pick_norm for t in (home_norm, away_norm)):
+                return "L"
+            return None  # "Draw" as a side names no team; not graded here
+        return "P"  # Push/tie
     
     # Pick could be "Team ML" or "Team Moneyline"
     for team_norm, team_winner in [(home_norm, "home"), (away_norm, "away")]:
