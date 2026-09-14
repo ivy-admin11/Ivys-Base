@@ -28,13 +28,24 @@ a single flaky request (one dropped connection, one slow response) already
 triggered a false "DOWN" alert to Henry once while the gateway process
 never actually stopped (2026-08-22). A real outage still fails every retry
 within seconds, so this doesn't meaningfully slow real detection.
+
+Since 2026-09-14 it also watches the tailnet. Tailscale is the only route to
+the gateway from outside the house -- uvicorn binds loopback, and the tailnet
+proxies to it -- and nothing in this repo set it up, asserted it, or noticed
+when it went. On 2026-09-14 the iMac showed offline on the tailnet from
+Henry's phone while every other check here was green. The tailnet state
+rides the same warnings channel as /ready's: one text when it changes, not
+one every five minutes.
 """
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import requests
 
@@ -131,6 +142,86 @@ def fetch_ready_warnings() -> list:
     the up/degraded/down verdict keeps its exact shape."""
     _, body = _probe_with_retries(GATEWAY_READY_URL)
     return _ready_warnings(body)
+
+
+# Where the Tailscale CLI lives on a Mac, in the order worth trying: on PATH,
+# the App Store / standalone app's symlink, Homebrew, and the app bundle
+# itself. launchd jobs get a thin PATH, so the bare name alone is not enough.
+TAILSCALE_CANDIDATES = (
+    "tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+)
+TAILSCALE_TIMEOUT_SECONDS = 10
+
+
+def _tailscale_binary() -> Optional[str]:
+    for candidate in TAILSCALE_CANDIDATES:
+        if os.sep in candidate:
+            if os.access(candidate, os.X_OK):
+                return candidate
+            continue
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def check_tailnet() -> tuple:
+    """Classify this Mac's tailnet membership: connected / disconnected / absent.
+
+    Returns ``(status, reason)``. ``reason`` is for the log; the warning text
+    that reaches Henry is built separately and kept stable, because the
+    warnings channel alerts once per distinct string and a reason that
+    carried a changing error message would page on every run.
+    """
+    binary = _tailscale_binary()
+    if not binary:
+        return "absent", "no tailscale CLI on PATH, /usr/local/bin, /opt/homebrew/bin or in Tailscale.app"
+    try:
+        proc = subprocess.run(
+            [binary, "status", "--json"],
+            capture_output=True, text=True, timeout=TAILSCALE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        return "disconnected", f"`tailscale status` could not run: {exc}"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:160]
+        return "disconnected", f"`tailscale status` exit {proc.returncode}: {detail}"
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return "disconnected", "`tailscale status --json` returned something that is not JSON"
+
+    backend = str(data.get("BackendState") or "unknown")
+    node = data.get("Self") or {}
+    if backend != "Running":
+        return "disconnected", f"BackendState={backend}"
+    if not node.get("Online", False):
+        return "disconnected", "BackendState=Running but this node reports Online=false"
+    ips = node.get("TailscaleIPs") or []
+    name = node.get("HostName") or "this node"
+    return "connected", f"online as {name}" + (f" ({ips[0]})" if ips else "")
+
+
+def tailnet_warnings() -> list:
+    """Warning strings for the shared channel. Stable per condition."""
+    status, reason = check_tailnet()
+    if status == "connected":
+        return []
+    if status == "absent":
+        return [
+            "tailnet_absent: no Tailscale on this Mac. It is the only route to "
+            "the gateway from outside the house, and nothing else stands in for it"
+        ]
+    # Fold the reason down to the one token that distinguishes conditions
+    # (NeedsLogin vs Stopped vs a dead daemon), so the text stays stable.
+    if reason.startswith("BackendState="):
+        state = reason.split("=", 1)[1].split()[0]
+        hint = " -- `tailscale up` and follow the link" if state in ("NeedsLogin", "NoState", "Stopped") else ""
+        return [f"tailnet_down: Tailscale is installed but {state}{hint}. The gateway is unreachable from outside the house until it reconnects"]
+    return ["tailnet_down: Tailscale is installed but not responding. The gateway is unreachable from outside the house until it reconnects"]
 
 
 def check_gateway() -> tuple:
@@ -238,6 +329,9 @@ def main() -> int:
     # warnings only — repeating a known one every two minutes would train him
     # to ignore the channel.
     warnings = fetch_ready_warnings()
+    tailnet_status, tailnet_reason = check_tailnet()
+    print(f"[{timestamp}] tailnet={tailnet_status} ({tailnet_reason})")
+    warnings = warnings + tailnet_warnings()
     previously_warned = set(state.get("warnings", []))
     new_warnings = [w for w in warnings if w not in previously_warned]
     if new_warnings and not alert_text:

@@ -106,6 +106,11 @@ def gw(tmp_path, monkeypatch):
     monkeypatch.setattr(mg, "STATE_PATH", str(tmp_path / "state" / "gateway_monitor_state.json"))
     monkeypatch.setattr(mg, "HEALTH_CHECK_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(mg, "DOWN_RECHECK_DELAY_SECONDS", 0)
+    # The tailnet is its own concern with its own tests below. The gateway
+    # tests assume it is fine, so an absent CLI on the test box does not
+    # surface as a warning in every one of them.
+    monkeypatch.setattr(mg, "check_tailnet", lambda: ("connected", "stubbed"))
+    monkeypatch.setattr(mg, "tailnet_warnings", lambda: [])
     return fake
 
 
@@ -609,3 +614,86 @@ class TestReadinessWarnings:
         mg.main()
         mg.main()
         assert sms.sent == []
+
+
+class TestTailnetCheck:
+    """Tailscale is the only route to the gateway from outside the house and
+    nothing watched it. On 2026-09-14 the iMac showed offline on the tailnet
+    from Henry's phone while every check here was green."""
+
+    def _fake_tailscale(self, tmp_path, monkeypatch, stdout="", exit_code=0):
+        binary = tmp_path / "tailscale"
+        binary.write_text(
+            "#!/bin/sh\n"
+            f"cat <<'EOF'\n{stdout}\nEOF\n"
+            f"exit {exit_code}\n"
+        )
+        binary.chmod(0o755)
+        monkeypatch.setattr(mg, "TAILSCALE_CANDIDATES", (str(binary),))
+        return binary
+
+    def test_absent_when_no_cli_anywhere(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(mg, "TAILSCALE_CANDIDATES", (str(tmp_path / "nope"), "definitely-not-a-command"))
+        status, reason = mg.check_tailnet()
+        assert status == "absent"
+        (w,) = mg.tailnet_warnings()
+        assert w.startswith("tailnet_absent:")
+
+    def test_connected(self, monkeypatch, tmp_path):
+        self._fake_tailscale(tmp_path, monkeypatch, json.dumps({
+            "BackendState": "Running",
+            "Self": {"Online": True, "HostName": "alexiss-imac", "TailscaleIPs": ["100.113.29.14"]},
+        }))
+        status, reason = mg.check_tailnet()
+        assert status == "connected"
+        assert "alexiss-imac" in reason and "100.113.29.14" in reason
+        assert mg.tailnet_warnings() == []
+
+    def test_needs_login_is_disconnected_with_the_fix_named(self, monkeypatch, tmp_path):
+        """Expired keys (180 days by default) look exactly like this."""
+        self._fake_tailscale(tmp_path, monkeypatch, json.dumps({
+            "BackendState": "NeedsLogin", "AuthURL": "https://login.tailscale.com/a/x",
+        }))
+        status, _ = mg.check_tailnet()
+        assert status == "disconnected"
+        (w,) = mg.tailnet_warnings()
+        assert w.startswith("tailnet_down:") and "NeedsLogin" in w and "tailscale up" in w
+
+    def test_running_but_offline_is_disconnected(self, monkeypatch, tmp_path):
+        self._fake_tailscale(tmp_path, monkeypatch, json.dumps({
+            "BackendState": "Running", "Self": {"Online": False},
+        }))
+        assert mg.check_tailnet()[0] == "disconnected"
+
+    def test_dead_daemon_is_disconnected(self, monkeypatch, tmp_path):
+        self._fake_tailscale(tmp_path, monkeypatch, stdout="failed to connect to local tailscaled", exit_code=1)
+        status, _ = mg.check_tailnet()
+        assert status == "disconnected"
+        (w,) = mg.tailnet_warnings()
+        assert "not responding" in w
+
+    def test_the_warning_string_is_stable_across_runs(self, monkeypatch, tmp_path):
+        """The channel alerts once per distinct string. Two runs seeing the
+        same condition with different stderr must produce the same text."""
+        self._fake_tailscale(tmp_path, monkeypatch, stdout="error: attempt 1", exit_code=1)
+        first = mg.tailnet_warnings()
+        self._fake_tailscale(tmp_path, monkeypatch, stdout="error: attempt 2 -- something else", exit_code=1)
+        second = mg.tailnet_warnings()
+        assert first == second
+
+    def test_a_tailnet_drop_reaches_henry_through_the_warnings_channel(self, monkeypatch, tmp_path):
+        """End to end through main(): gateway up, /ready clean, tailnet gone."""
+        state = tmp_path / "state.json"
+        state.write_text(json.dumps({"status": "up", "reason": "ok", "warnings": [], "last_alert_ts": 0}))
+        monkeypatch.setattr(mg, "STATE_PATH", str(state))
+        monkeypatch.setattr(mg, "check_gateway", lambda: ("up", "ok"))
+        monkeypatch.setattr(mg, "fetch_ready_warnings", lambda: [])
+        monkeypatch.setattr(mg, "TAILSCALE_CANDIDATES", (str(tmp_path / "absent"),))
+        sent = []
+        monkeypatch.setattr(mg, "send_imessage", lambda phone, text: sent.append(text) or True)
+
+        mg.main()
+        assert sent and "tailnet_absent" in sent[0]
+        # Second run: same condition, already warned -> silence.
+        mg.main()
+        assert len(sent) == 1

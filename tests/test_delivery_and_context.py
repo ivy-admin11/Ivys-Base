@@ -447,6 +447,8 @@ def _run_monitor(monkeypatch, tmp_path, statuses, prior_state):
 
     monkeypatch.setattr(mon, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(mon, "DOWN_RECHECK_DELAY_SECONDS", 0)
+    monkeypatch.setattr(mon, "check_tailnet", lambda: ("connected", "stubbed"))
+    monkeypatch.setattr(mon, "tailnet_warnings", lambda: [])
     if prior_state is not None:
         (tmp_path / "state.json").write_text(json.dumps(prior_state))
     seq = iter(statuses)
